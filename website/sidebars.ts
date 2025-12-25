@@ -100,6 +100,7 @@ export const sidebars: SidebarsConfig = {
       collapsed: false,
       items: [
         isInternal() ? 'users/migration_guide' : null,
+        'users/repo_user_walkthrough',
         {
           type: 'category' as const,
           label: 'Commands',
