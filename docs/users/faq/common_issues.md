@@ -44,6 +44,25 @@ by running Buck1, which will report cycles properly.
 For information, see
 [Finding Commands that Buck2 Ran](../../developers/what-ran.md).
 
+## How can I force Buck2 to skip cache and re-execute actions?
+
+Use `--no-remote-cache` on `buck2 build` to skip remote cache reads and writes:
+
+```sh
+buck2 build //foo:bar --no-remote-cache
+```
+
+If you only want to skip cache reads but still allow writes on RE workers, pair
+it with `--write-to-cache-anyway`:
+
+```sh
+buck2 build //foo:bar --no-remote-cache --write-to-cache-anyway
+```
+
+`--no-remote-cache` does not disable local incremental behavior or local reuse
+of already materialized outputs. If you need a stricter "rebuild from scratch"
+locally, run `buck2 clean` before building.
+
 ## Are multiple concurrent commands supported?
 
 Yes, they are supported. There are 2 types of concurrent commands: 1) parallel
