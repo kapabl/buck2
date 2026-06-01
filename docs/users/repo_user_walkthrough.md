@@ -67,6 +67,13 @@ cxx_library(
 ```
 【F:docs/concepts/build_file.md†L55-L95】
 
+## Execution flow for complex projects
+
+For a detailed walkthrough of how targets, toolchains, configurations, and
+execution platforms line up in large, multi-toolchain builds (including remote
+execution), see the dedicated guide: [Execution flow for complex
+projects](./execution_flow.md).【F:docs/users/execution_flow.md†L1-L200】
+
 ## Run the core commands
 
 A Buck2 command combines an action (such as `build`, `run`, or `test`), one or
