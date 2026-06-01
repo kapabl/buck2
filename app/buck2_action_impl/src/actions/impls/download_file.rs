@@ -22,6 +22,7 @@ use buck2_build_api::actions::execute::action_executor::ActionExecutionMetadata;
 use buck2_build_api::actions::execute::action_executor::ActionOutputs;
 use buck2_build_api::actions::execute::error::ExecuteError;
 use buck2_build_api::artifact_groups::ArtifactGroup;
+use buck2_build_signals::env::WaitingData;
 use buck2_common::cas_digest::RawDigest;
 use buck2_common::file_ops::metadata::FileDigest;
 use buck2_common::file_ops::metadata::FileMetadata;
@@ -40,9 +41,11 @@ use buck2_execute::materialize::http::http_download;
 use buck2_execute::materialize::http::http_head;
 use buck2_execute::materialize::materializer::DeclareArtifactPayload;
 use buck2_execute::materialize::materializer::HttpDownloadInfo;
+use buck2_hash::BuckIndexSet;
 use buck2_http::HttpClient;
 use dupe::Dupe;
-use indexmap::IndexSet;
+use pagable::Pagable;
+use pagable::pagable_typetag;
 use starlark::values::OwnedFrozenValue;
 
 use crate::actions::impls::offline;
@@ -58,7 +61,7 @@ enum DownloadFileActionError {
     ContentBasedPathWithoutMetadata(BuildArtifactPath),
 }
 
-#[derive(Debug, Allocative)]
+#[derive(Debug, Allocative, Pagable)]
 pub(crate) struct UnregisteredDownloadFileAction {
     checksum: Checksum,
     size_bytes: Option<u64>,
@@ -77,8 +80,8 @@ impl UnregisteredDownloadFileAction {
     ) -> Self {
         Self {
             checksum,
-            url,
             size_bytes,
+            url,
             vpnless_url,
             is_executable,
         }
@@ -88,7 +91,7 @@ impl UnregisteredDownloadFileAction {
 impl UnregisteredAction for UnregisteredDownloadFileAction {
     fn register(
         self: Box<Self>,
-        outputs: IndexSet<BuildArtifact>,
+        outputs: BuckIndexSet<BuildArtifact>,
         _starlark_data: Option<OwnedFrozenValue>,
         _error_handler: Option<OwnedFrozenValue>,
     ) -> buck2_error::Result<Box<dyn Action>> {
@@ -96,7 +99,7 @@ impl UnregisteredAction for UnregisteredDownloadFileAction {
     }
 }
 
-#[derive(Debug, Allocative)]
+#[derive(Debug, Allocative, Pagable)]
 struct DownloadFileAction {
     outputs: Box<[BuildArtifact]>,
     inner: UnregisteredDownloadFileAction,
@@ -104,7 +107,7 @@ struct DownloadFileAction {
 
 impl DownloadFileAction {
     fn new(
-        outputs: IndexSet<BuildArtifact>,
+        outputs: BuckIndexSet<BuildArtifact>,
         inner: UnregisteredDownloadFileAction,
     ) -> buck2_error::Result<Self> {
         if outputs.len() != 1 {
@@ -161,9 +164,9 @@ impl DownloadFileAction {
             Some(s) => Some(s),
             None => {
                 let url = self.url(client);
-                let head = http_head(client, url).await.map_err(|e| {
-                    buck2_error::Error::from(e).tag([ErrorTag::DownloadFileHeadRequest])
-                })?;
+                let head = http_head(client, url)
+                    .await
+                    .map_err(|e| e.tag([ErrorTag::DownloadFileHeadRequest]))?;
 
                 head.headers()
                     .get(http::header::CONTENT_LENGTH)
@@ -209,7 +212,7 @@ impl DownloadFileAction {
         &self,
         ctx: &mut dyn ActionExecutionCtx,
     ) -> buck2_error::Result<(ActionOutputs, ActionExecutionMetadata)> {
-        let outputs = offline::declare_copy_from_offline_cache(ctx, self.output()).await?;
+        let outputs = offline::declare_copy_from_offline_cache(ctx, &[self.output()]).await?;
 
         Ok((
             outputs,
@@ -217,11 +220,13 @@ impl DownloadFileAction {
                 execution_kind: ActionExecutionKind::Simple,
                 timing: ActionExecutionTimingData::default(),
                 input_files_bytes: None,
+                waiting_data: WaitingData::new(),
             },
         ))
     }
 }
 
+#[pagable_typetag]
 #[async_trait]
 impl Action for DownloadFileAction {
     fn kind(&self) -> buck2_data::ActionKind {
@@ -254,6 +259,7 @@ impl Action for DownloadFileAction {
     async fn execute(
         &self,
         ctx: &mut dyn ActionExecutionCtx,
+        waiting_data: WaitingData,
     ) -> Result<(ActionOutputs, ActionExecutionMetadata), ExecuteError> {
         // Early return - if this path exists, it's because we're running in a
         // special offline mode where the HEAD request below will likely fail.
@@ -282,6 +288,10 @@ impl Action for DownloadFileAction {
                         .as_ref(),
                     )?;
 
+                    let configuration_path = ctx
+                        .materializer()
+                        .maybe_eager_configuration_path(ctx.fs(), self.output().get_path())?;
+
                     // Fast path: download later via the materializer.
                     ctx.materializer()
                         .declare_http(
@@ -292,6 +302,7 @@ impl Action for DownloadFileAction {
                                 metadata,
                                 owner: ctx.target().owner().dupe(),
                             },
+                            configuration_path,
                         )
                         .await?;
 
@@ -334,7 +345,7 @@ impl Action for DownloadFileAction {
                         .declare_existing(vec![DeclareArtifactPayload {
                             path: rel_path,
                             artifact: ArtifactValue::file(metadata.dupe()),
-                            persist_full_directory_structure: false,
+                            configuration_path: None,
                         }])
                         .await?;
 
@@ -359,6 +370,7 @@ impl Action for DownloadFileAction {
                 execution_kind,
                 timing: ActionExecutionTimingData::default(),
                 input_files_bytes: None,
+                waiting_data,
             },
         ))
     }

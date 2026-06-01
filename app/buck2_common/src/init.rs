@@ -14,6 +14,8 @@ use std::time::Duration;
 use allocative::Allocative;
 use buck2_core::buck2_env;
 use buck2_error::BuckErrorContext;
+#[cfg(unix)]
+use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -95,8 +97,8 @@ impl HttpConfig {
             connect_timeout_ms,
             read_timeout_ms,
             write_timeout_ms,
-            max_redirects,
             http2,
+            max_redirects,
             max_concurrent_requests,
         })
     }
@@ -219,6 +221,9 @@ pub struct ResourceControlConfig {
     /// The corresponding buckconfig is `buck2_resource_control.status` that can take
     /// one of `{off | if_available | required}`.
     pub status: ResourceControlStatus,
+    /// If resource control is enabled, buck needs to get a cgroup to run in from somewhere - this is
+    /// where.
+    pub init: ResourceControlInit,
     /// Maximum allowed memory usage for all work buck2 manages.
     ///
     /// Accepts either a number of bytes or a percentage of the available resources.
@@ -233,16 +238,24 @@ pub struct ResourceControlConfig {
     pub memory_max_per_action: Option<String>,
     /// A memory threshold that any action is allowed to reach before being throttled.
     pub memory_high_per_action: Option<String>,
-    /// Memory high limit for action cgroup pool. Used when enable_action_cgroup_pool is true.
-    /// The corresponding buckconfig is `buck2_resource_control.memory_high_action_cgroup_pool`.
+    /// Memory high limit for all actions.
+    ///
     /// Mainly for testing purpose.
-    pub memory_high_action_cgroup_pool: Option<String>,
-    /// If provided and above the threshold, the cgroups will enforce this memory pressure and will freeze/kill actions
-    /// to stay under this pressure limit. (Currently only used for logging purposes and doesn't actually do the above)
-    pub memory_pressure_threshold_percent: u64,
+    pub memory_high_actions: Option<String>,
+    /// Memory max limit for all actions.
+    ///
+    /// Mainly for testing purpose.
+    pub memory_max_actions: Option<String>,
     /// Enable suspension when memory pressure is high.
     pub enable_suspension: bool,
+    pub experimental_suspension_algo_variant: Option<u8>,
     pub preferred_action_suspend_strategy: ActionSuspendStrategy,
+}
+
+impl ResourceControlConfig {
+    pub fn testing_default() -> Self {
+        Self::from_config(&LegacyBuckConfig::empty()).unwrap()
+    }
 }
 
 #[derive(Allocative, Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -269,6 +282,7 @@ impl FromStr for ActionSuspendStrategy {
 #[derive(
     Allocative,
     Clone,
+    Copy,
     Debug,
     Default,
     Serialize,
@@ -303,11 +317,45 @@ impl FromStr for ResourceControlStatus {
     }
 }
 
+#[derive(Allocative, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ResourceControlInit {
+    Systemd,
+    #[cfg(unix)]
+    Cgroup(AbsNormPathBuf),
+}
+
+impl FromStr for ResourceControlInit {
+    type Err = buck2_error::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "systemd" {
+            return Ok(ResourceControlInit::Systemd);
+        }
+        #[cfg(unix)]
+        if let Some(p) = s.strip_prefix("cgroup:") {
+            return Ok(ResourceControlInit::Cgroup(AbsNormPathBuf::from(
+                p.to_owned(),
+            )?));
+        }
+        Err(buck2_error::buck2_error!(
+            buck2_error::ErrorTag::Input,
+            "Unknown resource control initializer: `{}`",
+            s
+        ))
+    }
+}
+
 /// The current version of the resource control algorithm. Say you have some important change to the
 /// algo that fixes a bug. Incrementing this to `N + 1` and setting the
 /// `buck2_resource_control.enable_suspension_if_min_algo_version` buckconfig to `N + 1` enables
 /// suspension only if your bug fix is actually included in the version of buck in use
-const RESOURCE_CONTROL_ALGO_VERSION: u32 = 3;
+const RESOURCE_CONTROL_ALGO_VERSION: u32 = 6;
+
+/// The current version of the daemon cgroup wrapping logic. Incrementing this to `N + 1` and
+/// setting `buck2_resource_control.status_if_min_daemon_cgroup_version` buckconfig to `N + 1`
+/// enables daemon cgroup wrapping (status = if_available) only if the bug fix is included in the
+/// version of buck in use.
+const DAEMON_CGROUP_VERSION: u32 = 1;
 
 impl ResourceControlConfig {
     pub fn from_config(config: &LegacyBuckConfig) -> buck2_error::Result<Self> {
@@ -323,6 +371,24 @@ impl ResourceControlConfig {
                     property: "status",
                 })?
                 .unwrap_or(ResourceControlStatus::Off);
+            let status_if_min_daemon_cgroup_version: Option<u32> =
+                config.parse(BuckconfigKeyRef {
+                    section: "buck2_resource_control",
+                    property: "status_if_min_daemon_cgroup_version",
+                })?;
+            let status = if status_if_min_daemon_cgroup_version
+                .is_some_and(|min_version| DAEMON_CGROUP_VERSION >= min_version)
+            {
+                ResourceControlStatus::IfAvailable
+            } else {
+                status
+            };
+            let init = config
+                .parse(BuckconfigKeyRef {
+                    section: "buck2_resource_control",
+                    property: "init",
+                })?
+                .unwrap_or(ResourceControlInit::Systemd);
             let memory_max = config.parse(BuckconfigKeyRef {
                 section: "buck2_resource_control",
                 property: "memory_max",
@@ -339,16 +405,14 @@ impl ResourceControlConfig {
                 section: "buck2_resource_control",
                 property: "memory_high_per_action",
             })?;
-            let memory_high_action_cgroup_pool = config.parse(BuckconfigKeyRef {
+            let memory_high_actions = config.parse(BuckconfigKeyRef {
                 section: "buck2_resource_control",
-                property: "memory_high_action_cgroup_pool",
+                property: "memory_high_actions",
             })?;
-            let memory_pressure_threshold_percent = config
-                .parse(BuckconfigKeyRef {
-                    section: "buck2_resource_control",
-                    property: "memory_pressure_threshold_percent",
-                })?
-                .unwrap_or(10);
+            let memory_max_actions = config.parse(BuckconfigKeyRef {
+                section: "buck2_resource_control",
+                property: "memory_max_actions",
+            })?;
             let enable_suspension = config.parse(BuckconfigKeyRef {
                 section: "buck2_resource_control",
                 property: "enable_suspension",
@@ -361,6 +425,10 @@ impl ResourceControlConfig {
             let enable_suspension = enable_suspension.unwrap_or(false)
                 || enable_suspension_if_min_algo_version
                     .is_some_and(|min_version| RESOURCE_CONTROL_ALGO_VERSION >= min_version);
+            let experimental_suspension_algo_variant = config.parse(BuckconfigKeyRef {
+                section: "buck2_resource_control",
+                property: "experimental_suspension_algo_variant",
+            })?;
             let preferred_action_suspend_strategy = config
                 .parse(BuckconfigKeyRef {
                     section: "buck2_resource_control",
@@ -369,13 +437,15 @@ impl ResourceControlConfig {
                 .unwrap_or(ActionSuspendStrategy::KillAndRetry);
             Ok(Self {
                 status,
+                init,
                 memory_max,
                 memory_high,
                 memory_max_per_action,
                 memory_high_per_action,
-                memory_high_action_cgroup_pool,
-                memory_pressure_threshold_percent,
+                memory_high_actions,
+                memory_max_actions,
                 enable_suspension,
+                experimental_suspension_algo_variant,
                 preferred_action_suspend_strategy,
             })
         }
@@ -455,6 +525,8 @@ pub struct DaemonStartupConfig {
     pub log_download_method: LogDownloadMethod,
     pub health_check_config: HealthCheckConfig,
     pub retained_event_logs: usize,
+    pub macos_qos_class: Option<String>,
+    pub daemon_idle_timeout_s: Option<u64>,
 }
 
 impl DaemonStartupConfig {
@@ -537,6 +609,35 @@ impl DaemonStartupConfig {
                 })
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(DEFAULT_RETAINED_EVENT_LOGS),
+            macos_qos_class: {
+                let from_config = config
+                    .get(BuckconfigKeyRef {
+                        section: "buck2",
+                        property: "macos_qos_class",
+                    })
+                    .map(ToOwned::to_owned);
+                if buck2_env!("BUCK2_DISABLE_MACOS_QOS", bool)? {
+                    buck2_core::soft_error!(
+                        "disable_macos_qos_env_var",
+                        buck2_error::buck2_error!(
+                            buck2_error::ErrorTag::Input,
+                            "BUCK2_DISABLE_MACOS_QOS is deprecated. \
+                             Use `[buck2] macos_qos_class = skip_lowering` in buckconfig instead. \
+                             This will be the default very soon."
+                        ),
+                        deprecation: true,
+                        quiet: false,
+                        error_on_oss: true
+                    )?;
+                    Some(from_config.unwrap_or_else(|| "skip_lowering".to_owned()))
+                } else {
+                    from_config
+                }
+            },
+            daemon_idle_timeout_s: config.parse(BuckconfigKeyRef {
+                section: "buck2",
+                property: "daemon_idle_timeout_s",
+            })?,
         })
     }
 
@@ -558,8 +659,7 @@ impl DaemonStartupConfig {
             paranoid: false,
             materializations: None,
             http: HttpConfig::default(),
-            resource_control: ResourceControlConfig::from_config(&LegacyBuckConfig::empty())
-                .unwrap(),
+            resource_control: ResourceControlConfig::testing_default(),
             log_download_method: if cfg!(fbcode_build) {
                 LogDownloadMethod::Manifold
             } else {
@@ -567,6 +667,43 @@ impl DaemonStartupConfig {
             },
             health_check_config: HealthCheckConfig::default(),
             retained_event_logs: DEFAULT_RETAINED_EVENT_LOGS,
+            macos_qos_class: None,
+            daemon_idle_timeout_s: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use indoc::indoc;
+
+    use super::*;
+    use crate::legacy_configs::configs::testing::parse;
+
+    #[test]
+    fn test_daemon_idle_timeout_s_default() -> buck2_error::Result<()> {
+        let config = parse(&[("config", indoc!(r#""#))], "config")?;
+        let startup_config = DaemonStartupConfig::new(&config)?;
+        assert_eq!(startup_config.daemon_idle_timeout_s, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_daemon_idle_timeout_s_configured() -> buck2_error::Result<()> {
+        let config = parse(
+            &[(
+                "config",
+                indoc!(
+                    r#"
+                    [buck2]
+                    daemon_idle_timeout_s = 10800
+                    "#
+                ),
+            )],
+            "config",
+        )?;
+        let startup_config = DaemonStartupConfig::new(&config)?;
+        assert_eq!(startup_config.daemon_idle_timeout_s, Some(10800));
+        Ok(())
     }
 }

@@ -46,14 +46,15 @@
 //! let globals: Globals = Globals::standard();
 //!
 //! // We create a `Module`, which stores the global variables for our calculation.
-//! let module: Module = Module::new();
+//! Module::with_temp_heap(|module| {
+//!     // We create an evaluator, which controls how evaluation occurs.
+//!     let mut eval: Evaluator = Evaluator::new(&module);
 //!
-//! // We create an evaluator, which controls how evaluation occurs.
-//! let mut eval: Evaluator = Evaluator::new(&module);
-//!
-//! // And finally we evaluate the code using the evaluator.
-//! let res: Value = eval.eval_module(ast, &globals)?;
-//! assert_eq!(res.unpack_str(), Some("hello world!"));
+//!     // And finally we evaluate the code using the evaluator.
+//!     let res: Value = eval.eval_module(ast, &globals)?;
+//!     assert_eq!(res.unpack_str(), Some("hello world!"));
+//!     starlark::Result::Ok(())
+//! })?;
 //! # Ok(())
 //! # }
 //! # fn main(){ run().unwrap(); }
@@ -86,8 +87,6 @@
 //!
 //! // We build our globals to make the function available in Starlark
 //! let globals = GlobalsBuilder::new().with(starlark_quadratic).build();
-//! let module = Module::new();
-//! let mut eval = Evaluator::new(&module);
 //!
 //! // Let's test calling the function from Starlark code
 //! let starlark_code = r#"
@@ -95,8 +94,12 @@
 //! "#;
 //!
 //! let ast = AstModule::parse("quadratic.star", starlark_code.to_owned(), &Dialect::Standard)?;
-//! let res = eval.eval_module(ast, &globals)?;
-//! assert_eq!(res.unpack_i32(), Some(273)); // Verify that we got an `int` return value of 4 * 8^2 + 2 * 8 + 1 = 273
+//! Module::with_temp_heap(|module| {
+//!     let mut eval = Evaluator::new(&module);
+//!     let res = eval.eval_module(ast, &globals)?;
+//!     assert_eq!(res.unpack_i32(), Some(273)); // Verify that we got an `int` return value of 4 * 8^2 + 2 * 8 + 1 = 273
+//!     starlark::Result::Ok(())
+//! })?;
 //! # Ok(())
 //! # }
 //! # fn main(){ run().unwrap(); }
@@ -156,14 +159,14 @@
 //! let ast = AstModule::parse("json.star", content.to_owned(), &Dialect::Standard)?;
 //! // We build our globals adding some functions we wrote
 //! let globals = GlobalsBuilder::new().with(starlark_emit).build();
-//! let module = Module::new();
 //! let store = Store::default();
-//! {
+//! Module::with_temp_heap(|module| {
 //!     let mut eval = Evaluator::new(&module);
 //!     // We add a reference to our store
 //!     eval.extra = Some(&store);
 //!     eval.eval_module(ast, &globals)?;
-//! }
+//!     starlark::Result::Ok(())
+//! })?;
 //! assert_eq!(&*store.0.borrow(), &["1", "[\"test\"]", "{\"x\":\"y\"}"]);
 //! # Ok(())
 //! # }
@@ -198,15 +201,17 @@
 //! // We could equally have done `dialect = Dialect::Extended`.
 //! let ast = AstModule::parse("json.star", content.to_owned(), &dialect)?;
 //! let globals = Globals::standard();
-//! let module = Module::new();
-//! let mut eval = Evaluator::new(&module);
-//! let res = eval.eval_module(ast, &globals);
-//! // We expect this to fail, since it is a type violation
-//! assert!(
-//!     res.unwrap_err()
-//!         .to_string()
-//!         .contains("Value `test` of type `string` does not match the type annotation `int`")
-//! );
+//! Module::with_temp_heap(|module| {
+//!     let mut eval = Evaluator::new(&module);
+//!     let res = eval.eval_module(ast, &globals);
+//!     // We expect this to fail, since it is a type violation
+//!     assert!(
+//!         res.unwrap_err()
+//!             .to_string()
+//!             .contains("Value `test` of type `string` does not match the type annotation `int`")
+//!     );
+//!     starlark::Result::Ok(())
+//! })?;
 //! # Ok(())
 //! # }
 //! # fn main(){ run().unwrap(); }
@@ -215,7 +220,7 @@
 //! ## Enable the `load` statement
 //!
 //! You can have Starlark load files imported by the user.
-//! That requires that the loaded modules are first frozen with [`Module.freeze`](environment::Module::freeze).
+//! That requires that the loaded modules are first frozen with [`Module.freeze_named`](environment::Module::freeze_named).
 //! There is no requirement that the files are on disk, but that would be a common pattern.
 //!
 //! ```
@@ -227,6 +232,7 @@
 //! use starlark::eval::ReturnFileLoader;
 //! use starlark::syntax::AstModule;
 //! use starlark::syntax::Dialect;
+//! use starlark::values::FrozenHeapName;
 //!
 //! // Get the file contents (for the demo), in reality use `AstModule::parse_file`.
 //! fn get_source(file: &str) -> &str {
@@ -256,15 +262,17 @@
 //!     let mut loader = ReturnFileLoader { modules: &modules };
 //!
 //!     let globals = Globals::standard();
-//!     let module = Module::new();
-//!     {
-//!         let mut eval = Evaluator::new(&module);
-//!         eval.set_loader(&mut loader);
-//!         eval.eval_module(ast, &globals)?;
-//!     }
-//!     // After creating a module we freeze it, preventing further mutation.
-//!     // It can now be used as the input for other Starlark modules.
-//!     Ok(module.freeze()?)
+//!     Module::with_temp_heap(|module| {
+//!         {
+//!             let mut eval = Evaluator::new(&module);
+//!             eval.set_loader(&mut loader);
+//!             eval.eval_module(ast, &globals)?;
+//!         }
+//!         // After creating a module we freeze it, preventing further mutation.
+//!         // It can now be used as the input for other Starlark modules.
+//!         // Each frozen module is given a name to identify its heap.
+//!         Ok(module.freeze_named(FrozenHeapName::User(Box::new(file.to_owned())))?)
+//!     })
 //! }
 //!
 //! let ab = get_module("ab.star")?;
@@ -295,16 +303,18 @@
 //!
 //! let ast = AstModule::parse("quadratic.star", content.to_owned(), &Dialect::Standard)?;
 //! let globals = Globals::standard();
-//! let module = Module::new();
-//! let mut eval = Evaluator::new(&module);
-//! let quad = eval.eval_module(ast, &globals)?;
-//! let heap = module.heap();
-//! let res = eval.eval_function(
-//!     quad,
-//!     &[heap.alloc(4), heap.alloc(2), heap.alloc(1)],
-//!     &[("x", heap.alloc(8))],
-//! )?;
-//! assert_eq!(res.unpack_i32(), Some(273));
+//! Module::with_temp_heap(|module| {
+//!     let mut eval = Evaluator::new(&module);
+//!     let quad = eval.eval_module(ast, &globals)?;
+//!     let heap = module.heap();
+//!     let res = eval.eval_function(
+//!         quad,
+//!         &[heap.alloc(4), heap.alloc(2), heap.alloc(1)],
+//!         &[("x", heap.alloc(8))],
+//!     )?;
+//!     assert_eq!(res.unpack_i32(), Some(273));
+//!     starlark::Result::Ok(())
+//! })?;
 //! # Ok(())
 //! # }
 //! # fn main(){ run().unwrap(); }
@@ -331,6 +341,7 @@
 //! use starlark::values::Heap;
 //! use starlark::values::NoSerialize;
 //! use starlark::values::ProvidesStaticType;
+//! use starlark::values::StarlarkPagable;
 //! use starlark::values::StarlarkValue;
 //! use starlark::values::Value;
 //! use starlark::values::ValueError;
@@ -338,7 +349,15 @@
 //! use starlark_derive::starlark_value;
 //!
 //! // Define complex numbers
-//! #[derive(Debug, PartialEq, Eq, ProvidesStaticType, NoSerialize, Allocative)]
+//! #[derive(
+//!     Debug,
+//!     PartialEq,
+//!     Eq,
+//!     ProvidesStaticType,
+//!     NoSerialize,
+//!     StarlarkPagable,
+//!     Allocative
+//! )]
 //! struct Complex {
 //!     real: i32,
 //!     imaginary: i32,
@@ -354,7 +373,7 @@
 //! #[starlark_value(type = "complex")]
 //! impl<'v> StarlarkValue<'v> for Complex {
 //!     // How we add them
-//!     fn add(&self, rhs: Value<'v>, heap: &'v Heap) -> Option<starlark::Result<Value<'v>>> {
+//!     fn add(&self, rhs: Value<'v>, heap: Heap<'v>) -> Option<starlark::Result<Value<'v>>> {
 //!         if let Some(rhs) = rhs.downcast_ref::<Self>() {
 //!             Some(Ok(heap.alloc(Complex {
 //!                 real: self.real + rhs.real,
@@ -370,21 +389,23 @@
 //!
 //! let ast = AstModule::parse("complex.star", content.to_owned(), &Dialect::Standard)?;
 //! let globals = Globals::standard();
-//! let module = Module::new();
-//! // We inject some complex numbers into the module before we start.
-//! let a = module.heap().alloc(Complex {
-//!     real: 1,
-//!     imaginary: 8,
-//! });
-//! module.set("a", a);
-//! let b = module.heap().alloc(Complex {
-//!     real: 4,
-//!     imaginary: 2,
-//! });
-//! module.set("b", b);
-//! let mut eval = Evaluator::new(&module);
-//! let res = eval.eval_module(ast, &globals)?;
-//! assert_eq!(res.unpack_str(), Some("5 + 10i"));
+//! Module::with_temp_heap(|module| {
+//!     // We inject some complex numbers into the module before we start.
+//!     let a = module.heap().alloc(Complex {
+//!         real: 1,
+//!         imaginary: 8,
+//!     });
+//!     module.set("a", a);
+//!     let b = module.heap().alloc(Complex {
+//!         real: 4,
+//!         imaginary: 2,
+//!     });
+//!     module.set("b", b);
+//!     let mut eval = Evaluator::new(&module);
+//!     let res = eval.eval_module(ast, &globals)?;
+//!     assert_eq!(res.unpack_str(), Some("5 + 10i"));
+//!     starlark::Result::Ok(())
+//! })?;
 //! # Ok(())
 //! # }
 //! # fn main(){ run().unwrap(); }
@@ -397,6 +418,7 @@
 #![cfg_attr(rust_nightly, feature(const_type_id))]
 #![cfg_attr(rust_nightly, feature(core_intrinsics))]
 #![cfg_attr(rust_nightly, feature(cfg_sanitize))]
+#![cfg_attr(rust_nightly, feature(cold_path))]
 #![cfg_attr(rust_nightly, feature(const_type_name))]
 // Good reasons
 #![allow(clippy::needless_return)] // Mixing explicit returns with implicit ones sometimes looks odd
@@ -428,7 +450,12 @@
 
 mod macros;
 
+pub use starlark_derive::StarlarkPagable;
+pub use starlark_derive::StarlarkPagablePanic;
+pub use starlark_derive::StarlarkPagableViaPagable;
 pub use starlark_derive::starlark_module;
+pub use starlark_derive::starlark_pagable_typetag;
+pub use starlark_derive::type_matcher;
 pub use starlark_syntax::Error;
 pub use starlark_syntax::ErrorKind;
 pub use starlark_syntax::Result;
@@ -457,6 +484,8 @@ mod stdlib;
 pub mod util;
 pub mod values;
 pub mod wasm;
+
+pub mod pagable;
 
 pub mod coerce;
 #[cfg(test)]

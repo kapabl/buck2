@@ -8,8 +8,6 @@
  * above-listed licenses.
  */
 
-use std::collections::HashMap;
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::str;
 use std::sync::Arc;
@@ -30,11 +28,14 @@ use buck2_data::FileWatcherKind as Kind;
 use buck2_eden::connection::EdenConnectionManager;
 use buck2_eden::semaphore;
 use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_events::dispatch::span_async;
 use buck2_fs::paths::abs_norm_path::AbsNormPath;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
+use buck2_hash::StdBuckHashMap;
+use buck2_hash::StdBuckHashSet;
 use dice::DiceTransactionUpdater;
 use edenfs::ChangeNotification;
 use edenfs::ChangesSinceV2Params;
@@ -95,10 +96,11 @@ pub(crate) struct EdenFsFileWatcher {
     cells: CellResolver,
     // The project root, relative to the eden mount point
     project_root: ForwardRelativePathBuf,
-    ignore_specs: HashMap<CellName, IgnoreSet>,
+    ignore_specs: StdBuckHashMap<CellName, IgnoreSet>,
     mergebase: RwLock<Option<MergebaseDetails>>,
     last_mergebase: RwLock<Option<MergebaseDetails>>,
     mergebase_with: Option<String>,
+    dice_clear_on_mergebase_change: bool,
     eden_version: RwLock<Option<String>>,
 }
 
@@ -108,8 +110,8 @@ impl EdenFsFileWatcher {
         project_root: &ProjectRoot,
         root_config: &LegacyBuckConfig,
         cells: CellResolver,
-        ignore_specs: HashMap<CellName, IgnoreSet>,
-    ) -> Result<Self, EdenFsWatcherError> {
+        ignore_specs: StdBuckHashMap<CellName, IgnoreSet>,
+    ) -> buck2_error::Result<Self> {
         let manager = EdenConnectionManager::new(
             fb,
             project_root,
@@ -136,6 +138,9 @@ impl EdenFsFileWatcher {
             })
             .map(|s| s.to_owned());
 
+        let dice_clear_on_mergebase_change =
+            crate::file_watcher::dice_clear_on_mergebase_change(root_config)?;
+
         Ok(Self {
             manager,
             mount_point,
@@ -147,6 +152,7 @@ impl EdenFsFileWatcher {
             mergebase: RwLock::new(None),
             last_mergebase: RwLock::new(None),
             mergebase_with,
+            dice_clear_on_mergebase_change,
             eden_version: RwLock::new(None),
         })
     }
@@ -180,7 +186,7 @@ impl EdenFsFileWatcher {
         // This can happen as we receive file changes from a commit transitions and from an explicit notification.
         // Also eden will report duplicates if there were another changes between changes on the same file.
         // We want to ignore duplicates, so we store unique changes in the set
-        let mut processed_changes: HashSet<EdenFsEvent> = HashSet::new();
+        let mut processed_changes: StdBuckHashSet<EdenFsEvent> = StdBuckHashSet::default();
         for change in result.changes {
             // Once a large or unknown change is detected, we need to invalidate DICE. Therefore,
             // skip processing the rest of the changes and continue to propagate true.
@@ -216,7 +222,7 @@ impl EdenFsFileWatcher {
         change: &ChangeNotification,
         tracker: &mut FileChangeTracker,
         stats: &mut FileWatcherStats,
-        processed_changes: &mut HashSet<EdenFsEvent>,
+        processed_changes: &mut StdBuckHashSet<EdenFsEvent>,
     ) -> buck2_error::Result<ProcessChangeStatus> {
         let large_or_unknown_change = match change {
             ChangeNotification::smallChange(small_change) => match small_change {
@@ -251,10 +257,9 @@ impl EdenFsFileWatcher {
                                 "EdenFS reported SmallChangeNotification::renamed directory: '{}' -> '{}'. \
                                  Directory renames are handled as LargeChangeNotification changes. \
                                  EdenFS Thrift API has changed and the buck2 code needs to be updated.",
-                                 bytes_to_string_or_unknown(&renamed.from),
-                                 bytes_to_string_or_unknown(&renamed.to)
+                                bytes_to_string_or_unknown(&renamed.from),
+                                bytes_to_string_or_unknown(&renamed.to)
                             )
-                            .into()
                         )?;
                     } else {
                         let kind = dtype_into_file_watcher_kind(renamed.fileType);
@@ -338,7 +343,6 @@ impl EdenFsFileWatcher {
                              EdenFS Thrift API has changed and the buck2 code needs to be updated.",
                             small_change
                         )
-                        .into()
                     )?;
                     ProcessChangeStatus::LargeOrUnknown
                 }
@@ -390,7 +394,6 @@ impl EdenFsFileWatcher {
                              EdenFS Thrift API has changed and the buck2 code needs to be updated.",
                             large_change
                         )
-                        .into()
                     )?;
                     ProcessChangeStatus::LargeOrUnknown
                 }
@@ -408,7 +411,6 @@ impl EdenFsFileWatcher {
                          EdenFS Thrift API has changed and the buck2 code needs to be updated.",
                         change
                     )
-                    .into()
                 )?;
                 ProcessChangeStatus::LargeOrUnknown
             }
@@ -440,7 +442,7 @@ impl EdenFsFileWatcher {
         kind: Kind,
         event: Type,
         path: &[u8],
-        processed_changes: &mut HashSet<EdenFsEvent>,
+        processed_changes: &mut StdBuckHashSet<EdenFsEvent>,
     ) -> buck2_error::Result<()> {
         let eden_rel_path = PathBuf::from(str::from_utf8(path)?);
 
@@ -454,8 +456,8 @@ impl EdenFsFileWatcher {
                 // If we error out here then we might miss other changes. This seems like
                 // it shouldn't happen, since the empty path should always be a valid path.
                 let path = find_first_valid_parent(&eden_rel_path)
-                    .with_buck_error_context(|| {
-                        format!(
+                    .ok_or_else(|| {
+                        internal_error!(
                             "Invalid path had no valid parent: `{}`",
                             eden_rel_path.display()
                         )
@@ -472,6 +474,13 @@ impl EdenFsFileWatcher {
             // we ignore any changes that are not relative to the project root
             Err(_) => return Ok(()),
         };
+
+        // Watchman cookie files are synchronization markers, not real source changes.
+        if crate::is_watchman_cookie(project_rel_path) {
+            stats.add_ignored(1);
+            return Ok(());
+        }
+
         let cell_path = self.cells.get_cell_path(project_rel_path);
 
         let ignore = self
@@ -523,7 +532,7 @@ impl EdenFsFileWatcher {
         stats: &mut FileWatcherStats,
         from: &str,
         to: Option<&str>,
-        processed_changes: &mut HashSet<EdenFsEvent>,
+        processed_changes: &mut StdBuckHashSet<EdenFsEvent>,
     ) -> buck2_error::Result<ProcessChangeStatus> {
         // `sl status` only reports added/removed/modified files, not directories.
         // we use `sl debugdiffdirs` to get changes for directories
@@ -552,7 +561,7 @@ impl EdenFsFileWatcher {
         stats: &mut FileWatcherStats,
         from: &str,
         to: Option<&str>,
-        processed_changes: &mut HashSet<EdenFsEvent>,
+        processed_changes: &mut StdBuckHashSet<EdenFsEvent>,
     ) -> buck2_error::Result<ProcessChangeStatus> {
         // limit results to MAX_SAPLING_STATUS_CHANGES
         match get_status(&self.eden_root, &from, to, MAX_SAPLING_STATUS_CHANGES)
@@ -611,7 +620,7 @@ impl EdenFsFileWatcher {
         stats: &mut FileWatcherStats,
         from: &str,
         to: Option<&str>,
-        processed_changes: &mut HashSet<EdenFsEvent>,
+        processed_changes: &mut StdBuckHashSet<EdenFsEvent>,
     ) -> buck2_error::Result<ProcessChangeStatus> {
         // limit results to MAX_SAPLING_STATUS_CHANGES
         match get_dir_diff(&self.eden_root, &from, to, MAX_SAPLING_STATUS_CHANGES)
@@ -674,18 +683,20 @@ impl EdenFsFileWatcher {
         stats: &mut FileWatcherStats,
         from: &str,
         to: &str,
-        processed_changes: &mut HashSet<EdenFsEvent>,
+        processed_changes: &mut StdBuckHashSet<EdenFsEvent>,
     ) -> buck2_error::Result<ProcessChangeStatus> {
-        if self
-            .update_mergebase(&to)
+        let mergebase_changed = self
+            .update_mergebase(to)
             .await
-            .buck_error_context("Failed to update mergebase.")?
-        {
+            .buck_error_context("Failed to update mergebase.")?;
+
+        if mergebase_changed && self.dice_clear_on_mergebase_change {
             // Mergebase has changed - invalidate DICE.
             Ok(ProcessChangeStatus::LargeOrUnknown)
         } else {
-            // Mergebase has not changed - compute changes form source control
-            self.process_source_control_changes(tracker, stats, &from, Some(to), processed_changes)
+            // Mergebase has not changed (or dice_clear_on_mergebase_change is disabled) -
+            // compute changes from source control
+            self.process_source_control_changes(tracker, stats, from, Some(to), processed_changes)
                 .await
         }
     }
@@ -738,7 +749,7 @@ impl EdenFsFileWatcher {
         if let Some(mergebase) = mergebase_info.map(|m| m.mergebase) {
             let mut tracker = FileChangeTracker::new();
             let mut stats = FileWatcherStats::new(base_stats, 0);
-            let mut processed_changes: HashSet<EdenFsEvent> = HashSet::new();
+            let mut processed_changes: StdBuckHashSet<EdenFsEvent> = StdBuckHashSet::default();
             self.process_source_control_changes(
                 &mut tracker,
                 &mut stats,

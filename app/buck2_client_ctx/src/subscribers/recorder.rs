@@ -10,8 +10,6 @@
 
 use std::cmp::max;
 use std::cmp::min;
-use std::collections::HashMap;
-use std::collections::HashSet;
 use std::io::Write;
 use std::ops::Sub;
 use std::sync::Arc;
@@ -27,7 +25,6 @@ use buck2_common::build_count::BuildCountManager;
 use buck2_common::convert::ProstDurationExt;
 use buck2_common::invocation_paths::InvocationPaths;
 use buck2_core::buck2_env;
-use buck2_core::io_counters::IoCounterKey;
 use buck2_core::soft_error;
 use buck2_data::ErrorReport;
 use buck2_data::FileWatcherProvider;
@@ -58,8 +55,11 @@ use buck2_events::BuckEvent;
 use buck2_events::daemon_id::DaemonId;
 use buck2_events::sink::remote::ScribeConfig;
 use buck2_events::sink::remote::new_remote_event_sink_if_enabled;
+use buck2_fs::error::IoResultExt;
 use buck2_fs::fs_util;
 use buck2_fs::paths::abs_path::AbsPathBuf;
+use buck2_hash::StdBuckHashMap;
+use buck2_hash::StdBuckHashSet;
 use buck2_util::network_speed_average::NetworkSpeedAverage;
 use buck2_util::sliding_window::SlidingWindow;
 use buck2_wrapper_common::BUCK_WRAPPER_START_TIME_ENV_VAR;
@@ -72,6 +72,7 @@ use itertools::Itertools;
 use termwiz::istty::IsTty;
 use tokio::sync::mpsc::Receiver;
 
+use crate::agent_context::AgentContextEntry;
 use crate::client_ctx::ClientCommandContext;
 use crate::client_metadata::ClientMetadata;
 use crate::common::CommonBuildConfigurationOptions;
@@ -172,9 +173,9 @@ pub struct InvocationRecorder {
     initial_sink_dropped_count: Option<u64>,
     initial_sink_bytes_written: Option<u64>,
     sink_max_buffer_depth: u64,
-    soft_error_categories: HashSet<SoftError>,
+    soft_error_categories: StdBuckHashSet<SoftError>,
     concurrent_command_blocking_duration: Option<Duration>,
-    metadata: HashMap<String, String>,
+    metadata: StdBuckHashMap<String, String>,
     analysis_count: u64,
     load_count: u64,
     daemon_in_memory_state_is_corrupted: bool,
@@ -208,12 +209,13 @@ pub struct InvocationRecorder {
     initial_hedwig_download_bytes: Option<u64>,
     initial_hedwig_upload_queries: Option<u64>,
     initial_hedwig_upload_bytes: Option<u64>,
-    concurrent_command_ids: HashSet<String>,
+    concurrent_command_ids: StdBuckHashSet<String>,
     daemon_connection_failure: bool,
     /// Daemon started by this command.
     daemon_was_started: Option<buck2_data::DaemonWasStartedReason>,
     should_restart: bool,
     client_metadata: Vec<buck2_data::ClientMetadata>,
+    agent_context: Vec<buck2_data::AgentContextEntry>,
     command_errors: Vec<ErrorReport>,
     exit_code: Option<u32>,
     exit_result_name: Option<String>,
@@ -228,7 +230,9 @@ pub struct InvocationRecorder {
     peak_process_memory_bytes: Option<u64>,
     has_new_buckconfigs: bool,
     peak_used_disk_space_bytes: Option<u64>,
-    active_networks_kinds: HashSet<i32>,
+    peak_normalized_system_load1: Option<f64>,
+    peak_normalized_system_load5: Option<f64>,
+    active_networks_kinds: StdBuckHashSet<i32>,
     target_cfg: Option<TargetCfg>,
     hg_revision: Option<String>,
     has_local_changes: Option<bool>,
@@ -242,7 +246,7 @@ pub struct InvocationRecorder {
     previous_uuid_with_mismatched_config: Option<String>,
     file_watcher: Option<String>,
     health_check_tags_receiver: Option<Receiver<Vec<String>>>,
-    health_check_tags: HashSet<String>,
+    health_check_tags: StdBuckHashSet<String>,
     exec_time_ms: u64,
     initial_local_cache_hits_files_from_memory_cache: Option<i64>,
     initial_local_cache_hits_files_from_filesystem_cache: Option<i64>,
@@ -259,7 +263,7 @@ pub struct InvocationRecorder {
     current_in_progress_remote_uploads: u64,
     max_in_progress_remote_uploads: u64,
     // Track executor stage types by span ID to know which counter to decrement on end
-    executor_stages_by_span: HashMap<u64, ExecutorStageType>,
+    executor_stages_by_span: StdBuckHashMap<u64, ExecutorStageType>,
     // Track maximum buck2 daemon anon memory usage
     memory_max_anon_allprocs: Option<u64>,
     // Track maximum buck2 forkserver anon memory usage
@@ -268,27 +272,34 @@ pub struct InvocationRecorder {
     memory_max_total_allprocs: Option<u64>,
     // Track maximum total buck2 forkserver memory usage (anon+file+kernel)
     memory_max_total_forkserver_actions: Option<u64>,
+    // Track peak allprocs swap usage (bytes)
+    memory_max_swap_bytes_allprocs: Option<u64>,
+    // Track peak allprocs memory pressure (PSI full avg10 %)
+    memory_max_pressure_10s_avg_allprocs: Option<f64>,
+    // Track peak allprocs memory pressure (PSI full avg60 %)
+    memory_max_pressure_60s_avg_allprocs: Option<f64>,
     // CommandOptions data
     command_options: Option<buck2_data::CommandOptions>,
     // Initial IO counters captured at invocation start
-    initial_io_copy_count: u32,
-    initial_io_symlink_count: u32,
-    initial_io_hardlink_count: u32,
-    initial_io_mkdir_count: u32,
-    initial_io_readdir_count: u32,
-    initial_io_readdir_eden_count: u32,
-    initial_io_rmdir_count: u32,
-    initial_io_rmdir_all_count: u32,
-    initial_io_stat_count: u32,
-    initial_io_stat_eden_count: u32,
-    initial_io_chmod_count: u32,
-    initial_io_readlink_count: u32,
-    initial_io_remove_count: u32,
-    initial_io_rename_count: u32,
-    initial_io_read_count: u32,
-    initial_io_write_count: u32,
-    initial_io_canonicalize_count: u32,
-    initial_io_eden_settle_count: u32,
+    initial_io_copy_count: Option<u32>,
+    initial_io_symlink_count: Option<u32>,
+    initial_io_hardlink_count: Option<u32>,
+    initial_io_mkdir_count: Option<u32>,
+    initial_io_readdir_count: Option<u32>,
+    initial_io_readdir_eden_count: Option<u32>,
+    initial_io_rmdir_count: Option<u32>,
+    initial_io_rmdir_all_count: Option<u32>,
+    initial_io_stat_count: Option<u32>,
+    initial_io_stat_eden_count: Option<u32>,
+    initial_io_chmod_count: Option<u32>,
+    initial_io_readlink_count: Option<u32>,
+    initial_io_remove_count: Option<u32>,
+    initial_io_rename_count: Option<u32>,
+    initial_io_read_count: Option<u32>,
+    initial_io_write_count: Option<u32>,
+    initial_io_canonicalize_count: Option<u32>,
+    initial_io_eden_settle_count: Option<u32>,
+    repo_path: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -375,7 +386,7 @@ impl InvocationRecorder {
             initial_sink_dropped_count: None,
             initial_sink_bytes_written: None,
             sink_max_buffer_depth: 0,
-            soft_error_categories: HashSet::new(),
+            soft_error_categories: StdBuckHashSet::default(),
             concurrent_command_blocking_duration: None,
             // Use a null daemon_id here initially - if we later get metadata back from the daemon,
             // we'll overwrite this then
@@ -413,11 +424,12 @@ impl InvocationRecorder {
             initial_hedwig_download_bytes: None,
             initial_hedwig_upload_queries: None,
             initial_hedwig_upload_bytes: None,
-            concurrent_command_ids: HashSet::new(),
+            concurrent_command_ids: StdBuckHashSet::default(),
             daemon_connection_failure: false,
             daemon_was_started: None,
             should_restart: false,
             client_metadata: Vec::new(),
+            agent_context: Vec::new(),
             command_errors: Vec::new(),
             exit_code: None,
             exit_result_name: None,
@@ -439,7 +451,9 @@ impl InvocationRecorder {
             peak_process_memory_bytes: None,
             has_new_buckconfigs: false,
             peak_used_disk_space_bytes: None,
-            active_networks_kinds: HashSet::new(),
+            peak_normalized_system_load1: None,
+            peak_normalized_system_load5: None,
+            active_networks_kinds: StdBuckHashSet::default(),
             target_cfg: None,
             hg_revision: None,
             has_local_changes: None,
@@ -453,7 +467,7 @@ impl InvocationRecorder {
             previous_uuid_with_mismatched_config: None,
             file_watcher: None,
             health_check_tags_receiver: None,
-            health_check_tags: HashSet::new(),
+            health_check_tags: StdBuckHashSet::default(),
             exec_time_ms: 0,
             initial_local_cache_hits_files_from_memory_cache: None,
             initial_local_cache_hits_files_from_filesystem_cache: None,
@@ -469,31 +483,40 @@ impl InvocationRecorder {
             max_in_progress_remote_actions: 0,
             current_in_progress_remote_uploads: 0,
             max_in_progress_remote_uploads: 0,
-            executor_stages_by_span: HashMap::new(),
+            executor_stages_by_span: StdBuckHashMap::default(),
             memory_max_anon_allprocs: None,
             memory_max_anon_forkserver_actions: None,
             memory_max_total_allprocs: None,
             memory_max_total_forkserver_actions: None,
+            memory_max_swap_bytes_allprocs: None,
+            memory_max_pressure_10s_avg_allprocs: None,
+            memory_max_pressure_60s_avg_allprocs: None,
             command_options: None,
-            initial_io_copy_count: IoCounterKey::Copy.get_finished(),
-            initial_io_symlink_count: IoCounterKey::Symlink.get_finished(),
-            initial_io_hardlink_count: IoCounterKey::Hardlink.get_finished(),
-            initial_io_mkdir_count: IoCounterKey::MkDir.get_finished(),
-            initial_io_readdir_count: IoCounterKey::ReadDir.get_finished(),
-            initial_io_readdir_eden_count: IoCounterKey::ReadDirEden.get_finished(),
-            initial_io_rmdir_count: IoCounterKey::RmDir.get_finished(),
-            initial_io_rmdir_all_count: IoCounterKey::RmDirAll.get_finished(),
-            initial_io_stat_count: IoCounterKey::Stat.get_finished(),
-            initial_io_stat_eden_count: IoCounterKey::StatEden.get_finished(),
-            initial_io_chmod_count: IoCounterKey::Chmod.get_finished(),
-            initial_io_readlink_count: IoCounterKey::ReadLink.get_finished(),
-            initial_io_remove_count: IoCounterKey::Remove.get_finished(),
-            initial_io_rename_count: IoCounterKey::Rename.get_finished(),
-            initial_io_read_count: IoCounterKey::Read.get_finished(),
-            initial_io_write_count: IoCounterKey::Write.get_finished(),
-            initial_io_canonicalize_count: IoCounterKey::Canonicalize.get_finished(),
-            initial_io_eden_settle_count: IoCounterKey::EdenSettle.get_finished(),
+            initial_io_copy_count: None,
+            initial_io_symlink_count: None,
+            initial_io_hardlink_count: None,
+            initial_io_mkdir_count: None,
+            initial_io_readdir_count: None,
+            initial_io_readdir_eden_count: None,
+            initial_io_rmdir_count: None,
+            initial_io_rmdir_all_count: None,
+            initial_io_stat_count: None,
+            initial_io_stat_eden_count: None,
+            initial_io_chmod_count: None,
+            initial_io_readlink_count: None,
+            initial_io_remove_count: None,
+            initial_io_rename_count: None,
+            initial_io_read_count: None,
+            initial_io_write_count: None,
+            initial_io_canonicalize_count: None,
+            initial_io_eden_settle_count: None,
+            repo_path: None,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn start_time(&self) -> SystemTime {
+        self.start_time
     }
 
     pub fn update_for_client_ctx(
@@ -519,6 +542,13 @@ impl InvocationRecorder {
                 client_id_from_client_metadata.to_owned(),
             );
         }
+
+        self.agent_context = ctx
+            .agent_context
+            .iter()
+            .map(AgentContextEntry::to_proto)
+            .collect();
+
         self.command_name = Some(command_name);
     }
 
@@ -571,6 +601,7 @@ impl InvocationRecorder {
         self.compressed_event_log_size_bytes = log_size_counter_bytes;
         self.health_check_tags_receiver = health_check_tags_receiver;
         self.preemptible = build_config_opts.and_then(|opts| opts.preemptible);
+        self.repo_path = paths.map(|p| p.project_root().root().to_string());
     }
 
     async fn build_count(
@@ -717,6 +748,25 @@ impl InvocationRecorder {
         let mut local_cache_lookups = None;
         let mut local_cache_lookup_latency_microseconds = None;
 
+        let mut io_copy_count = None;
+        let mut io_symlink_count = None;
+        let mut io_hardlink_count = None;
+        let mut io_mkdir_count = None;
+        let mut io_readdir_count = None;
+        let mut io_readdir_eden_count = None;
+        let mut io_rmdir_count = None;
+        let mut io_rmdir_all_count = None;
+        let mut io_stat_count = None;
+        let mut io_stat_eden_count = None;
+        let mut io_chmod_count = None;
+        let mut io_readlink_count = None;
+        let mut io_remove_count = None;
+        let mut io_rename_count = None;
+        let mut io_read_count = None;
+        let mut io_write_count = None;
+        let mut io_canonicalize_count = None;
+        let mut io_eden_settle_count = None;
+
         if let Some(snapshot) = &self.last_snapshot {
             sink_success_count =
                 calculate_diff_if_some(&snapshot.sink_successes, &self.initial_sink_success_count);
@@ -841,6 +891,57 @@ impl InvocationRecorder {
                 &self.initial_local_cache_lookup_latency_microseconds,
             );
 
+            io_copy_count =
+                calculate_diff_if_some(&snapshot.io_copy_count, &self.initial_io_copy_count);
+            io_symlink_count =
+                calculate_diff_if_some(&snapshot.io_symlink_count, &self.initial_io_symlink_count);
+            io_hardlink_count = calculate_diff_if_some(
+                &snapshot.io_hardlink_count,
+                &self.initial_io_hardlink_count,
+            );
+            io_mkdir_count =
+                calculate_diff_if_some(&snapshot.io_mkdir_count, &self.initial_io_mkdir_count);
+            io_readdir_count =
+                calculate_diff_if_some(&snapshot.io_readdir_count, &self.initial_io_readdir_count);
+            io_readdir_eden_count = calculate_diff_if_some(
+                &snapshot.io_readdir_eden_count,
+                &self.initial_io_readdir_eden_count,
+            );
+            io_rmdir_count =
+                calculate_diff_if_some(&snapshot.io_rmdir_count, &self.initial_io_rmdir_count);
+            io_rmdir_all_count = calculate_diff_if_some(
+                &snapshot.io_rmdir_all_count,
+                &self.initial_io_rmdir_all_count,
+            );
+            io_stat_count =
+                calculate_diff_if_some(&snapshot.io_stat_count, &self.initial_io_stat_count);
+            io_stat_eden_count = calculate_diff_if_some(
+                &snapshot.io_stat_eden_count,
+                &self.initial_io_stat_eden_count,
+            );
+            io_chmod_count =
+                calculate_diff_if_some(&snapshot.io_chmod_count, &self.initial_io_chmod_count);
+            io_readlink_count = calculate_diff_if_some(
+                &snapshot.io_readlink_count,
+                &self.initial_io_readlink_count,
+            );
+            io_remove_count =
+                calculate_diff_if_some(&snapshot.io_remove_count, &self.initial_io_remove_count);
+            io_rename_count =
+                calculate_diff_if_some(&snapshot.io_rename_count, &self.initial_io_rename_count);
+            io_read_count =
+                calculate_diff_if_some(&snapshot.io_read_count, &self.initial_io_read_count);
+            io_write_count =
+                calculate_diff_if_some(&snapshot.io_write_count, &self.initial_io_write_count);
+            io_canonicalize_count = calculate_diff_if_some(
+                &snapshot.io_canonicalize_count,
+                &self.initial_io_canonicalize_count,
+            );
+            io_eden_settle_count = calculate_diff_if_some(
+                &snapshot.io_eden_settle_count,
+                &self.initial_io_eden_settle_count,
+            );
+
             // We show memory/disk warnings in the console but we can't emit a tag event there due to having no access to dispatcher.
             // Also, it suffices to only emit a single tag per invocation, not one tag each time memory pressure is exceeded.
             // We can't just rely on the last snapshot here instead we use the peak memory/disk usage to check if we ever reported a warning.
@@ -870,15 +971,11 @@ impl InvocationRecorder {
         let mut metadata = Self::default_metadata();
         metadata.strings.extend(std::mem::take(&mut self.metadata));
 
-        let preemptible = self
-            .preemptible
-            .take()
-            .map(|p| match p {
-                PreemptibleWhen::Never => "NEVER",
-                PreemptibleWhen::Always => "ALWAYS",
-                PreemptibleWhen::OnDifferentState => "ON_DIFFERENT_STATE",
-            })
-            .unwrap_or("UNSPECIFIED");
+        let preemptible = self.preemptible.take().map_or("UNSPECIFIED", |p| match p {
+            PreemptibleWhen::Never => "NEVER",
+            PreemptibleWhen::Always => "ALWAYS",
+            PreemptibleWhen::OnDifferentState => "ON_DIFFERENT_STATE",
+        });
 
         let errors = self.finalize_errors();
 
@@ -1023,8 +1120,11 @@ impl InvocationRecorder {
             daemon_was_started: self.daemon_was_started.map(|t| t as i32),
             should_restart: Some(self.should_restart),
             client_metadata: std::mem::take(&mut self.client_metadata),
+            agent_context: std::mem::take(&mut self.agent_context),
             errors,
-            target_rule_type_names: std::mem::take(&mut self.target_rule_type_names),
+            target_rule_type_names: unique_and_sorted(
+                std::mem::take(&mut self.target_rule_type_names).into_iter(),
+            ),
             new_configs_used: Some(self.has_new_buckconfigs),
             re_max_download_speed: self
                 .re_max_download_speeds
@@ -1045,6 +1145,8 @@ impl InvocationRecorder {
             event_log_manifold_ttl_s: manifold_event_log_ttl().ok().map(|t| t.as_secs()),
             total_disk_space_bytes: self.system_info.total_disk_space_bytes.take(),
             peak_used_disk_space_bytes: self.peak_used_disk_space_bytes.take(),
+            peak_normalized_system_load1: self.peak_normalized_system_load1.take(),
+            peak_normalized_system_load5: self.peak_normalized_system_load5.take(),
             zdb_download_queries,
             zdb_download_bytes,
             zdb_upload_queries,
@@ -1084,12 +1186,9 @@ impl InvocationRecorder {
             local_cache_hits_files_from_memory_cache,
             local_cache_hits_files_from_filesystem_cache,
             local_cache_lookups,
-            re_average_local_cache_lookup_microseconds: local_cache_lookups
-                .map(|c| {
-                    local_cache_lookup_latency_microseconds
-                        .map(|duration| duration as f64 / c as f64)
-                })
-                .flatten(),
+            re_average_local_cache_lookup_microseconds: local_cache_lookups.and_then(|c| {
+                local_cache_lookup_latency_microseconds.map(|duration| duration as f64 / c as f64)
+            }),
             max_dice_in_progress_keys: Some(self.max_dice_in_progress_keys),
             max_dice_compute_keys: Some(self.max_dice_compute_keys),
             max_in_progress_actions: Some(self.max_in_progress_actions),
@@ -1100,97 +1199,33 @@ impl InvocationRecorder {
             memory_max_anon_forkserver_actions: self.memory_max_anon_forkserver_actions,
             memory_max_total_allprocs: self.memory_max_total_allprocs,
             memory_max_total_forkserver_actions: self.memory_max_total_forkserver_actions,
+            memory_max_swap_bytes_allprocs: self.memory_max_swap_bytes_allprocs.unwrap_or(0),
+            memory_max_pressure_10s_avg_allprocs: self
+                .memory_max_pressure_10s_avg_allprocs
+                .unwrap_or(0.0),
+            memory_max_pressure_60s_avg_allprocs: self
+                .memory_max_pressure_60s_avg_allprocs
+                .unwrap_or(0.0),
             command_options: self.command_options,
-            io_copy_count: Some(
-                IoCounterKey::Copy
-                    .get_finished()
-                    .saturating_sub(self.initial_io_copy_count),
-            ),
-            io_symlink_count: Some(
-                IoCounterKey::Symlink
-                    .get_finished()
-                    .saturating_sub(self.initial_io_symlink_count),
-            ),
-            io_hardlink_count: Some(
-                IoCounterKey::Hardlink
-                    .get_finished()
-                    .saturating_sub(self.initial_io_hardlink_count),
-            ),
-            io_mkdir_count: Some(
-                IoCounterKey::MkDir
-                    .get_finished()
-                    .saturating_sub(self.initial_io_mkdir_count),
-            ),
-            io_readdir_count: Some(
-                IoCounterKey::ReadDir
-                    .get_finished()
-                    .saturating_sub(self.initial_io_readdir_count),
-            ),
-            io_readdir_eden_count: Some(
-                IoCounterKey::ReadDirEden
-                    .get_finished()
-                    .saturating_sub(self.initial_io_readdir_eden_count),
-            ),
-            io_rmdir_count: Some(
-                IoCounterKey::RmDir
-                    .get_finished()
-                    .saturating_sub(self.initial_io_rmdir_count),
-            ),
-            io_rmdir_all_count: Some(
-                IoCounterKey::RmDirAll
-                    .get_finished()
-                    .saturating_sub(self.initial_io_rmdir_all_count),
-            ),
-            io_stat_count: Some(
-                IoCounterKey::Stat
-                    .get_finished()
-                    .saturating_sub(self.initial_io_stat_count),
-            ),
-            io_stat_eden_count: Some(
-                IoCounterKey::StatEden
-                    .get_finished()
-                    .saturating_sub(self.initial_io_stat_eden_count),
-            ),
-            io_chmod_count: Some(
-                IoCounterKey::Chmod
-                    .get_finished()
-                    .saturating_sub(self.initial_io_chmod_count),
-            ),
-            io_readlink_count: Some(
-                IoCounterKey::ReadLink
-                    .get_finished()
-                    .saturating_sub(self.initial_io_readlink_count),
-            ),
-            io_remove_count: Some(
-                IoCounterKey::Remove
-                    .get_finished()
-                    .saturating_sub(self.initial_io_remove_count),
-            ),
-            io_rename_count: Some(
-                IoCounterKey::Rename
-                    .get_finished()
-                    .saturating_sub(self.initial_io_rename_count),
-            ),
-            io_read_count: Some(
-                IoCounterKey::Read
-                    .get_finished()
-                    .saturating_sub(self.initial_io_read_count),
-            ),
-            io_write_count: Some(
-                IoCounterKey::Write
-                    .get_finished()
-                    .saturating_sub(self.initial_io_write_count),
-            ),
-            io_canonicalize_count: Some(
-                IoCounterKey::Canonicalize
-                    .get_finished()
-                    .saturating_sub(self.initial_io_canonicalize_count),
-            ),
-            io_eden_settle_count: Some(
-                IoCounterKey::EdenSettle
-                    .get_finished()
-                    .saturating_sub(self.initial_io_eden_settle_count),
-            ),
+            io_copy_count,
+            io_symlink_count,
+            io_hardlink_count,
+            io_mkdir_count,
+            io_readdir_count,
+            io_readdir_eden_count,
+            io_rmdir_count,
+            io_rmdir_all_count,
+            io_stat_count,
+            io_stat_eden_count,
+            io_chmod_count,
+            io_readlink_count,
+            io_remove_count,
+            io_rename_count,
+            io_read_count,
+            io_write_count,
+            io_canonicalize_count,
+            io_eden_settle_count,
+            repo_path: self.repo_path.take(),
         };
 
         let event = BuckEvent::new(
@@ -1206,7 +1241,10 @@ impl InvocationRecorder {
 
         if let Some(path) = &self.write_to_path {
             let res = (|| {
-                let out = fs_util::create_file(path).buck_error_context("Error opening")?;
+                let out = fs_util::create_file(path)
+                    // input path from --unstable-write-invocation-record
+                    .categorize_input()
+                    .buck_error_context("Error opening")?;
                 let mut out = std::io::BufWriter::new(out);
                 serde_json::to_writer(&mut out, event.event())
                     .buck_error_context("Error writing")?;
@@ -1242,11 +1280,11 @@ impl InvocationRecorder {
     // Collects client-side state and data, suitable for telemetry.
     // NOTE: If data is visible from the daemon, put it in cli::metadata::collect()
     fn default_metadata() -> buck2_data::TypedMetadata {
-        let mut ints = HashMap::new();
+        let mut ints = StdBuckHashMap::default();
         ints.insert("is_tty".to_owned(), std::io::stderr().is_tty() as i64);
         buck2_data::TypedMetadata {
             ints,
-            strings: HashMap::new(),
+            strings: StdBuckHashMap::default(),
         }
     }
 
@@ -1279,7 +1317,7 @@ impl InvocationRecorder {
         let command_data = command
             .data
             .as_ref()
-            .buck_error_context("Missing command data")?;
+            .ok_or_else(|| internal_error!("Missing command data"))?;
 
         let build_count = match command_data {
             buck2_data::command_end::Data::Build(..)
@@ -1299,7 +1337,7 @@ impl InvocationRecorder {
                     Ok(Some(build_count)) => build_count,
                     Ok(None) => Default::default(),
                     Err(e) => {
-                        let _ignored = soft_error!("build_count_error", e.into());
+                        let _ignored = soft_error!("build_count_error", e);
                         Default::default()
                     }
                 }
@@ -1483,10 +1521,8 @@ impl InvocationRecorder {
                 }
                 _ => {}
             },
-            Some(buck2_data::executor_stage_start::Stage::Local(local_stage)) => match &local_stage
-                .stage
-            {
-                Some(buck2_data::local_stage::Stage::Execute(_)) => {
+            Some(buck2_data::executor_stage_start::Stage::Local(local_stage)) => {
+                if let Some(buck2_data::local_stage::Stage::Execute(_)) = &local_stage.stage {
                     self.executor_stages_by_span
                         .insert(span_id.into(), ExecutorStageType::LocalAction);
                     self.current_in_progress_local_actions =
@@ -1498,8 +1534,7 @@ impl InvocationRecorder {
                     self.time_to_first_command_execution_start
                         .get_or_insert_with(|| duration_since(event.timestamp(), self.start_time));
                 }
-                _ => {}
-            },
+            }
             _ => {}
         }
         Ok(())
@@ -1735,12 +1770,6 @@ impl InvocationRecorder {
     ) -> buck2_error::Result<()> {
         let mut duration = Duration::default();
 
-        for node in &info.critical_path {
-            if let Some(d) = &node.duration {
-                duration += d.try_into_duration()?;
-            }
-        }
-
         for node in &info.critical_path2 {
             if let Some(d) = &node.duration {
                 duration += d.try_into_duration()?;
@@ -1907,6 +1936,62 @@ impl InvocationRecorder {
                 Some(update.local_cache_lookup_latency_microseconds);
         }
 
+        // Initialize IO counters from first snapshot
+        if self.initial_io_copy_count.is_none() {
+            self.initial_io_copy_count = update.io_copy_count;
+        }
+        if self.initial_io_symlink_count.is_none() {
+            self.initial_io_symlink_count = update.io_symlink_count;
+        }
+        if self.initial_io_hardlink_count.is_none() {
+            self.initial_io_hardlink_count = update.io_hardlink_count;
+        }
+        if self.initial_io_mkdir_count.is_none() {
+            self.initial_io_mkdir_count = update.io_mkdir_count;
+        }
+        if self.initial_io_readdir_count.is_none() {
+            self.initial_io_readdir_count = update.io_readdir_count;
+        }
+        if self.initial_io_readdir_eden_count.is_none() {
+            self.initial_io_readdir_eden_count = update.io_readdir_eden_count;
+        }
+        if self.initial_io_rmdir_count.is_none() {
+            self.initial_io_rmdir_count = update.io_rmdir_count;
+        }
+        if self.initial_io_rmdir_all_count.is_none() {
+            self.initial_io_rmdir_all_count = update.io_rmdir_all_count;
+        }
+        if self.initial_io_stat_count.is_none() {
+            self.initial_io_stat_count = update.io_stat_count;
+        }
+        if self.initial_io_stat_eden_count.is_none() {
+            self.initial_io_stat_eden_count = update.io_stat_eden_count;
+        }
+        if self.initial_io_chmod_count.is_none() {
+            self.initial_io_chmod_count = update.io_chmod_count;
+        }
+        if self.initial_io_readlink_count.is_none() {
+            self.initial_io_readlink_count = update.io_readlink_count;
+        }
+        if self.initial_io_remove_count.is_none() {
+            self.initial_io_remove_count = update.io_remove_count;
+        }
+        if self.initial_io_rename_count.is_none() {
+            self.initial_io_rename_count = update.io_rename_count;
+        }
+        if self.initial_io_read_count.is_none() {
+            self.initial_io_read_count = update.io_read_count;
+        }
+        if self.initial_io_write_count.is_none() {
+            self.initial_io_write_count = update.io_write_count;
+        }
+        if self.initial_io_canonicalize_count.is_none() {
+            self.initial_io_canonicalize_count = update.io_canonicalize_count;
+        }
+        if self.initial_io_eden_settle_count.is_none() {
+            self.initial_io_eden_settle_count = update.io_eden_settle_count;
+        }
+
         for s in self.re_max_download_speeds.iter_mut() {
             s.update(event.timestamp(), update.re_download_bytes);
         }
@@ -1928,6 +2013,20 @@ impl InvocationRecorder {
             update.used_disk_space_bytes,
         );
 
+        if let Some(ref unix_stats) = update.unix_system_stats {
+            let num_cores = self.system_info.num_cores.unwrap_or(1) as f64;
+            let normalized_load1 = unix_stats.load1 / num_cores;
+            let normalized_load5 = unix_stats.load5 / num_cores;
+            self.peak_normalized_system_load1 = Some(
+                self.peak_normalized_system_load1
+                    .map_or(normalized_load1, |v| f64::max(v, normalized_load1)),
+            );
+            self.peak_normalized_system_load5 = Some(
+                self.peak_normalized_system_load5
+                    .map_or(normalized_load5, |v| f64::max(v, normalized_load5)),
+            );
+        }
+
         // Track maximum buck2 daemon memory usage from cgroup
         if let Some(allprocs_cgroup) = &update.allprocs_cgroup {
             self.memory_max_anon_allprocs =
@@ -1936,6 +2035,23 @@ impl InvocationRecorder {
                 allprocs_cgroup.anon + allprocs_cgroup.file + allprocs_cgroup.kernel;
             self.memory_max_total_allprocs =
                 max(self.memory_max_total_allprocs, Some(total_daemon_memory));
+            // Track peak allprocs swap usage
+            self.memory_max_swap_bytes_allprocs = max(
+                self.memory_max_swap_bytes_allprocs,
+                Some(allprocs_cgroup.swap_bytes),
+            );
+            // Track peak allprocs memory pressure (avg10 from PSI)
+            let pct = allprocs_cgroup.memory_pressure_10s_avg;
+            self.memory_max_pressure_10s_avg_allprocs = Some(
+                self.memory_max_pressure_10s_avg_allprocs
+                    .map_or(pct, |v| f64::max(v, pct)),
+            );
+            // Track peak allprocs memory pressure (avg60 from PSI)
+            let pct = allprocs_cgroup.memory_pressure_60s_avg;
+            self.memory_max_pressure_60s_avg_allprocs = Some(
+                self.memory_max_pressure_60s_avg_allprocs
+                    .map_or(pct, |v| f64::max(v, pct)),
+            );
         }
 
         // Track maximum buck2 forkserver memory usage from cgroup
@@ -1955,7 +2071,7 @@ impl InvocationRecorder {
 
         for stat in update.network_interface_stats.values() {
             if stat.rx_bytes > 0 || stat.tx_bytes > 0 {
-                self.active_networks_kinds.insert(stat.network_kind.into());
+                self.active_networks_kinds.insert(stat.network_kind);
             }
         }
         self.try_read_health_check_tags();
@@ -1973,7 +2089,7 @@ impl InvocationRecorder {
         // See: https://fb.workplace.com/groups/buck2dev/permalink/3396726613948720/
         self.file_watcher_stats =
             merge_file_watcher_stats(self.file_watcher_stats.take(), file_watcher.stats.clone());
-        if let Some(duration) = duration.cloned().and_then(|x| Duration::try_from(x).ok()) {
+        if let Some(duration) = duration.copied().and_then(|x| Duration::try_from(x).ok()) {
             *self.file_watcher_duration.get_or_insert_default() += duration;
         }
         if let Some(stats) = &file_watcher.stats {
@@ -2112,7 +2228,11 @@ impl InvocationRecorder {
 
         match event.data() {
             buck2_data::buck_event::Data::SpanStart(start) => {
-                match start.data.as_ref().buck_error_context("Missing `start`")? {
+                match start
+                    .data
+                    .as_ref()
+                    .ok_or_else(|| internal_error!("Missing `start`"))?
+                {
                     buck2_data::span_start_event::Data::Command(command) => {
                         self.handle_command_start(command, event)
                     }
@@ -2134,7 +2254,7 @@ impl InvocationRecorder {
                     buck2_data::span_start_event::Data::TestDiscovery(test_discovery) => {
                         self.handle_test_discovery_start(test_discovery, event)
                     }
-                    buck2_data::span_start_event::Data::TestStart(test_start) => {
+                    buck2_data::span_start_event::Data::TestRun(test_start) => {
                         self.handle_test_run_start(test_start, event)
                     }
                     buck2_data::span_start_event::Data::FileWatcher(file_watcher) => {
@@ -2144,7 +2264,11 @@ impl InvocationRecorder {
                 }
             }
             buck2_data::buck_event::Data::SpanEnd(end) => {
-                match end.data.as_ref().buck_error_context("Missing `end`")? {
+                match end
+                    .data
+                    .as_ref()
+                    .ok_or_else(|| internal_error!("Missing `end`"))?
+                {
                     buck2_data::span_end_event::Data::Command(command) => {
                         self.handle_command_end(command, event).await
                     }
@@ -2191,7 +2315,11 @@ impl InvocationRecorder {
                 }
             }
             buck2_data::buck_event::Data::Instant(instant) => {
-                match instant.data.as_ref().buck_error_context("Missing `data`")? {
+                match instant
+                    .data
+                    .as_ref()
+                    .ok_or_else(|| internal_error!("Missing `data`"))?
+                {
                     buck2_data::instant_event::Data::ReSession(session) => {
                         self.handle_re_session_created(session, event)
                     }
@@ -2238,6 +2366,11 @@ impl InvocationRecorder {
                         self.target_cfg = Some(target_cfg.clone());
                         Ok(())
                     }
+                    buck2_data::instant_event::Data::TargetRuleTypeName(rule_type) => {
+                        self.target_rule_type_names
+                            .push(rule_type.rule_type.clone());
+                        Ok(())
+                    }
                     buck2_data::instant_event::Data::VersionControlRevision(revision) => {
                         self.handle_version_control(revision)
                     }
@@ -2253,7 +2386,7 @@ impl InvocationRecorder {
                     buck2_data::instant_event::Data::DiceStateSnapshot(dice_state_snapshot) => {
                         self.handle_dice_state_snapshot(dice_state_snapshot)
                     }
-                    buck2_data::instant_event::Data::ComandOptions(command_options) => {
+                    buck2_data::instant_event::Data::CommandOptions(command_options) => {
                         self.handle_command_options(command_options)
                     }
                     _ => Ok(()),
@@ -2297,7 +2430,6 @@ fn process_error_report(error: buck2_data::ErrorReport) -> buck2_data::Processed
     let tags = tags.chain(string_tags).collect();
 
     buck2_data::ProcessedErrorReport {
-        tier: None,
         message: strip_ansi_codes(&error.message).to_string(),
         telemetry_message: error
             .telemetry_message
@@ -2337,11 +2469,9 @@ impl EventSubscriber for InvocationRecorder {
         &mut self,
         c: &Option<SuperConsoleToggle>,
     ) -> buck2_error::Result<()> {
-        match c {
-            Some(c) => self
-                .tags
-                .push(format!("superconsole-toggle:{}", c.key()).to_owned()),
-            None => {}
+        if let Some(c) = c {
+            self.tags
+                .push(format!("superconsole-toggle:{}", c.key()).to_owned())
         }
         Ok(())
     }
@@ -2353,18 +2483,19 @@ impl EventSubscriber for InvocationRecorder {
         self.has_command_result = true;
         match &result.result {
             Some(command_result::Result::BuildResponse(res)) => {
-                let built_rule_type_names: Vec<String> =
-                    unique_and_sorted(res.build_targets.iter().map(|t| {
+                // Append per-BuildTarget rule type names from the build
+                // response. Extending (not assigning) preserves rule types
+                // already accumulated from `TargetRuleTypeName` instant events.
+                self.target_rule_type_names
+                    .extend(res.build_targets.iter().map(|t| {
                         t.target_rule_type_name
                             .clone()
                             .unwrap_or_else(|| "NULL".to_owned())
                     }));
-                self.target_rule_type_names = built_rule_type_names;
             }
-            Some(command_result::Result::TestResponse(res)) => {
-                let built_rule_type_names: Vec<String> =
-                    unique_and_sorted(res.target_rule_type_names.clone().into_iter());
-                self.target_rule_type_names = built_rule_type_names;
+            Some(command_result::Result::InstallResponse(res)) => {
+                self.target_rule_type_names
+                    .extend(res.target_rule_type_names.iter().cloned());
             }
             _ => {}
         }
@@ -2399,7 +2530,7 @@ impl EventSubscriber for InvocationRecorder {
         self.has_end_of_stream = true;
     }
 
-    async fn finalize(&mut self) -> buck2_error::Result<()> {
+    async fn finalize(mut self: Box<Self>) -> buck2_error::Result<()> {
         // Can't set this before the daemon forks.
         // Typically initialized already unless the command failed early.
         let fb = buck2_common::fbinit::get_or_init_fbcode_globals();

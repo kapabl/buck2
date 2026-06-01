@@ -30,15 +30,15 @@ use buck2_directory::directory::directory::Directory;
 use buck2_directory::directory::directory_hasher::NoDigest;
 use buck2_directory::directory::directory_iterator::DirectoryIterator;
 use buck2_directory::directory::entry::DirectoryEntry;
-use buck2_error::BuckErrorContext;
 use buck2_error::internal_error;
 use buck2_execute::execute::request::OutputType;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
+use buck2_hash::BuckIndexSet;
 use dupe::Dupe;
 use dupe::OptionDupedExt;
 use gazebo::prelude::SliceExt;
-use indexmap::IndexSet;
+use pagable::Pagable;
 use starlark::codemap::FileSpan;
 use starlark::collections::SmallMap;
 use starlark::collections::SmallSet;
@@ -81,7 +81,7 @@ impl<'v> ActionsRegistry<'v> {
     pub fn declare_dynamic_output(
         &mut self,
         artifact: &BuildArtifact,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> buck2_error::Result<DeclaredArtifact<'v>> {
         if !self.pending.is_empty() {
             return Err(internal_error!(
@@ -173,7 +173,7 @@ impl<'v> ActionsRegistry<'v> {
         output_type: OutputType,
         declaration_location: Option<FileSpan>,
         path_resolution_method: BuckOutPathKind,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> buck2_error::Result<DeclaredArtifact<'v>> {
         let (path, hidden) = match prefix {
             None => (path, 0),
@@ -196,7 +196,7 @@ impl<'v> ActionsRegistry<'v> {
     pub fn register<A: UnregisteredAction + 'static>(
         &mut self,
         self_key: &DeferredHolderKey,
-        outputs: IndexSet<OutputArtifact>,
+        outputs: BuckIndexSet<OutputArtifact>,
         action: A,
     ) -> buck2_error::Result<ActionKey> {
         let key = ActionKey::new(
@@ -208,7 +208,7 @@ impl<'v> ActionsRegistry<'v> {
                 (self.declared_dynamic_outputs.len() + self.pending.len()).try_into()?,
             ),
         );
-        let mut bound_outputs = IndexSet::with_capacity(outputs.len());
+        let mut bound_outputs = BuckIndexSet::with_capacity(outputs.len());
         for output in outputs {
             let bound = output.bind(key.dupe())?.as_base_artifact().dupe();
             bound_outputs.insert(bound);
@@ -248,9 +248,8 @@ impl<'v> ActionsRegistry<'v> {
                 let action = a.register(starlark_data, error_handler)?;
                 match (action.category(), action.identifier()) {
                     (category, Some(identifier)) => {
-                        let existing_identifiers = observed_names
-                            .entry(category.to_owned())
-                            .or_insert_with(HashSet::<String>::new);
+                        let existing_identifiers =
+                            observed_names.entry(category.to_owned()).or_default();
                         // false -> identifier was already present in the set
                         if !existing_identifiers.insert(identifier.to_owned()) {
                             return Err(ActionErrors::ActionCategoryIdentifierNotUnique(
@@ -308,7 +307,7 @@ impl<'v> ActionsRegistry<'v> {
     }
 }
 
-#[derive(Debug, Allocative)]
+#[derive(Debug, Allocative, Pagable)]
 pub struct RecordedActions {
     /// Vec of actions indexed by ActionKey::id.
     ///
@@ -358,7 +357,7 @@ impl RecordedActions {
         self.actions
             .get(key.action_index().0 as usize)
             .duped()
-            .with_internal_error(|| format!("action key missing in recorded actions {key}"))
+            .ok_or_else(|| internal_error!("action key missing in recorded actions {key}"))
     }
 
     /// Iterates over the actions created in this analysis.

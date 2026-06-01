@@ -19,9 +19,10 @@ buck2_common = { workspace = true }
 buck2_core = { workspace = true }
 buck2_error = { workspace = true }
 buck2_fs = { workspace = true }
+buck2_hash = { workspace = true }
 
 [dev-dependencies]
 paste = { workspace = true }
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(buck_build)"] }
+[lints]
+workspace = true

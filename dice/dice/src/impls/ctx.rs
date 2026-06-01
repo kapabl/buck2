@@ -20,7 +20,9 @@ use dice_error::DiceError;
 use dice_error::DiceResult;
 use dice_error::result::CancellableResult;
 use dice_error::result::CancellationReason;
+use dice_futures::cancellation::CancellationContext;
 use dice_futures::owning_future::OwningFuture;
+use dice_futures::spawn::spawn_dropcancel;
 use dupe::Dupe;
 use futures::FutureExt;
 use futures::TryFutureExt;
@@ -34,6 +36,7 @@ use crate::LinearRecomputeDiceComputations;
 use crate::UserCycleDetectorGuard;
 use crate::api::activation_tracker::ActivationData;
 use crate::api::computations::DiceComputations;
+use crate::api::computations::DiceComputationsData;
 use crate::api::data::DiceData;
 use crate::api::invalidation_tracking::DiceKeyTrackedInvalidationPaths;
 use crate::api::key::Key;
@@ -54,7 +57,7 @@ use crate::impls::events::DiceEventDispatcher;
 use crate::impls::key::CowDiceKeyHashed;
 use crate::impls::key::DiceKey;
 use crate::impls::key::ParentKey;
-use crate::impls::opaque::OpaqueValueModern;
+use crate::impls::opaque::OpaqueValue;
 use crate::impls::task::PreviouslyCancelledTask;
 use crate::impls::task::promise::DicePromise;
 use crate::impls::task::sync_dice_task;
@@ -175,7 +178,7 @@ impl ModernComputeCtx<'_> {
     pub(crate) fn compute_opaque<'a, K>(
         &'a self,
         key: &K,
-    ) -> impl Future<Output = DiceResult<OpaqueValueModern<K>>> + use<'a, K>
+    ) -> impl Future<Output = DiceResult<OpaqueValue<K>>> + use<'a, K>
     where
         K: Key,
     {
@@ -185,14 +188,14 @@ impl ModernComputeCtx<'_> {
     fn compute_opaque_impl<K>(
         ctx_data: &CoreCtx,
         key: &K,
-    ) -> impl Future<Output = DiceResult<OpaqueValueModern<K>>> + use<K>
+    ) -> impl Future<Output = DiceResult<OpaqueValue<K>>> + use<K>
     where
         K: Key,
     {
         ctx_data.compute_opaque(key).map(move |cancellable_result| {
             let cancellable = cancellable_result.map(move |(dice_key, dice_value)| {
                 let (value, invalidation_paths) = dice_value.into_parts();
-                OpaqueValueModern::new(dice_key, value, invalidation_paths)
+                OpaqueValue::new(dice_key, value, invalidation_paths)
             });
 
             cancellable.map_err(DiceError::cancelled)
@@ -288,15 +291,63 @@ impl ModernComputeCtx<'_> {
         })
     }
 
-    pub(crate) fn opaque_into_value<K: Key>(&mut self, opaque: OpaqueValueModern<K>) -> K::Value {
+    pub fn spawned<'a, T, Compute>(
+        &'a mut self,
+        closure: Compute,
+    ) -> impl Future<Output = T> + use<'a, Compute, T>
+    where
+        T: Send + 'static,
+        Compute: (for<'x> FnOnce(
+                &'x mut DiceComputations<'_>,
+                &'x CancellationContext,
+            ) -> BoxFuture<'x, T>)
+            + Send
+            + 'static,
+    {
+        let (ctx_data, self_dep_trackers) = self.unpack();
+        let mut inner_ctx: DiceComputations<'static> =
+            DiceComputations(DiceComputationsImpl(ModernComputeCtx::new(
+                ctx_data.parent_key,
+                ctx_data.cycles.clone(),
+                ctx_data.async_evaluator.dupe(),
+            )));
+
+        let user_data = ctx_data.per_transaction_data();
+        let spawner = user_data.spawner.dupe();
+        let ctx_data = user_data.dupe();
+
+        let task = spawn_dropcancel(
+            |cancellation| {
+                async move {
+                    let res = closure(&mut inner_ctx, cancellation).await;
+                    let dep_trackers = inner_ctx.0.0.into_owned().1;
+                    (res, dep_trackers)
+                }
+                .boxed()
+            },
+            &*spawner,
+            ctx_data,
+        );
+
+        task.map(move |(res, dep_trackers)| {
+            let deps = dep_trackers.collect_deps();
+            let validity = deps.deps_validity;
+            let mut self_dep_trackers = self_dep_trackers.lock();
+            for k in deps.deps.iter_keys() {
+                self_dep_trackers.record(k, validity, TrackedInvalidationPaths::clean())
+            }
+            self_dep_trackers.update_invalidation_paths(deps.invalidation_paths.dupe());
+
+            res
+        })
+    }
+
+    pub(crate) fn opaque_into_value<K: Key>(&mut self, opaque: OpaqueValue<K>) -> K::Value {
         Self::opaque_into_value_impl(self.unpack().1, opaque)
     }
 
-    fn opaque_into_value_impl<K: Key>(
-        deps: DepsTrackerHolder,
-        opaque: OpaqueValueModern<K>,
-    ) -> K::Value {
-        let OpaqueValueModern {
+    fn opaque_into_value_impl<K: Key>(deps: DepsTrackerHolder, opaque: OpaqueValue<K>) -> K::Value {
+        let OpaqueValue {
             derive_from_key,
             derive_from,
             invalidation_paths,
@@ -323,6 +374,12 @@ impl ModernComputeCtx<'_> {
             normal,
             high,
         )
+    }
+
+    pub(crate) fn data(&self) -> DiceComputationsData {
+        DiceComputationsData(ModernDiceComputationsData(
+            self.ctx_data().async_evaluator.dupe(),
+        ))
     }
 }
 
@@ -404,6 +461,20 @@ impl<'a> ModernComputeCtxParallelBuilder<'a> {
             )
             .right_future(),
         }
+    }
+}
+
+/// A holder for the user data attached to DICE.
+#[derive(Clone, Dupe)]
+pub struct ModernDiceComputationsData(AsyncEvaluator);
+
+impl ModernDiceComputationsData {
+    pub fn global_data(&self) -> &DiceData {
+        &self.0.dice.global_data
+    }
+
+    pub fn per_transaction_data(&self) -> &UserComputationData {
+        &self.0.user_data
     }
 }
 
@@ -561,7 +632,7 @@ impl ModernComputeCtx<'_> {
     /// Compute "projection" based on deriving value
     pub(crate) fn projection<K: Key, P: ProjectionKey<DeriveFromKey = K>>(
         &mut self,
-        derive_from: &OpaqueValueModern<K>,
+        derive_from: &OpaqueValue<K>,
         key: &P,
     ) -> DiceResult<P::Value> {
         let (ctx_data, dep_trackers) = self.unpack();
@@ -637,7 +708,7 @@ impl CoreCtx {
     fn project<B: Key, K: ProjectionKey<DeriveFromKey = B>>(
         &self,
         key: &K,
-        base: &OpaqueValueModern<B>,
+        base: &OpaqueValue<B>,
         dep_trackers: DepsTrackerHolder,
     ) -> DiceResult<K::Value> {
         let dice_key = self
@@ -729,7 +800,7 @@ impl CoreCtx {
 #[derivative(Debug)]
 pub(crate) struct SharedLiveTransactionCtx {
     version: VersionNumber,
-    version_epoch: VersionEpoch,
+    pub(crate) version_epoch: VersionEpoch,
     #[derivative(Debug = "ignore")]
     cache: SharedCache,
 }
@@ -779,7 +850,7 @@ impl SharedLiveTransactionCtx {
                                 eval,
                                 cycles,
                                 events,
-                                Some(PreviouslyCancelledTask { previous }),
+                                Some(PreviouslyCancelledTask::new(previous)),
                             )
                         });
 
@@ -895,50 +966,5 @@ impl EvaluationData {
 
     pub(crate) fn into_activation_data(self) -> ActivationData {
         ActivationData::Evaluated(self.0)
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod testing {
-    use crate::impls::cache::DiceTaskRef;
-    use crate::impls::core::versions::VersionEpoch;
-    use crate::impls::ctx::SharedLiveTransactionCtx;
-    use crate::impls::key::DiceKey;
-    use crate::impls::key::ParentKey;
-    use crate::impls::task::promise::DiceSyncResult;
-    use crate::impls::task::sync_dice_task;
-    use crate::impls::value::DiceComputedValue;
-
-    impl SharedLiveTransactionCtx {
-        pub(crate) fn inject(&self, k: DiceKey, v: DiceComputedValue) {
-            // TODO(cjhopman): We should delete this. tests using it are doing weird things and
-            // causing the transaction cache to be out of sync with what is possible in real
-            // execution and it makes things really difficult to reason about. These tests
-            // should be constructing the states they want to test via valid interactions
-            // with things.
-            let task = unsafe {
-                // SAFETY: completed immediately below
-                sync_dice_task(k)
-            };
-            let _r = task
-                .depended_on_by(ParentKey::None)
-                .unwrap()
-                .sync_get_or_complete(|| DiceSyncResult::testing(v));
-
-            match self.cache.get(k) {
-                DiceTaskRef::Computed(_) => panic!("cannot inject already computed task"),
-                DiceTaskRef::Occupied(o) => {
-                    o.replace_entry(task);
-                }
-                DiceTaskRef::Vacant(v) => {
-                    v.insert(task);
-                }
-                DiceTaskRef::TransactionCancelled => panic!("transaction cancelled"),
-            }
-        }
-
-        pub(crate) fn testing_get_epoch(&self) -> VersionEpoch {
-            self.version_epoch
-        }
     }
 }

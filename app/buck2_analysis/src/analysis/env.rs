@@ -8,8 +8,8 @@
  * above-listed licenses.
  */
 
-use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use buck2_build_api::analysis::AnalysisResult;
 use buck2_build_api::analysis::anon_promises_dyn::RunAnonPromisesAccessorPair;
@@ -31,8 +31,10 @@ use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
 use buck2_core::unsafe_send_future::UnsafeSendFuture;
 use buck2_error::BuckErrorContext;
 use buck2_error::conversion::from_any_with_tag;
+use buck2_error::internal_error;
 use buck2_events::dispatch::get_dispatcher;
 use buck2_execute::digest_config::HasDigestConfig;
+use buck2_hash::StdBuckHashMap;
 use buck2_interpreter::dice::starlark_provider::StarlarkEvalKind;
 use buck2_interpreter::factory::BuckStarlarkModule;
 use buck2_interpreter::factory::StarlarkEvaluatorProvider;
@@ -56,6 +58,7 @@ use starlark::values::ValueTyped;
 use starlark::values::ValueTypedComplex;
 use starlark_map::small_map::SmallMap;
 
+use crate::analysis::calculation::AnalysisSplitInstants;
 use crate::analysis::plugins::plugins_to_starlark_value;
 use crate::attrs::resolve::ctx::AnalysisQueryResult;
 use crate::attrs::resolve::ctx::AttrResolutionContext;
@@ -74,15 +77,15 @@ enum AnalysisError {
 
 // Contains a `module` that things must live on, and various `FrozenProviderCollectionValue`s
 // that are NOT tied to that module. Must claim ownership of them via `add_reference` before returning them.
-pub struct RuleAnalysisAttrResolutionContext<'v> {
-    pub module: &'v Module,
-    pub dep_analysis_results: HashMap<ConfiguredTargetLabel, FrozenProviderCollectionValue>,
-    pub query_results: HashMap<String, Arc<AnalysisQueryResult>>,
+pub struct RuleAnalysisAttrResolutionContext<'a, 'v> {
+    pub module: &'a Module<'v>,
+    pub dep_analysis_results: StdBuckHashMap<ConfiguredTargetLabel, FrozenProviderCollectionValue>,
+    pub query_results: StdBuckHashMap<String, Arc<AnalysisQueryResult>>,
     pub execution_platform_resolution: ExecutionPlatformResolution,
 }
 
-impl<'v> AttrResolutionContext<'v> for &'_ RuleAnalysisAttrResolutionContext<'v> {
-    fn starlark_module(&self) -> &'v Module {
+impl<'a, 'v> AttrResolutionContext<'v> for &'_ RuleAnalysisAttrResolutionContext<'a, 'v> {
+    fn starlark_module(&self) -> &Module<'v> {
         self.module
     }
 
@@ -114,24 +117,24 @@ impl<'v> AttrResolutionContext<'v> for &'_ RuleAnalysisAttrResolutionContext<'v>
 }
 
 pub fn get_dep<'v>(
-    dep_analysis_results: &HashMap<ConfiguredTargetLabel, FrozenProviderCollectionValue>,
+    dep_analysis_results: &StdBuckHashMap<ConfiguredTargetLabel, FrozenProviderCollectionValue>,
     target: &ConfiguredProvidersLabel,
-    module: &'v Module,
+    module: &Module<'v>,
 ) -> buck2_error::Result<FrozenValueTyped<'v, FrozenProviderCollection>> {
     match dep_analysis_results.get(target.target()) {
         None => Err(AnalysisError::MissingDep(target.dupe()).into()),
         Some(x) => {
             let x = x.lookup_inner(target)?;
             // IMPORTANT: Anything given back to the user must be kept alive
-            Ok(x.add_heap_ref(module.frozen_heap()))
+            Ok(x.add_heap_ref(module.heap()))
         }
     }
 }
 
-pub fn resolve_unkeyed_placeholder<'v>(
-    dep_analysis_results: &HashMap<ConfiguredTargetLabel, FrozenProviderCollectionValue>,
+pub fn resolve_unkeyed_placeholder(
+    dep_analysis_results: &StdBuckHashMap<ConfiguredTargetLabel, FrozenProviderCollectionValue>,
     name: &str,
-    module: &'v Module,
+    module: &Module,
 ) -> Option<FrozenCommandLineArg> {
     // TODO(cjhopman): Make it an error if two deps provide a value for the placeholder.
     for providers in dep_analysis_results.values() {
@@ -152,7 +155,7 @@ pub fn resolve_unkeyed_placeholder<'v>(
 }
 
 pub fn resolve_query(
-    query_results: &HashMap<String, Arc<AnalysisQueryResult>>,
+    query_results: &StdBuckHashMap<String, Arc<AnalysisQueryResult>>,
     query: &str,
     module: &Module,
 ) -> buck2_error::Result<Arc<AnalysisQueryResult>> {
@@ -185,7 +188,7 @@ pub trait RuleSpec: Sync {
 struct AnalysisEnv<'a> {
     rule_spec: &'a dyn RuleSpec,
     deps: Vec<(&'a ConfiguredTargetLabel, AnalysisResult)>,
-    query_results: HashMap<String, Arc<AnalysisQueryResult>>,
+    query_results: StdBuckHashMap<String, Arc<AnalysisQueryResult>>,
     execution_platform: &'a ExecutionPlatformResolution,
     label: ConfiguredTargetLabel,
     cancellation: &'a CancellationContext,
@@ -195,12 +198,12 @@ pub(crate) async fn run_analysis<'a>(
     dice: &'a mut DiceComputations<'_>,
     label: &ConfiguredTargetLabel,
     results: Vec<(&'a ConfiguredTargetLabel, AnalysisResult)>,
-    query_results: HashMap<String, Arc<AnalysisQueryResult>>,
+    query_results: StdBuckHashMap<String, Arc<AnalysisQueryResult>>,
     execution_platform: &'a ExecutionPlatformResolution,
     rule_spec: &'a dyn RuleSpec,
     node: ConfiguredTargetNodeRef<'a>,
     cancellation: &CancellationContext,
-) -> buck2_error::Result<AnalysisResult> {
+) -> buck2_error::Result<(AnalysisResult, Option<AnalysisSplitInstants>)> {
     let analysis_env = AnalysisEnv {
         rule_spec,
         deps: results,
@@ -214,11 +217,11 @@ pub(crate) async fn run_analysis<'a>(
 
 pub fn get_deps_from_analysis_results(
     results: Vec<(&ConfiguredTargetLabel, AnalysisResult)>,
-) -> buck2_error::Result<HashMap<ConfiguredTargetLabel, FrozenProviderCollectionValue>> {
+) -> buck2_error::Result<StdBuckHashMap<ConfiguredTargetLabel, FrozenProviderCollectionValue>> {
     results
         .into_iter()
         .map(|(label, result)| Ok((label.dupe(), result.providers()?.to_owned())))
-        .collect::<buck2_error::Result<HashMap<ConfiguredTargetLabel, FrozenProviderCollectionValue>>>()
+        .collect::<buck2_error::Result<StdBuckHashMap<ConfiguredTargetLabel, FrozenProviderCollectionValue>>>()
 }
 
 // Used to express that the impl Future below captures multiple named lifetimes.
@@ -230,7 +233,9 @@ fn run_analysis_with_env<'a, 'd: 'a>(
     dice: &'a mut DiceComputations<'d>,
     analysis_env: AnalysisEnv<'a>,
     node: ConfiguredTargetNodeRef<'a>,
-) -> impl Future<Output = buck2_error::Result<AnalysisResult>> + 'a + Captures<'d> {
+) -> impl Future<Output = buck2_error::Result<(AnalysisResult, Option<AnalysisSplitInstants>)>>
++ 'a
++ Captures<'d> {
     let fut = async move { run_analysis_with_env_underlying(dice, analysis_env, node).await };
     unsafe { UnsafeSendFuture::new_encapsulates_starlark(fut) }
 }
@@ -239,9 +244,8 @@ async fn run_analysis_with_env_underlying(
     dice: &mut DiceComputations<'_>,
     analysis_env: AnalysisEnv<'_>,
     node: ConfiguredTargetNodeRef<'_>,
-) -> buck2_error::Result<AnalysisResult> {
-    BuckStarlarkModule::with_profiling_async(|env_provider| async move {
-        let env = env_provider.make();
+) -> buck2_error::Result<(AnalysisResult, Option<AnalysisSplitInstants>)> {
+    BuckStarlarkModule::with_profiling_async(async move |env| {
         let print = EventDispatcherPrintHandler(get_dispatcher());
 
         let validations_from_deps = analysis_env
@@ -280,7 +284,7 @@ async fn run_analysis_with_env_underlying(
         let mut reentrant_eval =
             eval_provider.make_reentrant_evaluator(&env, analysis_env.cancellation.into())?;
 
-        let (ctx, list_res) = reentrant_eval.with_evaluator(|mut eval| {
+        let (ctx, list_res) = reentrant_eval.with_evaluator(|eval| {
             eval.set_print_handler(&print);
             eval.set_soft_error_handler(&Buck2StarlarkSoftErrorHandler);
 
@@ -293,14 +297,26 @@ async fn run_analysis_with_env_underlying(
                 dice.global_data().get_digest_config(),
             );
 
-            let list_res = analysis_env.rule_spec.invoke(&mut eval, ctx)?;
+            let list_res = analysis_env.rule_spec.invoke(eval, ctx)?;
 
             Ok((ctx, list_res))
         })?;
 
-        ctx.actions
+        let pre_promises = Instant::now();
+        let resolved_any = ctx
+            .actions
             .run_promises(&mut RunAnonPromisesAccessorPair(&mut reentrant_eval, dice))
             .await?;
+        let post_promises = Instant::now();
+
+        let split_instants = if resolved_any {
+            Some(AnalysisSplitInstants {
+                pre_promises,
+                post_promises,
+            })
+        } else {
+            None
+        };
 
         // Pull the ctx object back out, and steal ctx.action's state back
         let analysis_registry = ctx.take_state();
@@ -330,13 +346,16 @@ async fn run_analysis_with_env_underlying(
 
         Ok((
             token,
-            AnalysisResult::new(
-                recorded_values,
-                profile_data,
-                HashMap::new(),
-                declared_actions,
-                declared_artifacts,
-                validations,
+            (
+                AnalysisResult::new(
+                    recorded_values,
+                    profile_data,
+                    StdBuckHashMap::default(),
+                    declared_actions,
+                    declared_artifacts,
+                    validations,
+                ),
+                split_instants,
             ),
         ))
     })
@@ -350,8 +369,7 @@ pub fn transitive_validations(
     let provider_collection = provider_collection.to_owned();
     let info = provider_collection
         .value
-        .maybe_map(|c| c.as_ref().builtin_provider_value::<FrozenValidationInfo>())
-        .map(|v| v.into_owned_frozen_ref());
+        .maybe_map(|c| c.as_ref().builtin_provider_value::<FrozenValidationInfo>());
     if info.is_some() || deps.len() > 1 {
         Some(TransitiveValidations(Arc::new(TransitiveValidationsData {
             info,
@@ -379,7 +397,7 @@ fn get_rule_callable(
     let rule_callable = rule_callable.owned_value(eval.frozen_heap());
     let rule_callable = rule_callable
         .unpack_frozen()
-        .internal_error("Must be frozen")?;
+        .ok_or_else(|| internal_error!("Must be frozen"))?;
     Ok(rule_callable)
 }
 

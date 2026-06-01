@@ -50,8 +50,34 @@ string: AstString = <l:@L> <e:"STRING"> <r:@R>
     => e.ast(l, r);
 
 #[inline]
-fstring: AstFString = <l:@L> <e:"FSTRING"> <r:@R>
-    => grammar_util::fstring(e, l, r, state);
+bytes: AstBytes = <l:@L> <e:"BYTES"> <r:@R>
+    => e.ast(l, r);
+
+// F-string conversion specifier: !s or !r
+FStringConv: lexer::FStringConv = {
+    => lexer::FStringConv::None,
+    <l:@L> "FSTRING_BANG" <id:"IDENTIFIER"> <r:@R> =>? {
+        match id.as_str() {
+            "s" => Ok(lexer::FStringConv::Str),
+            "r" => Ok(lexer::FStringConv::Repr),
+            _ => Err(lalrpop_util::ParseError::User {
+                error: grammar_util::fstring_conv_error(l, r, state),
+            }),
+        }
+    },
+};
+
+// An f-string part is either text or an expression with optional conversion
+FStringTextOrExpr: grammar_util::FStringElement = {
+    <l:@L> <s:"FSTRING_TEXT"> <r:@R>
+        => grammar_util::FStringElement::Text(s.ast(l, r)),
+    <l:@L> "FSTRING_EXPR_START" <e:Test> <conv:FStringConv> "FSTRING_EXPR_END" <r:@R>
+        => grammar_util::FStringElement::Expr(e, conv),
+};
+
+// An f-string is: start, parts*, end
+fstring: AstFString = <l:@L> "FSTRING_START" <parts:FStringTextOrExpr*> "FSTRING_END" <r:@R>
+    => grammar_util::fstring_from_parts(parts, l, r, state);
 
 #[inline]
 identifier: AstString = <l:@L> <e:"IDENTIFIER"> <r:@R>
@@ -221,7 +247,7 @@ LoadStmtSyms: (AstAssignIdent, AstString) = <id:LoadStmtBindingName?> <n:string>
 };
 
 // Expression
-L<E>: AstExpr = <l:@L> <v:(<E> ",")*> <e:E> <f:","?> <r:@R>
+ParenTuple<E>: AstExpr = <l:@L> <v:(<E> ",")*> <e:E> <f:","?> <r:@R>
     => {
         if f.is_some() || !v.is_empty() {
             Expr::Tuple(v.into_iter().chain(vec![e].into_iter()).collect())
@@ -231,9 +257,19 @@ L<E>: AstExpr = <l:@L> <v:(<E> ",")*> <e:E> <f:","?> <r:@R>
         }
     };
 
-ExprList: AstExpr = L<Expr>;
+UnparenTuple<E>: AstExpr = {
+    <l:@L> <e:E> "," <r:@R>
+        =>? Ok(grammar_util::reject_unparenthesized_tuple_trailing_comma(state.codemap, l, r)?),
+    <l:@L> <v:(<E> ",")+> <e:E> "," <r:@R>
+        =>? Ok(grammar_util::reject_unparenthesized_tuple_trailing_comma(state.codemap, l, r)?),
+    <l:@L> <v:(<E> ",")+> <e:E> <r:@R>
+        => Expr::Tuple(v.into_iter().chain(vec![e].into_iter()).collect()).ast(l, r),
+    E,
+};
 
-TestList: AstExpr = L<Test>;
+ExprList: AstExpr = UnparenTuple<Expr>;
+
+TestList: AstExpr = UnparenTuple<Test>;
 
 
 PrimaryExpr: AstExpr = {
@@ -274,6 +310,8 @@ Operand: AstExpr = {
         => Expr::Literal(AstLiteral::Float(f)).ast(l, r),
     <l:@L> <s:string> <r:@R>
         => Expr::Literal(AstLiteral::String(s)).ast(l, r),
+    <l:@L> <b:bytes> <r:@R>
+        => Expr::Literal(AstLiteral::Bytes(b)).ast(l, r),
     <l:@L> "..." <r:@R>
         => Expr::Literal(AstLiteral::Ellipsis).ast(l, r),
     <l:@L> "[" <e:COMMA<Test>> "]" <r:@R>
@@ -282,7 +320,7 @@ Operand: AstExpr = {
     <l:@L> "{" <e:COMMA<DictEntry>> "}" <r:@R>
         => Expr::Dict(e).ast(l, r),
     DictComp,
-    <l:@L> "(" <e:TestList?> ")" <r:@R>
+    <l:@L> "(" <e:ParenTuple<Test>?> ")" <r:@R>
         => match e {
             Some(t) => t,
             None => Expr::Tuple(vec![]).ast(l, r)
@@ -504,6 +542,14 @@ extern {
       "INTEGER" => lexer::Token::Int(<lexer::TokenInt>),
       "FLOAT" => lexer::Token::Float(<f64>),
       "STRING" => lexer::Token::String(<String>),
-      "FSTRING" => lexer::Token::FString(<lexer::TokenFString>),
+      "BYTES" => lexer::Token::Bytes(<Vec<u8>>),
+
+      // F-string tokens with proper expression support
+      "FSTRING_START" => lexer::Token::FStringStart(<lexer::FStringQuote>),
+      "FSTRING_TEXT" => lexer::Token::FStringText(<String>),
+      "FSTRING_EXPR_START" => lexer::Token::FStringExprStart,
+      "FSTRING_BANG" => lexer::Token::FStringBang,
+      "FSTRING_EXPR_END" => lexer::Token::FStringExprEnd,
+      "FSTRING_END" => lexer::Token::FStringEnd,
     }
 }

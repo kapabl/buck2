@@ -8,7 +8,6 @@
  * above-listed licenses.
  */
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -31,10 +30,12 @@ use buck2_events::dispatch::EventDispatcher;
 use buck2_events::metadata;
 use buck2_execute::execute::blocking::IoRequest;
 use buck2_execute::execute::clean_output_paths::cleanup_path;
+use buck2_fs::error::IoResultExt;
 use buck2_fs::fs_util;
 use buck2_fs::paths::abs_norm_path::AbsNormPath;
 use buck2_fs::paths::file_name::FileName;
 use buck2_fs::paths::file_name::FileNameBuf;
+use buck2_hash::StdBuckHashMap;
 use buck2_wrapper_common::invocation_id::TraceId;
 use chrono::DateTime;
 use chrono::Utc;
@@ -44,12 +45,12 @@ use dupe::Dupe;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use tokio::sync::oneshot::Sender;
-use tracing::error;
 
 use crate::materializers::deferred::ArtifactMaterializationStage;
 use crate::materializers::deferred::DeferredMaterializerCommandProcessor;
 use crate::materializers::deferred::artifact_tree::ArtifactMaterializationData;
 use crate::materializers::deferred::artifact_tree::ArtifactTree;
+use crate::materializers::deferred::artifact_tree::artifact_metadata_size;
 use crate::materializers::deferred::extension::ExtensionCommand;
 use crate::materializers::deferred::io_handler::IoHandler;
 use crate::materializers::deferred::join_all_existing_futs;
@@ -172,7 +173,7 @@ impl CleanStaleArtifactsCommand {
                 },
                 Err(e) => Err(e),
             };
-            let result: Result<CleanResult, buck2_error::Error> = result.map_err(|e| e.into());
+            let result: Result<CleanResult, buck2_error::Error> = result;
             let result_event: buck2_data::CleanStaleResult = create_result(
                 result.clone(),
                 trace_id,
@@ -180,7 +181,7 @@ impl CleanStaleArtifactsCommand {
                 (Instant::now() - start_time).as_secs(),
             );
             dispatcher_dup.instant_event(result_event);
-            Ok(result?.into())
+            result
         }
         .boxed()
     }
@@ -190,7 +191,7 @@ impl CleanStaleArtifactsCommand {
         processor: &mut DeferredMaterializerCommandProcessor<T>,
     ) -> buck2_error::Result<PendingCleanResult> {
         let (liveliness_observer, liveliness_guard) = LivelinessGuard::create_sync();
-        *processor.command_sender.clean_guard.lock() = Some(liveliness_guard);
+        *processor.command_sender.clean_guard.write() = Some(liveliness_guard);
 
         if let Some(sqlite_db) = processor.sqlite_db.as_mut() {
             if !processor.defer_write_actions {
@@ -218,40 +219,52 @@ impl CleanStaleArtifactsCommand {
         liveliness_observer: Arc<dyn LivelinessObserverSync>,
     ) -> buck2_error::Result<PendingCleanResult> {
         let start_time = Instant::now();
-        let gen_path = io
-            .buck_out_path()
-            .join(ProjectRelativePathBuf::unchecked_new("gen".to_owned()));
-        let gen_dir = io.fs().resolve(&gen_path);
-        if !fs_util::try_exists(&gen_dir)? {
+
+        let mut artifact_dirs = Vec::new();
+        for dir_name in &["gen", "art"] {
+            let dir_path = io
+                .buck_out_path()
+                .join(ProjectRelativePathBuf::unchecked_new(dir_name.to_string()));
+            let dir_abs = io.fs().resolve(&dir_path);
+            if fs_util::try_exists(&dir_abs)? {
+                artifact_dirs.push(dir_path);
+            }
+        }
+        if artifact_dirs.is_empty() {
             return Ok(CleanStaleResultKind::SkippedNoGenDir.into());
         }
-        tracing::trace!(gen_dir = %gen_dir, "Scanning");
 
         let mut found_paths = Vec::new();
         if self.tracked_only {
             find_stale_tracked_only(tree, self.keep_since_time, &mut found_paths)?
         } else {
-            let gen_subtree = tree
-                .get_subtree(&mut gen_path.iter())
-                .buck_error_context("Found a file where gen dir expected")?;
+            for dir_path in &artifact_dirs {
+                tracing::trace!(dir = %io.fs().resolve(dir_path), "Scanning");
 
-            let empty;
+                let dir_subtree = tree
+                    .get_subtree(&mut dir_path.iter())
+                    .with_buck_error_context(|| {
+                        format!("Found a file where directory was expected: {}", dir_path)
+                    })?;
 
-            let gen_subtree = match gen_subtree {
-                Some(t) => t,
-                None => {
-                    empty = HashMap::new();
-                    &empty
+                let empty;
+
+                let dir_subtree = match dir_subtree {
+                    Some(t) => t,
+                    None => {
+                        empty = StdBuckHashMap::default();
+                        &empty
+                    }
+                };
+
+                StaleFinder {
+                    io: io.dupe(),
+                    keep_since_time: self.keep_since_time,
+                    found_paths: &mut found_paths,
+                    liveliness_observer: liveliness_observer.clone(),
                 }
-            };
-
-            StaleFinder {
-                io: io.dupe(),
-                keep_since_time: self.keep_since_time,
-                found_paths: &mut found_paths,
-                liveliness_observer: liveliness_observer.clone(),
+                .visit_recursively(dir_path.clone(), dir_subtree)?;
             }
-            .visit_recursively(gen_path, gen_subtree)?;
         };
 
         let mut stats = stats_for_paths(&found_paths);
@@ -294,8 +307,7 @@ impl CleanStaleArtifactsCommand {
                     stats,
                 };
                 // quiet just because it's also returned, soft_error to log to scribe
-                return Err(soft_error!("clean_stale_error", error.into(), quiet: true)
-                    .map(|e| e.into())?);
+                return Err(soft_error!("clean_stale_error", error.into(), quiet: true)?);
             }
         }
 
@@ -370,13 +382,13 @@ fn create_clean_fut<T: IoHandler>(
         tree.invalidate_paths_and_collect_futures(paths_to_invalidate, Some(sqlite_db))?;
     let mut existing_materialization_futs = vec![];
     for data in tree.iter_without_paths() {
-        match &data.processing {
-            super::Processing::Active {
-                future: super::ProcessingFuture::Materializing(future),
-                ..
-            } => existing_materialization_futs.push(future.clone()),
-            _ => (),
-        };
+        if let super::Processing::Active {
+            future: super::ProcessingFuture::Materializing(future),
+            ..
+        } = &data.processing
+        {
+            existing_materialization_futs.push(future.clone());
+        }
     }
 
     let fut = async move {
@@ -439,11 +451,10 @@ async fn clean_artifact<T: IoHandler>(
     {
         Ok(()) => Ok(Some(size)),
         Err(e) => {
-            let e: buck2_error::Error = e.into();
             if e.has_tag(ErrorTag::CleanInterrupt) {
                 Ok(None)
             } else {
-                Err(e.into())
+                Err(e)
             }
         }
     }
@@ -457,7 +468,7 @@ pub struct CleanInvalidatedPathRequest {
 impl IoRequest for CleanInvalidatedPathRequest {
     fn execute(self: Box<Self>, project_fs: &ProjectRoot) -> buck2_error::Result<()> {
         if !self.liveliness_observer.is_alive_sync() {
-            return Err(buck2_error!(ErrorTag::CleanInterrupt, "Interrupt").into());
+            return Err(buck2_error!(ErrorTag::CleanInterrupt, "Interrupt"));
         }
         cleanup_path(project_fs, &self.path)?;
         Ok(())
@@ -468,7 +479,7 @@ impl IoRequest for CleanInvalidatedPathRequest {
 pub fn get_size(path: &AbsNormPath) -> buck2_error::Result<u64> {
     let mut result = 0;
     if path.is_dir() {
-        for entry in fs_util::read_dir(path)? {
+        for entry in fs_util::read_dir(path).categorize_internal()? {
             result += get_size(&entry?.path())?;
         }
     } else {
@@ -498,7 +509,7 @@ impl<T: IoHandler> StaleFinder<'_, T> {
     fn visit_recursively(
         &mut self,
         path: ProjectRelativePathBuf,
-        subtree: &HashMap<FileNameBuf, ArtifactTree>,
+        subtree: &StdBuckHashMap<FileNameBuf, ArtifactTree>,
     ) -> buck2_error::Result<()> {
         let mut queue = vec![(path, subtree)];
 
@@ -516,10 +527,10 @@ impl<T: IoHandler> StaleFinder<'_, T> {
     fn visit<'t>(
         &mut self,
         path: &ProjectRelativePath,
-        subtree: &'t HashMap<FileNameBuf, ArtifactTree>,
+        subtree: &'t StdBuckHashMap<FileNameBuf, ArtifactTree>,
         queue: &mut Vec<(
             ProjectRelativePathBuf,
-            &'t HashMap<FileNameBuf, ArtifactTree>,
+            &'t StdBuckHashMap<FileNameBuf, ArtifactTree>,
         )>,
     ) -> buck2_error::Result<()> {
         let abs_path = self.io.fs().resolve(path);
@@ -573,14 +584,15 @@ impl<T: IoHandler> StaleFinder<'_, T> {
                     // This is something we can invalidate.
                     tracing::trace!(path = %path, file_type = ?file_type, "marking as stale");
                     self.found_paths
-                        .push(FoundPath::Stale(path, metadata.size()));
+                        .push(FoundPath::Stale(path, artifact_metadata_size(metadata)));
                 }
                 ArtifactTree::Data(box ArtifactMaterializationData {
                     stage: ArtifactMaterializationStage::Materialized { metadata, .. },
                     ..
                 }) => {
                     tracing::trace!(path = %path, file_type = ?file_type, "marking as retained");
-                    self.found_paths.push(FoundPath::Retained(metadata.size()));
+                    self.found_paths
+                        .push(FoundPath::Retained(artifact_metadata_size(metadata)));
                 }
                 _ => {
                     // What we have on disk does not match what we have in the materializer (which is
@@ -625,8 +637,22 @@ pub struct CleanStaleConfig {
     pub clean_period: std::time::Duration,
     pub artifact_ttl: std::time::Duration,
     pub dry_run: bool,
-    pub decreased_ttl_hours: Option<std::time::Duration>,
-    pub decreased_ttl_hours_disk_threshold: Option<f64>,
+    pub low_disk: Option<LowDiskCleanConfig>,
+}
+
+/// Configures how the scheduled clean reacts to low free disk space.
+#[derive(Debug, Clone)]
+pub struct LowDiskCleanConfig {
+    /// Free disk space (as a percentage of total) at or below which the
+    /// `mode` engages.
+    pub threshold_percent: f64,
+    pub mode: LowDiskCleanMode,
+}
+
+#[derive(Debug, Clone)]
+pub enum LowDiskCleanMode {
+    /// Use this smaller TTL when free disk % is at/below the threshold.
+    Fixed(std::time::Duration),
 }
 
 impl CleanStaleConfig {
@@ -661,16 +687,24 @@ impl CleanStaleConfig {
                 property: "clean_stale_dry_run",
             })?
             .unwrap_or(false);
-        let decreased_ttl_hours: Option<f64> = root_config.parse(BuckconfigKeyRef {
-            section: "buck2",
-            property: "clean_stale_low_disk_artifact_ttl_hours",
-        })?;
-        let decreased_ttl_hours_disk_threshold = root_config.parse(BuckconfigKeyRef {
+        let low_disk_ttl_hours: f64 = root_config
+            .parse(BuckconfigKeyRef {
+                section: "buck2",
+                property: "clean_stale_low_disk_artifact_ttl_hours",
+            })?
+            .unwrap_or(48.0);
+        let low_disk_threshold_percent: Option<f64> = root_config.parse(BuckconfigKeyRef {
             section: "buck2",
             property: "clean_stale_low_disk_threshold",
         })?;
 
         let secs_in_hour = 60.0 * 60.0;
+        let low_disk = low_disk_threshold_percent.map(|threshold_percent| LowDiskCleanConfig {
+            threshold_percent,
+            mode: LowDiskCleanMode::Fixed(std::time::Duration::from_secs_f64(
+                secs_in_hour * low_disk_ttl_hours,
+            )),
+        });
         let clean_stale_config = if clean_stale_enabled {
             Some(Self {
                 clean_period: std::time::Duration::from_secs_f64(
@@ -682,9 +716,7 @@ impl CleanStaleConfig {
                 start_offset: std::time::Duration::from_secs_f64(
                     secs_in_hour * clean_stale_start_offset_hours,
                 ),
-                decreased_ttl_hours: decreased_ttl_hours
-                    .map(|hours| std::time::Duration::from_secs_f64(secs_in_hour * hours)),
-                decreased_ttl_hours_disk_threshold,
+                low_disk,
                 dry_run: clean_stale_dry_run,
             })
         } else {

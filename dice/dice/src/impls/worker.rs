@@ -31,6 +31,7 @@ use crate::api::activation_tracker::ActivationData;
 use crate::arc::Arc;
 use crate::impls::core::graph::types::VersionedGraphKey;
 use crate::impls::core::graph::types::VersionedGraphResult;
+use crate::impls::core::graph::types::VersionedGraphResultMismatch;
 use crate::impls::core::state::CoreStateHandle;
 use crate::impls::core::versions::VersionEpoch;
 use crate::impls::deps::graph::SeriesParallelDeps;
@@ -50,6 +51,7 @@ use crate::impls::task::spawn_dice_task;
 use crate::impls::user_cycle::KeyComputingUserCycleDetectorData;
 use crate::impls::user_cycle::UserCycleDetectorData;
 use crate::impls::value::DiceComputedValue;
+use crate::impls::value::MaybeValidDiceValue;
 use crate::impls::value::TrackedInvalidationPaths;
 use crate::impls::worker::state::ActivationInfo;
 use crate::impls::worker::state::DiceWorkerStateAwaitingPrevious;
@@ -161,7 +163,28 @@ impl DiceTaskWorker {
             VersionedGraphResult::Match(entry) => {
                 return task_state.lookup_matches(handle, entry);
             }
+            VersionedGraphResult::MatchPagedOut(paged) => {
+                let entry = self
+                    .hydrate_and_rehydrate(&state_handle, paged.data_key)
+                    .await?;
+                let entry = DiceComputedValue::new(
+                    MaybeValidDiceValue::valid(entry),
+                    paged.valid,
+                    paged.invalidation_paths,
+                );
+                return task_state.lookup_matches(handle, entry);
+            }
             VersionedGraphResult::CheckDeps(mismatch2) => Some(mismatch2),
+            VersionedGraphResult::CheckDepsPagedOut(paged) => {
+                let entry = self
+                    .hydrate_and_rehydrate(&state_handle, paged.data_key)
+                    .await?;
+                Some(VersionedGraphResultMismatch {
+                    entry,
+                    prev_verified_version: paged.prev_verified_version,
+                    deps_to_validate: paged.deps_to_validate,
+                })
+            }
             VersionedGraphResult::Compute => None,
             VersionedGraphResult::Rejected(..) => {
                 return Err(CancellationReason::Rejected);
@@ -264,7 +287,7 @@ impl DiceTaskWorker {
                             self.version_epoch,
                             result.storage,
                             value,
-                            Arc::new(result.deps),
+                            result.deps.into_arc(),
                             result.invalidation_paths,
                         )
                         .await
@@ -311,6 +334,34 @@ impl DiceTaskWorker {
             deps,
             data,
         )
+    }
+
+    /// Deserialize a paged-out value via `DiceStorage`, then send a `Rehydrate` request
+    /// so the graph node returns to the `Hydrated` state for subsequent lookups. The
+    /// returned value is the worker's local copy.
+    ///
+    /// Hydration I/O failures (e.g. storage corruption, missing data) are surfaced as
+    /// `CancellationReason::HydrationFailure` so the worker terminates cleanly rather
+    /// than panicking. A missing `DiceStorage` is an internal invariant violation (we
+    /// only receive a paged-out lookup result if storage is configured) and panics.
+    async fn hydrate_and_rehydrate(
+        &self,
+        state_handle: &CoreStateHandle,
+        data_key: pagable::DataKey,
+    ) -> CancellableResult<crate::impls::value::DiceValidValue> {
+        let storage = self
+            .eval
+            .dice
+            .pagable_storage
+            .as_ref()
+            .expect("paged-out lookup result requires DiceStorage to be configured");
+        let key_dyn = self.eval.dice.key_index.get(self.k);
+        let value = storage.hydrate(key_dyn, data_key).await.map_err(|e| {
+            tracing::error!("failed to hydrate paged-out DICE value: {:#}", e);
+            CancellationReason::HydrationFailure
+        })?;
+        state_handle.rehydrate(self.k, value.dupe());
+        Ok(value)
     }
 }
 
@@ -429,7 +480,7 @@ async fn check_dependency(
         .compute_opaque(
             dep,
             parent_key,
-            &eval,
+            eval,
             cycles.subrequest(dep, &eval.dice.key_index),
         )
         .await?;
@@ -504,7 +555,7 @@ pub(crate) fn project_for_key(
                         version_epoch,
                         storage,
                         value,
-                        Arc::new(deps),
+                        deps.into_arc(),
                         invalidation_paths.dupe(),
                     );
 

@@ -15,8 +15,6 @@ use allocative::Allocative;
 use buck2_build_api_derive::internal_provider;
 use buck2_common::legacy_configs::configs::parse_config_section_and_key;
 use buck2_core::configuration::config_setting::ConfigSettingData;
-use buck2_core::configuration::constraints::ConstraintKey;
-use buck2_core::configuration::constraints::ConstraintValue;
 use buck2_core::configuration::data::ConfigurationDataData;
 use buck2_interpreter::types::configured_providers_label::StarlarkProvidersLabel;
 use buck2_interpreter::types::target_label::StarlarkTargetLabel;
@@ -30,6 +28,7 @@ use starlark::eval::Evaluator;
 use starlark::starlark_module;
 use starlark::values::Freeze;
 use starlark::values::Heap;
+use starlark::values::StarlarkPagable;
 use starlark::values::Trace;
 use starlark::values::UnpackAndDiscard;
 use starlark::values::Value;
@@ -54,8 +53,19 @@ use crate::interpreter::rule_defs::provider::builtin::constraint_value_info::Fro
 /// Provider that signals that a rule contains configuration info. This is used both as part of
 /// defining configurations (`platform()`, `constraint_value()`) and defining whether a target "matches"
 /// a configuration or not (`config_setting()`, `constraint_value()`)
-#[internal_provider(configuration_info_creator, methods = configuration_info_methods)]
-#[derive(Debug, Trace, Coerce, Freeze, ProvidesStaticType, Allocative)]
+#[internal_provider(
+    configuration_info_creator,
+    methods = configuration_info_methods,
+)]
+#[derive(
+    Debug,
+    Trace,
+    Coerce,
+    Freeze,
+    ProvidesStaticType,
+    Allocative,
+    StarlarkPagable
+)]
 #[repr(C)]
 pub struct ConfigurationInfoGen<V: ValueLifetimeless> {
     constraints:
@@ -73,24 +83,13 @@ impl<'v, V: ValueLike<'v>> ConfigurationInfoGen<V> {
                 .expect("type checked on construction");
             let value_target = ConstraintValueInfo::from_value(v.to_value())
                 .expect("type checked on construction");
-            let constraint_setting_info =
-                ConstraintSettingInfo::from_value(value_target.setting().to_value())
-                    .expect("type checked on construction");
-            let default_constraint_value = constraint_setting_info.default().map(|default| {
-                ConstraintValue(
-                    StarlarkProvidersLabel::from_value(default.to_value())
-                        .expect("type checked on construction")
-                        .label()
-                        .dupe(),
-                )
-            });
-            converted_constraints.insert(
-                ConstraintKey {
-                    key: key_target.label().dupe(),
-                    default: default_constraint_value,
-                },
-                ConstraintValue(value_target.label().label().dupe()),
+            let (constraint_key, constraint_value) = value_target.to_constraint_key_value();
+            debug_assert_eq!(
+                key_target.label(),
+                &constraint_key.key,
+                "dict key should match constraint setting label"
             );
+            converted_constraints.insert(constraint_key, constraint_value);
         }
 
         let values = DictRef::from_value(self.values.get().to_value())
@@ -122,7 +121,7 @@ impl<'v, V: ValueLike<'v>> ConfigurationInfoGen<V> {
 
 impl<'v> ConfigurationInfo<'v> {
     /// Create a provider from configuration data.
-    pub fn from_configuration_data(conf: &ConfigurationDataData, heap: &'v Heap) -> Self {
+    pub fn from_configuration_data(conf: &ConfigurationDataData, heap: Heap<'v>) -> Self {
         let mut constraints = SmallMap::new();
         for (k, v) in &conf.constraints {
             let constraint_setting_label =
@@ -260,7 +259,7 @@ fn configuration_info_methods(builder: &mut MethodsBuilder) {
     /// constraints, returns the default constraint value from the setting.
     /// Returns `None` only if the constraint is not present and the constraint has no default.
     ///
-    /// # Example
+    /// ### Example
     ///
     /// ```python
     /// # Get constraint value by setting
@@ -272,7 +271,7 @@ fn configuration_info_methods(builder: &mut MethodsBuilder) {
     fn get<'v>(
         this: &ConfigurationInfo<'v>,
         #[starlark(require = pos)] key: ValueOf<'v, &'v ConstraintSettingInfo<'v>>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> starlark::Result<NoneOr<ValueTypedComplex<'v, ConstraintValueInfo<'v>>>> {
         let constraints = DictRef::from_value(this.constraints.get().to_value())
             .expect("type checked on construction");
@@ -301,7 +300,7 @@ fn configuration_info_methods(builder: &mut MethodsBuilder) {
     /// (if defined). Returns `None` only if there was no previous value and the constraint
     /// has no default.
     ///
-    /// # Example
+    /// ### Example
     ///
     /// ```python
     /// # Insert a new constraint value
@@ -313,7 +312,7 @@ fn configuration_info_methods(builder: &mut MethodsBuilder) {
     fn insert<'v>(
         this: &ConfigurationInfo<'v>,
         #[starlark(require = pos)] value: ValueOf<'v, &'v ConstraintValueInfo<'v>>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> starlark::Result<NoneOr<ValueTypedComplex<'v, ConstraintValueInfo<'v>>>> {
         let constraint_value = value.typed;
         let setting_info = constraint_value.setting();
@@ -355,7 +354,7 @@ fn configuration_info_methods(builder: &mut MethodsBuilder) {
     /// If not present, returns the default constraint value from the setting (if defined).
     /// Returns `None` only if the constraint was not set and the constraint has no default.
     ///
-    /// # Example
+    /// ### Example
     ///
     /// ```python
     /// # Remove a constraint
@@ -367,7 +366,7 @@ fn configuration_info_methods(builder: &mut MethodsBuilder) {
     fn pop<'v>(
         this: &ConfigurationInfo<'v>,
         #[starlark(require = pos)] key: ValueOf<'v, &'v ConstraintSettingInfo<'v>>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> starlark::Result<NoneOr<ValueTypedComplex<'v, ConstraintValueInfo<'v>>>> {
         let label = key.typed.label();
         let mut constraints = DictMut::from_value(this.constraints.get().to_value())?;
@@ -399,7 +398,7 @@ fn configuration_info_methods(builder: &mut MethodsBuilder) {
     ///
     /// A new `ConfigurationInfo` with the same constraints and values as the original.
     ///
-    /// # Example
+    /// ### Example
     ///
     /// ```python
     /// # Create a copy and modify it without affecting the original
@@ -409,7 +408,7 @@ fn configuration_info_methods(builder: &mut MethodsBuilder) {
     /// ```
     fn copy<'v>(
         this: &ConfigurationInfo<'v>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> starlark::Result<ConfigurationInfo<'v>> {
         // Copy constraints dict
         let constraints = DictRef::from_value(this.constraints.get().to_value())
@@ -440,7 +439,7 @@ fn configuration_info_methods(builder: &mut MethodsBuilder) {
 /// Returns the default constraint value if one exists, otherwise returns None.
 fn get_default_constraint_value<'v>(
     key: ValueOf<'v, &'v ConstraintSettingInfo<'v>>,
-    heap: &'v Heap,
+    heap: Heap<'v>,
 ) -> NoneOr<ValueTypedComplex<'v, ConstraintValueInfo<'v>>> {
     NoneOr::from_option(
         ConstraintValueInfo::default_from_constraint_setting(key)

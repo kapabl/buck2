@@ -11,7 +11,9 @@
 use std::cell::OnceCell;
 
 use allocative::Allocative;
-use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
+use starlark::StarlarkPagable;
+use starlark::StarlarkPagablePanic;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::FrozenModule;
 use starlark::environment::Module;
@@ -27,16 +29,25 @@ use crate::interpreter::package_file_extra::FrozenPackageFileExtra;
 use crate::interpreter::package_file_extra::PackageFileExtra;
 
 /// `Module.extra_value` when evaluating build, bzl, package, and bxl files.
-#[derive(Default, Debug, ProvidesStaticType, Allocative, Trace)]
+#[derive(
+    Default,
+    Debug,
+    ProvidesStaticType,
+    Allocative,
+    Trace,
+    StarlarkPagablePanic
+)]
 pub(crate) struct InterpreterExtraValue<'v> {
     /// Set when evaluating `PACKAGE` files.
     pub(crate) package_extra: OnceCell<PackageFileExtra<'v>>,
 }
 
-#[derive(Debug, ProvidesStaticType, Allocative)]
+#[derive(Debug, ProvidesStaticType, Allocative, StarlarkPagable)]
 pub(crate) struct FrozenInterpreterExtraValue {
     pub(crate) package_extra: Option<FrozenPackageFileExtra>,
 }
+
+starlark::register_starlark_any_complex!(InterpreterExtraValue<'_>, frozen FrozenInterpreterExtraValue);
 
 impl<'v> Freeze for InterpreterExtraValue<'v> {
     type Frozen = FrozenInterpreterExtraValue;
@@ -53,12 +64,12 @@ impl<'v> Freeze for InterpreterExtraValue<'v> {
 }
 
 impl<'v> InterpreterExtraValue<'v> {
-    pub(crate) fn get(module: &'v Module) -> buck2_error::Result<&'v InterpreterExtraValue<'v>> {
+    pub(crate) fn get(module: &Module<'v>) -> buck2_error::Result<&'v InterpreterExtraValue<'v>> {
         Ok(&module
             .extra_value()
-            .internal_error("Extra value is missing")?
+            .ok_or_else(|| internal_error!("Extra value is missing"))?
             .downcast_ref::<StarlarkAnyComplex<InterpreterExtraValue>>()
-            .internal_error("Extra value had wrong type")?
+            .ok_or_else(|| internal_error!("Extra value had wrong type"))?
             .value)
     }
 }
@@ -70,9 +81,9 @@ impl FrozenInterpreterExtraValue {
     {
         module
             .owned_extra_value()
-            .internal_error("Extra value is missing")?
+            .ok_or_else(|| internal_error!("Extra value is missing"))?
             .downcast()
             .ok()
-            .internal_error("Extra value had wrong type")
+            .ok_or_else(|| internal_error!("Extra value had wrong type"))
     }
 }

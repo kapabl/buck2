@@ -16,11 +16,11 @@ use starlark::starlark_module;
 use starlark::values::AllocValue;
 use starlark::values::Heap;
 use starlark::values::NoSerialize;
+use starlark::values::StarlarkPagable;
 use starlark::values::StarlarkValue;
 use starlark::values::Value;
 use starlark::values::ValueOf;
 use starlark::values::starlark_value;
-use starlark::values::starlark_value_as_type::StarlarkValueAsType;
 use starlark::values::tuple::UnpackTuple;
 use starlark::values::typing::TypeCompiled;
 use starlark::values::typing::TypeType;
@@ -33,7 +33,8 @@ use crate::dynamic::attrs::DynamicAttrType;
     derive_more::Display,
     ProvidesStaticType,
     Allocative,
-    NoSerialize
+    NoSerialize,
+    StarlarkPagable
 )]
 #[display("{}", ty)]
 pub struct StarlarkDynamicAttrType {
@@ -44,13 +45,16 @@ pub struct StarlarkDynamicAttrType {
 impl<'v> StarlarkValue<'v> for StarlarkDynamicAttrType {}
 
 impl<'v> AllocValue<'v> for StarlarkDynamicAttrType {
-    fn alloc_value(self, heap: &'v Heap) -> Value<'v> {
+    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
         heap.alloc_simple(self)
     }
 }
 
 /// Attributes declared for [`dynamic_actions()`](../#dynamic_actions) functions.
 #[starlark_module]
+#[starlark_types(
+    StarlarkDynamicAttrType as DynamicAttrType
+)]
 fn struct_dynattrs(globals: &mut GlobalsBuilder) {
     /// Unbound output to be bound by this dynamic action.
     /// Accepts an [`OutputArtifact`](../OutputArtifact/).
@@ -141,9 +145,6 @@ fn struct_dynattrs(globals: &mut GlobalsBuilder) {
             ty: DynamicAttrType::Option(Box::new(ty)),
         })
     }
-
-    const DynamicAttrType: StarlarkValueAsType<StarlarkDynamicAttrType> =
-        StarlarkValueAsType::new();
 }
 
 pub(crate) fn register_dynamic_attrs(globals: &mut GlobalsBuilder) {

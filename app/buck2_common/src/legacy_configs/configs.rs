@@ -8,7 +8,6 @@
  * above-listed licenses.
  */
 
-use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Display;
 use std::io::BufRead;
@@ -18,7 +17,9 @@ use allocative::Allocative;
 use buck2_cli_proto::ConfigOverride;
 use buck2_core::cells::cell_root_path::CellRootPath;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
+use buck2_hash::StdBuckHashMap;
 use dupe::Dupe;
+use pagable::Pagable;
 use starlark_map::sorted_map::SortedMap;
 
 use super::cells::ExternalPathBuckconfigData;
@@ -29,15 +30,15 @@ use crate::legacy_configs::file_ops::ConfigPath;
 use crate::legacy_configs::key::BuckconfigKeyRef;
 use crate::legacy_configs::parser::LegacyConfigParser;
 
-#[derive(Clone, Dupe, Debug, Allocative)]
+#[derive(Clone, Dupe, Debug, Allocative, Pagable)]
 pub struct LegacyBuckConfig(pub(crate) Arc<ConfigData>);
 
-#[derive(Debug, Allocative)]
+#[derive(Debug, Allocative, Pagable)]
 pub(crate) struct ConfigData {
     pub(crate) values: SortedMap<String, LegacyBuckConfigSection>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Allocative)]
+#[derive(Clone, Debug, PartialEq, Eq, Allocative, Pagable)]
 pub(crate) enum ResolvedValue {
     // A placeholder used before we do resolution.
     Unknown,
@@ -47,19 +48,19 @@ pub(crate) enum ResolvedValue {
     Resolved(String),
 }
 
-#[derive(Debug, PartialEq, Eq, Allocative)]
+#[derive(Debug, PartialEq, Eq, Allocative, Pagable)]
 pub(crate) struct ConfigFileLocation {
     pub(crate) path: String,
     pub(crate) include_source: Option<Location>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Allocative)]
+#[derive(Clone, Debug, PartialEq, Eq, Allocative, Pagable)]
 pub(crate) struct ConfigFileLocationWithLine {
     pub(crate) source_file: Arc<ConfigFileLocation>,
     pub(crate) line: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Allocative)]
+#[derive(Clone, Debug, PartialEq, Eq, Allocative, Pagable)]
 pub(crate) enum Location {
     File(ConfigFileLocationWithLine),
     CommandLineArgument,
@@ -129,14 +130,14 @@ pub fn parse_config_section_and_key(
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Allocative)]
+#[derive(Debug, Clone, PartialEq, Eq, Allocative, Pagable)]
 pub(crate) struct ConfigValue {
     raw_value: String,
     pub(crate) resolved_value: ResolvedValue,
     pub(crate) source: Location,
 }
 
-#[derive(Debug, Default, Allocative)]
+#[derive(Debug, Default, Allocative, Pagable)]
 pub struct LegacyBuckConfigSection {
     pub(crate) values: SortedMap<String, ConfigValue>,
 }
@@ -277,7 +278,7 @@ impl LegacyBuckConfig {
         for main_config_file in config_paths {
             let mut parser = LegacyConfigParser::new();
             parser
-                .parse_file(&main_config_file, None, follow_includes, file_ops)
+                .parse_file(main_config_file, None, follow_includes, file_ops)
                 .await?;
             external_path_configs.push(ExternalPathBuckconfigData {
                 origin_path: main_config_file.clone(),
@@ -298,7 +299,7 @@ impl LegacyBuckConfig {
         let mut parser = LegacyConfigParser::combine(external_path_configs);
         for main_config_file in main_config_files {
             parser
-                .parse_file(&main_config_file, None, follow_includes, file_ops)
+                .parse_file(main_config_file, None, follow_includes, file_ops)
                 .await?;
         }
 
@@ -363,12 +364,12 @@ pub mod testing {
     }
 
     pub struct TestConfigParserFileOps {
-        data: HashMap<ProjectRelativePathBuf, String>,
+        data: StdBuckHashMap<ProjectRelativePathBuf, String>,
     }
 
     impl TestConfigParserFileOps {
         pub fn new(data: &[(&str, &str)]) -> buck2_error::Result<Self> {
-            let mut holder_data = HashMap::new();
+            let mut holder_data = StdBuckHashMap::default();
             for (file, content) in data {
                 holder_data.insert(
                     ProjectRelativePath::new(*file)?.to_owned(),
@@ -407,7 +408,6 @@ pub mod testing {
 
             Ok(Some(
                 file.lines()
-                    .into_iter()
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(buck2_error::Error::from)?,
             ))
@@ -470,20 +470,16 @@ pub(crate) mod tests {
     }
 
     fn assert_config_value_is_empty(config: &LegacyBuckConfig, section: &str, key: &str) {
-        match config.get_section(section) {
-            Some(values) => match values.get(key) {
-                Some(v) => {
-                    panic!(
-                        "Expected `{}.{}` to not exist. Got `{}` for value.",
-                        section,
-                        key,
-                        v.as_str()
-                    );
-                }
-                _ => {}
-            },
-            _ => {}
-        };
+        if let Some(values) = config.get_section(section)
+            && let Some(v) = values.get(key)
+        {
+            panic!(
+                "Expected `{}.{}` to not exist. Got `{}` for value.",
+                section,
+                key,
+                v.as_str()
+            );
+        }
     }
 
     #[test]
@@ -817,7 +813,7 @@ pub(crate) mod tests {
                         r#"
                             [cells]
                               root = .
-                            
+
                             [apple]
                               key = value1
                         "#

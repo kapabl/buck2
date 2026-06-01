@@ -16,7 +16,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use arc_swap::ArcSwapOption;
-use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use once_cell::sync::Lazy;
 use starlark_map::small_set::SmallSet;
 
@@ -33,6 +33,76 @@ static HANDLER: OnceLock<StructuredErrorHandler> = OnceLock::new();
 
 pub fn buck2_hard_error_env() -> buck2_error::Result<Option<&'static str>> {
     buck2_env!("BUCK2_HARD_ERROR")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ShowSoftErrorConfig {
+    Disabled,
+    All,
+    Selected(SmallSet<String>),
+}
+
+impl ShowSoftErrorConfig {
+    fn should_show(&self, category: &str) -> bool {
+        match self {
+            Self::Disabled => false,
+            Self::All => true,
+            Self::Selected(s) => s.contains(category),
+        }
+    }
+}
+
+impl ShowSoftErrorConfig {
+    fn parse(s: &str) -> Self {
+        if s.is_empty() {
+            return Self::Disabled;
+        }
+        let val = s.to_lowercase();
+        if val == "true" || val == "1" {
+            return Self::All;
+        }
+        if let Some(categories) = val.strip_prefix("only=") {
+            return Self::Selected(categories.split(',').map(|c| c.trim().to_owned()).collect());
+        }
+        Self::Disabled
+    }
+}
+
+static SHOW_SOFT_ERROR_CONFIG: ShowSoftErrorConfigHolder = ShowSoftErrorConfigHolder {
+    config: ArcSwapOption::const_empty(),
+};
+
+struct ShowSoftErrorConfigHolder {
+    config: ArcSwapOption<ShowSoftErrorConfig>,
+}
+
+impl ShowSoftErrorConfigHolder {
+    fn reload(&self, var_value: &str) {
+        let config = ShowSoftErrorConfig::parse(var_value);
+        if let Some(old_config) = &*self.config.load() {
+            if **old_config == config {
+                return;
+            }
+        }
+        self.config.store(Some(Arc::new(config)));
+    }
+}
+
+pub fn buck2_show_soft_errors_env() -> buck2_error::Result<Option<&'static str>> {
+    buck2_env!("BUCK2_SHOW_SOFT_ERRORS")
+}
+
+/// Reload the show soft error config from the client-provided value.
+/// Called on every command, mirroring `reload_hard_error_config`.
+pub fn reload_show_soft_error_config(var_value: &str) {
+    SHOW_SOFT_ERROR_CONFIG.reload(var_value);
+}
+
+fn should_show_soft_error(category: &str) -> bool {
+    match SHOW_SOFT_ERROR_CONFIG.config.load_full() {
+        Some(config) => config.should_show(category),
+        None => false,
+    }
 }
 
 static HARD_ERROR_CONFIG: HardErrorConfigHolder = HardErrorConfigHolder {
@@ -64,6 +134,20 @@ static HARD_ERROR_PANIC_ALLOWLIST: Lazy<SmallSet<String>> =
 ///
 /// You'll get the error back as the Ok() value if it wasn't thrown, otherwise you get a Err() to
 /// propagate.
+///
+/// Example (see [StructuredErrorOptions] for all key=value options):
+/// ```ignore
+/// soft_error!(
+///     "soft_error_category",
+///     buck2_error::buck2_error!(
+///         buck2_error::ErrorTag::Tier0,
+///         "Did something bad with {}",
+///         value,
+///     )
+///     .into(),
+///     quiet = false,
+/// )?;
+/// ```
 pub macro soft_error {
     ($category:expr, $err:expr) => {
         $crate::soft_error::soft_error!($category, $err,)
@@ -131,7 +215,7 @@ fn hard_error_config() -> buck2_error::Result<Arc<HardErrorConfig>> {
     HARD_ERROR_CONFIG
         .config
         .load_full()
-        .internal_error("Just stored a value")
+        .ok_or_else(|| internal_error!("Just stored a value"))
 }
 
 pub fn reload_hard_error_config(var_value: &str) -> buck2_error::Result<()> {
@@ -144,6 +228,10 @@ pub struct StructuredErrorOptions {
     /// Create a task for this error.
     pub task: bool,
     pub deprecation: bool,
+    /// When true, this soft error will be promoted to a hard error in open source builds.
+    /// Use this for deprecation/migration errors that OSS users should see.
+    /// Monitoring/logging errors should leave this as false (the default).
+    pub error_on_oss: bool,
     pub daemon_in_memory_state_is_corrupted: bool,
     pub daemon_materializer_state_is_corrupted: bool,
     pub action_cache_is_corrupted: bool,
@@ -161,6 +249,7 @@ impl Default for StructuredErrorOptions {
             quiet: true,
             task: true,
             deprecation: false,
+            error_on_oss: false,
             daemon_in_memory_state_is_corrupted: false,
             daemon_materializer_state_is_corrupted: false,
             action_cache_is_corrupted: false,
@@ -185,6 +274,13 @@ pub fn handle_soft_error(
         ALL_SOFT_ERROR_COUNTERS.lock().unwrap().push(count);
     });
 
+    let mut options = options;
+    if options.quiet && should_show_soft_error(category) {
+        options.quiet = false;
+    }
+
+    let error_on_oss = options.error_on_oss;
+
     // We want to limit each error to appearing at most 10 times in a build (no point spamming people)
     if count.fetch_add(1, Ordering::SeqCst) < 10 {
         if let Some(handler) = HANDLER.get() {
@@ -199,16 +295,15 @@ pub fn handle_soft_error(
         );
     }
     if hard_error_config()?.should_hard_error(category) {
-        return Err(err
-            .context("Upgraded warning to failure via $BUCK2_HARD_ERROR")
-            .into());
+        return Err(err.context("Upgraded warning to failure via $BUCK2_HARD_ERROR"));
     }
 
     // @oss-disable: let is_open_source = false;
     let is_open_source = true; // @oss-enable
-    if is_open_source {
-        // We don't log these, and we have no legacy users, and they might not upgrade that often,
-        // so lets just break open source things immediately.
+    if is_open_source && error_on_oss {
+        // In open source builds, only deprecation/migration soft errors (those with
+        // error_on_oss: true) are promoted to hard errors. Monitoring/logging soft errors
+        // are no-ops, matching internal behavior.
         return Err(err);
     }
 
@@ -275,13 +370,10 @@ impl FromStr for HardErrorConfig {
 
         let mut parts = s.split('=');
 
-        match (parts.next(), parts.next(), parts.next()) {
-            (Some("only"), Some(v), None) => {
-                return Ok(Self::Selected(
-                    v.split(',').map(|s| s.trim().to_owned()).collect(),
-                ));
-            }
-            _ => {}
+        if let (Some("only"), Some(v), None) = (parts.next(), parts.next(), parts.next()) {
+            return Ok(Self::Selected(
+                v.split(',').map(|s| s.trim().to_owned()).collect(),
+            ));
         }
 
         Err(InvalidHardErrorConfig(s.to_owned()))

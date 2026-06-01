@@ -9,7 +9,6 @@
  */
 
 use std::collections::BTreeMap;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use buck2_common::file_ops::trait_::DiceFileOps;
@@ -23,7 +22,7 @@ use buck2_core::pattern::pattern::ParsedPatternWithModifiers;
 use buck2_core::pattern::pattern_type::PatternType;
 use buck2_core::target::name::TargetName;
 use buck2_events::dispatch::console_message;
-use buck2_util::hash::BuckHasherBuilder;
+use buck2_hash::BuckHasherBuilder;
 use dice::DiceComputations;
 use dice::LinearRecomputeDiceComputations;
 use dice_futures::owning_future::OwningFuture;
@@ -50,7 +49,7 @@ enum BuildErrors {
 
 struct Builder<'c, 'd> {
     ctx: &'c LinearRecomputeDiceComputations<'d>,
-    already_loading: HashSet<PackageLabel, BuckHasherBuilder>,
+    already_loading: std::collections::HashSet<PackageLabel, BuckHasherBuilder>,
     load_package_futs:
         FuturesUnordered<BoxFuture<'c, (PackageLabel, buck2_error::Result<Arc<EvaluationResult>>)>>,
 }
@@ -59,7 +58,7 @@ impl Builder<'_, '_> {
     pub fn new<'c, 'd>(ctx: &'c LinearRecomputeDiceComputations<'d>) -> Builder<'c, 'd> {
         Builder {
             ctx,
-            already_loading: HashSet::default(),
+            already_loading: std::collections::HashSet::default(),
             load_package_futs: FuturesUnordered::new(),
         }
     }
@@ -109,7 +108,7 @@ async fn resolve_patterns_and_load_buildfiles<'c, T: PatternType>(
         }
     }
 
-    collect_package_roots(&DiceFileOps(&ctx), recursive_packages, |package| {
+    collect_package_roots(&DiceFileOps(ctx), recursive_packages, |package| {
         let package = package?;
         spec.add_package(package.dupe(), Modifiers::new(None));
         builder.load_package(package);
@@ -148,7 +147,7 @@ async fn resolve_patterns_with_modifiers_and_load_buildfiles<'c, T: PatternType>
             ParsedPattern::Recursive(cell_path) => {
                 let mut roots = Vec::new();
 
-                collect_package_roots(&DiceFileOps(&ctx), vec![cell_path], |package| {
+                collect_package_roots(&DiceFileOps(ctx), vec![cell_path], |package| {
                     let package = package?;
                     roots.push(package);
                     buck2_error::Ok(())
@@ -255,7 +254,7 @@ impl<T: PatternType> LoadedPatterns<T> {
             let targets = result
                 .as_ref()
                 .map(|pkg| pkg.targets.values().map(|t| t.dupe()).collect::<Vec<_>>())
-                .map_err(|e| e.dupe().into());
+                .map_err(|e| e.dupe());
             (package.dupe(), targets)
         })
     }
@@ -339,7 +338,7 @@ pub async fn load_patterns<T: PatternType>(
         let mut results: BTreeMap<PackageLabel, buck2_error::Result<Arc<EvaluationResult>>> =
             BTreeMap::new();
         while let Some((pkg, load_res)) = load_package_futs.next().await {
-            results.insert(pkg, load_res.map_err(buck2_error::Error::from));
+            results.insert(pkg, load_res);
         }
 
         apply_spec(spec, results, skip_missing_targets)
@@ -359,7 +358,7 @@ pub async fn load_patterns_with_modifiers<T: PatternType>(
         let mut results: BTreeMap<PackageLabel, buck2_error::Result<Arc<EvaluationResult>>> =
             BTreeMap::new();
         while let Some((pkg, load_res)) = load_package_futs.next().await {
-            results.insert(pkg, load_res.map_err(buck2_error::Error::from));
+            results.insert(pkg, load_res);
         }
 
         apply_spec(spec, results, skip_missing_targets)

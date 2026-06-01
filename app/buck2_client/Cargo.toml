@@ -44,6 +44,7 @@ buck2_data = { workspace = true }
 buck2_error = { workspace = true }
 buck2_event_log = { workspace = true }
 buck2_fs = { workspace = true }
+buck2_hash = { workspace = true }
 buck2_query_parser = { workspace = true }
 buck2_subscription_proto = { workspace = true }
 buck2_util = { workspace = true }
@@ -52,3 +53,6 @@ buck2_wrapper_common = { workspace = true }
 [dev-dependencies]
 assert_matches = { workspace = true }
 tempfile = { workspace = true }
+
+[lints]
+workspace = true

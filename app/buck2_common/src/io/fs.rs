@@ -17,8 +17,9 @@ use async_trait::async_trait;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
+use buck2_fs::IoResultExt;
 use buck2_fs::fs_util;
-use buck2_fs::fs_util::IoError;
 use buck2_fs::paths::RelativePathBuf;
 use buck2_fs::paths::abs_path::AbsPath;
 use buck2_fs::paths::abs_path::AbsPathBuf;
@@ -28,6 +29,7 @@ use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
 use compact_str::CompactString;
 use dupe::Dupe;
 use once_cell::sync::Lazy;
+use pagable::Pagable;
 use tokio::sync::Semaphore;
 
 use crate::cas_digest::CasDigestConfig;
@@ -42,7 +44,7 @@ use crate::file_ops::metadata::Symlink;
 use crate::file_ops::metadata::TrackedFileDigest;
 use crate::io::IoProvider;
 
-#[derive(Clone, Dupe, Allocative)]
+#[derive(Clone, Dupe, Allocative, Pagable)]
 pub struct FsIoProvider {
     fs: ProjectRoot,
     cas_digest_config: CasDigestConfig,
@@ -116,9 +118,7 @@ impl IoProvider for FsIoProvider {
         static SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(100));
         let _permit = SEMAPHORE.acquire().await.unwrap();
 
-        tokio::task::spawn_blocking(move || fs_util::read_to_string_if_exists(path))
-            .await?
-            .map_err(|e| IoError::categorize_for_source_file(e).into())
+        tokio::task::spawn_blocking(move || fs_util::read_to_string_if_exists(path)).await?
     }
 
     async fn read_dir_impl(
@@ -134,8 +134,7 @@ impl IoProvider for FsIoProvider {
         let path = self.fs.resolve(&path);
 
         tokio::task::spawn_blocking(move || {
-            let dir_entries =
-                fs_util::read_dir(path).map_err(IoError::categorize_for_source_file)?;
+            let dir_entries = fs_util::read_dir(path).categorize_input()?;
 
             let mut entries = Vec::new();
 
@@ -242,7 +241,7 @@ fn read_path_metadata<P: AsRef<AbsPath>>(
             ExactPathMetadata::DoesNotExist => return Ok(None),
             ExactPathMetadata::Symlink(symlink) => {
                 let rest: ForwardRelativePathBuf = relpath_components.collect();
-                return Ok(Some(symlink.to_raw_path_metadata(curr, rest)?));
+                return Ok(Some(symlink.into_raw_path_metadata(curr, rest)?));
             }
             ExactPathMetadata::FileOrDirectory(path_meta) => {
                 meta = Some(path_meta);
@@ -251,7 +250,7 @@ fn read_path_metadata<P: AsRef<AbsPath>>(
     }
 
     // If we get here that means we never hit a symlink. So, the metadata we have
-    let meta = meta.buck_error_context("Attempted to access empty path")?;
+    let meta = meta.ok_or_else(|| internal_error!("Attempted to access empty path"))?;
     let meta = convert_metadata(&curr, meta, file_digest_config)?;
 
     if cfg!(test) {
@@ -292,40 +291,35 @@ enum ExactPathMetadata {
 
 impl ExactPathMetadata {
     fn from_exact_path(curr: &PathAndAbsPath) -> buck2_error::Result<Self> {
-        Ok(
-            match fs_util::symlink_metadata_if_exists(&curr.abspath)
-                .map_err(IoError::categorize_for_source_file)?
-            {
-                Some(meta) if meta.file_type().is_symlink() => {
-                    let dest = fs_util::read_link(&curr.abspath)
-                        .map_err(IoError::categorize_for_source_file)?;
+        Ok(match fs_util::symlink_metadata_if_exists(&curr.abspath)? {
+            Some(meta) if meta.file_type().is_symlink() => {
+                let dest = fs_util::read_link(&curr.abspath).categorize_input()?;
 
-                    let out = if dest.is_absolute() {
-                        ExactPathSymlinkMetadata::ExternalSymlink(dest)
-                    } else {
-                        // Remove the symlink name.
-                        let link_path = curr
-                            .path
-                            .parent()
-                            .expect("We pushed a component to this so it cannot be empty")
-                            .join_system_normalized(&dest)
-                            .with_buck_error_context(|| {
-                                format!("Invalid symlink at `{}`: `{}`", curr.path, dest.display())
-                            })?;
+                let out = if dest.has_root() {
+                    ExactPathSymlinkMetadata::ExternalSymlink(dest)
+                } else {
+                    // Remove the symlink name.
+                    let link_path = curr
+                        .path
+                        .parent()
+                        .expect("We pushed a component to this so it cannot be empty")
+                        .join_system_normalized(&dest)
+                        .with_buck_error_context(|| {
+                            format!("Invalid symlink at `{}`: `{}`", curr.path, dest.display())
+                        })?;
 
-                        // FIXME(JakobDegen): Remove the `unwrap` after we fork `relative_path`
-                        ExactPathSymlinkMetadata::InternalSymlink(
-                            link_path,
-                            RelativePathBuf::from_path(dest).unwrap(),
-                        )
-                    };
+                    // FIXME(JakobDegen): Remove the `unwrap`.
+                    ExactPathSymlinkMetadata::InternalSymlink(
+                        link_path,
+                        RelativePathBuf::from_system_path(dest).unwrap(),
+                    )
+                };
 
-                    ExactPathMetadata::Symlink(out)
-                }
-                Some(meta) => ExactPathMetadata::FileOrDirectory(meta),
-                None => ExactPathMetadata::DoesNotExist,
-            },
-        )
+                ExactPathMetadata::Symlink(out)
+            }
+            Some(meta) => ExactPathMetadata::FileOrDirectory(meta),
+            None => ExactPathMetadata::DoesNotExist,
+        })
     }
 }
 
@@ -337,7 +331,7 @@ enum ExactPathSymlinkMetadata {
 }
 
 impl ExactPathSymlinkMetadata {
-    fn to_raw_path_metadata(
+    fn into_raw_path_metadata(
         self,
         curr: PathAndAbsPath,
         rest: ForwardRelativePathBuf,
@@ -392,7 +386,7 @@ fn read_unchecked<P: AsRef<AbsPath>>(
             ReadUncheckedOptions::Anything => convert_metadata(&curr, meta, file_digest_config),
         },
         ExactPathMetadata::Symlink(link) => {
-            link.to_raw_path_metadata(curr, ForwardRelativePathBuf::default())
+            link.into_raw_path_metadata(curr, ForwardRelativePathBuf::default())
         }
     }
 }
@@ -415,6 +409,7 @@ mod tests {
     use std::os::unix;
 
     use assert_matches::assert_matches;
+    use buck2_fs::fs_util::uncategorized as fs_util;
     use tempfile::TempDir;
 
     use super::*;
@@ -447,8 +442,8 @@ mod tests {
         assert_matches!(
             read_path_metadata(AbsPath::new(t.path())?, ForwardRelativePath::new("x")?, FileDigestConfig::source(CasDigestConfig::testing_default())),
             Ok(Some(RawPathMetadata::Symlink{at:_, to: RawSymlink::Relative(r, r_rel)})) => {
-                assert_eq!(r, "y/z");
-                assert_eq!(r_rel.target(), "y/z");
+                assert_eq!(r.as_str(), "y/z");
+                assert_eq!(r_rel.target().as_str(), "y/z");
             }
         );
 
@@ -466,8 +461,8 @@ mod tests {
         assert_matches!(
             read_path_metadata(AbsPath::new(t)?, ForwardRelativePath::new("x/xx/xxx")?, FileDigestConfig::source(CasDigestConfig::testing_default())),
             Ok(Some(RawPathMetadata::Symlink{at:_, to: RawSymlink::Relative(r, r_rel)})) => {
-                assert_eq!(r, "x/y");
-                assert_eq!(r_rel.target(), "../y");
+                assert_eq!(r.as_str(), "x/y");
+                assert_eq!(r_rel.target().as_str(), "../y");
             }
         );
 
@@ -483,8 +478,8 @@ mod tests {
         assert_matches!(
             read_path_metadata(AbsPath::new(t.path())?, ForwardRelativePath::new("x/z/zz")?, FileDigestConfig::source(CasDigestConfig::testing_default())),
             Ok(Some(RawPathMetadata::Symlink{at:_, to: RawSymlink::Relative(r, r_rel)})) => {
-                assert_eq!(r, "y/z/zz");
-                assert_eq!(r_rel.target(), "y/z/zz");
+                assert_eq!(r.as_str(), "y/z/zz");
+                assert_eq!(r_rel.target().as_str(), "y/z/zz");
             }
         );
 

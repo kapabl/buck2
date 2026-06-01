@@ -17,13 +17,14 @@ use std::time::SystemTime;
 
 use allocative::Allocative;
 use buck2_action_metadata_proto::RemoteDepFile;
+use buck2_build_signals::env::WaitingData;
 use buck2_core::content_hash::ContentBasedPathHash;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_data::SchedulingMode;
+use buck2_hash::BuckIndexMap;
 use buck2_util::time_span::TimeSpan;
 use derivative::Derivative;
 use dupe::Dupe;
-use indexmap::IndexMap;
 use remote_execution::TActionResult2;
 
 use crate::artifact_value::ArtifactValue;
@@ -214,7 +215,7 @@ impl CommandExecutionMetadata {
             input_materialization_duration: metadata.input_materialization_duration.try_into().ok(),
             execution_stats: metadata.execution_stats,
             hashing_duration: metadata.hashing_duration.try_into().ok(),
-            hashed_artifacts_count: metadata.hashed_artifacts_count.try_into().ok().unwrap_or(0),
+            hashed_artifacts_count: metadata.hashed_artifacts_count,
             queue_duration: metadata.queue_duration.and_then(|d| d.try_into().ok()),
             suspend_duration: metadata.suspend_duration.and_then(|d| d.try_into().ok()),
             suspend_count: metadata.suspend_count,
@@ -227,15 +228,15 @@ impl CommandExecutionMetadata {
 #[derivative(Debug)]
 pub struct CommandExecutionResult {
     /// The outputs produced by this command
-    pub outputs: IndexMap<CommandExecutionOutput, ArtifactValue>,
+    pub outputs: BuckIndexMap<CommandExecutionOutput, ArtifactValue>,
     /// How it executed.
     pub report: CommandExecutionReport,
     /// A previously rejected execution of this command.
     pub rejected_execution: Option<CommandExecutionReport>,
-    /// Whether this was uploaded to cache, by Buck2.
-    pub did_cache_upload: bool,
-    /// Whether dep file information for this action was uploaded to cache, by Buck2.
-    pub did_dep_file_cache_upload: bool,
+    /// Why the main action-result upload did or did not occur.
+    pub cache_upload_result: buck2_data::UploadResult,
+    /// Why dep file information for this action did or did not get uploaded to cache, by Buck2.
+    pub dep_file_cache_upload_result: buck2_data::UploadResult,
     // Remote dep file key, if we did upload a dep file entry
     pub dep_file_key: Option<DepFileDigest>,
     /// Whether this command was eligible for hybrid execution.
@@ -250,6 +251,9 @@ pub struct CommandExecutionResult {
     pub action_result: Option<TActionResult2>,
     /// Description of how local or remote execution were scheduled (currently only set by hybrid executor)
     pub scheduling_mode: Option<SchedulingMode>,
+
+    /// Data about time spent waiting (not on critical path) during command execution.
+    pub waiting_data: WaitingData,
 }
 
 impl CommandExecutionResult {
@@ -257,54 +261,50 @@ impl CommandExecutionResult {
     pub fn calc_output_size_bytes(&self) -> u64 {
         self.outputs
             .values()
-            .map(|v| v.calc_output_count_and_bytes().bytes)
+            .map(|v| v.calc_output_count_and_bytes(false).bytes)
             .sum()
     }
 
     pub fn was_success(&self) -> bool {
-        match self.report.status {
-            CommandExecutionStatus::Success { .. } => true,
-            _ => false,
-        }
+        matches!(self.report.status, CommandExecutionStatus::Success { .. })
     }
 
     pub fn was_served_by_remote_dep_file_cache(&self) -> bool {
-        match self.report.status {
+        matches!(
+            self.report.status,
             CommandExecutionStatus::Success {
                 execution_kind: CommandExecutionKind::RemoteDepFileCache { .. },
-            } => true,
-            _ => false,
-        }
+            }
+        )
     }
 
     pub fn was_remotely_executed(&self) -> bool {
-        match self.report.status {
+        matches!(
+            self.report.status,
             CommandExecutionStatus::Success {
                 execution_kind: CommandExecutionKind::Remote { .. },
-            } => true,
-            _ => false,
-        }
+            }
+        )
     }
 
     pub fn was_locally_executed(&self) -> bool {
-        match self.report.status {
+        matches!(
+            self.report.status,
             CommandExecutionStatus::Success {
                 execution_kind: CommandExecutionKind::Local { .. },
-            } => true,
-            CommandExecutionStatus::Success {
+            } | CommandExecutionStatus::Success {
                 execution_kind: CommandExecutionKind::LocalWorker { .. },
-            } => true,
-            _ => false,
-        }
+            }
+        )
     }
 
     pub fn was_action_cache_hit(&self) -> bool {
-        match self.report.status {
+        matches!(
+            self.report.status,
             CommandExecutionStatus::Success {
                 execution_kind: CommandExecutionKind::ActionCache { .. },
-            } => true,
-            _ => false,
-        }
+            }
+        )
     }
 
     /// For content-based outputs, resolve the outputs to the "constant" (non-content-based) paths

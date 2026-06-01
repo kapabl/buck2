@@ -15,7 +15,7 @@ use buck2_core::cells::cell_path::CellPath;
 use buck2_core::configuration::compatibility::MaybeCompatible;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
 use buck2_core::target::label::label::TargetLabel;
-use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_node::configured_universe::CqueryUniverse;
 use buck2_node::nodes::configured::ConfiguredTargetNode;
 use buck2_node::nodes::configured_node_ref::ConfiguredTargetNodeRefNode;
@@ -29,6 +29,7 @@ use buck2_query::query::graph::successors::AsyncChildVisitor;
 use buck2_query::query::syntax::simple::eval::error::QueryError;
 use buck2_query::query::syntax::simple::eval::file_set::FileSet;
 use buck2_query::query::syntax::simple::eval::set::TargetSet;
+use buck2_query::query::syntax::simple::eval::values::QueryValueDepth;
 use buck2_query::query::syntax::simple::functions::DefaultQueryFunctionsModule;
 use buck2_query::query::syntax::simple::functions::HasModuleDescription;
 use buck2_query::query::syntax::simple::functions::docs::QueryEnvironmentDescription;
@@ -112,7 +113,7 @@ impl<'c> CqueryEnvironment<'c> {
         let universe = self
             .universe
             .as_ref()
-            .internal_error("Target universe not specified")?;
+            .ok_or_else(|| internal_error!("Target universe not specified"))?;
         universe.owners(path)
     }
 }
@@ -221,10 +222,10 @@ impl QueryEnvironment for CqueryEnvironment<'_> {
     async fn deps(
         &self,
         targets: &TargetSet<Self::Target>,
-        depth: Option<i32>,
+        depth: QueryValueDepth,
         filter: Option<&dyn TraversalFilter<Self::Target>>,
     ) -> buck2_error::Result<TargetSet<Self::Target>> {
-        if depth.is_none() && filter.is_none() {
+        if depth.is_unbounded() && filter.is_none() {
             // TODO(nga): fast lookup with depth too.
 
             let mut deps = TargetSet::new();

@@ -18,11 +18,13 @@ use std::time::Instant;
 use async_trait::async_trait;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_error::BuckErrorContext;
+use buck2_events::dispatch::EventDispatcher;
 use buck2_events::dispatch::get_dispatcher;
 use buck2_execute::materialize::materializer::DeferredMaterializerEntry;
 use buck2_execute::materialize::materializer::DeferredMaterializerExtensions;
 use buck2_execute::materialize::materializer::DeferredMaterializerIterItem;
 use buck2_execute::materialize::materializer::DeferredMaterializerSubscription;
+use buck2_fs::error::IoResultExt;
 use buck2_fs::fs_util;
 use chrono::DateTime;
 use chrono::Duration;
@@ -46,6 +48,7 @@ use crate::materializers::deferred::DeferredMaterializerCommandProcessor;
 use crate::materializers::deferred::MaterializerCommand;
 use crate::materializers::deferred::Processing;
 use crate::materializers::deferred::ProcessingFuture;
+use crate::materializers::deferred::artifact_tree::artifact_metadata_size;
 use crate::materializers::deferred::clean_stale::CleanStaleArtifactsCommand;
 use crate::materializers::deferred::clean_stale::CleanStaleArtifactsExtensionCommand;
 use crate::materializers::deferred::io_handler::IoHandler;
@@ -121,7 +124,7 @@ struct Iterate {
 impl<T: IoHandler> ExtensionCommand<T> for Iterate {
     fn execute(self: Box<Self>, processor: &mut DeferredMaterializerCommandProcessor<T>) {
         // Ensure up to date access times
-        processor.flush_access_times(0);
+        processor.flush_access_times();
         for (path, data) in processor.tree.iter_with_paths() {
             let stage = match &data.stage {
                 ArtifactMaterializationStage::Declared { method, .. } => {
@@ -139,7 +142,7 @@ impl<T: IoHandler> ExtensionCommand<T> for Iterate {
                         .unwrap();
                     PathStage::Materialized {
                         ts,
-                        size: Some(metadata.size()),
+                        size: Some(artifact_metadata_size(metadata)),
                     }
                 }
             };
@@ -219,7 +222,8 @@ impl<T: IoHandler> ExtensionCommand<T> for Fsck {
             // actual things are in flight.
 
             let path = ProjectRelativePathBuf::from(path);
-            let res = fs_util::symlink_metadata(processor.io.fs().resolve(&path));
+            let res =
+                fs_util::symlink_metadata(processor.io.fs().resolve(&path)).categorize_internal();
             match res {
                 Ok(..) => {}
                 Err(e) => {
@@ -245,7 +249,7 @@ impl<T: IoHandler> ExtensionCommand<T> for RefreshTtls {
             Duration::seconds(self.min_ttl),
             processor.io.digest_config(),
         )
-        .map(|f| processor.spawn(f));
+        .map(|f| processor.spawn(&EventDispatcher::error_on_event(), f));
         let _ignored = self.sender.send(task);
     }
 }
@@ -343,7 +347,7 @@ impl<T: IoHandler> ExtensionCommand<T> for FlushAccessTimes {
     fn execute(self: Box<Self>, processor: &mut DeferredMaterializerCommandProcessor<T>) {
         let mut out = String::new();
 
-        writeln!(&mut out, "{}", processor.flush_access_times(0)).unwrap();
+        writeln!(&mut out, "{}", processor.flush_access_times()).unwrap();
         let _ignored = self.sender.send(out);
     }
 }
@@ -385,16 +389,14 @@ impl<T: IoHandler> DeferredMaterializerExtensions for DeferredMaterializerAccess
             .send(MaterializerCommand::Extension(
                 Box::new(RefreshTtls { sender, min_ttl }) as _,
             ))?;
-        match receiver
+        if let Some(task) = receiver
             .await
             .buck_error_context("No response from materializer")?
         {
-            Some(task) => task
-                .await
+            task.await
                 .buck_error_context("Refresh task aborted")?
-                .buck_error_context("Refresh failed")?,
-            None => {}
-        };
+                .buck_error_context("Refresh failed")?;
+        }
         Ok(())
     }
 

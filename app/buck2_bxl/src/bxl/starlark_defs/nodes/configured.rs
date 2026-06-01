@@ -10,7 +10,6 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt;
 use std::path::Path;
@@ -25,7 +24,9 @@ use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_artifact::artifact::source_artifact::SourceArtifact;
 use buck2_build_api::actions::query::PackageLabelOption;
 use buck2_build_api::analysis::AnalysisResult;
+use buck2_build_api::bxl::unconfigured_attribute::StarlarkCoercedAttr;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact::StarlarkArtifact;
+use buck2_build_api::interpreter::rule_defs::provider::builtin::configuration_info::ConfigurationInfo;
 use buck2_common::dice::cells::HasCellResolver;
 use buck2_common::dice::data::HasIoProvider;
 use buck2_core::cells::cell_path::CellPath;
@@ -36,7 +37,16 @@ use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
 use buck2_error::BuckErrorContext;
 use buck2_fs::paths::abs_path::AbsPath;
+use buck2_hash::StdBuckHashMap;
+use buck2_hash::StdBuckHashSet;
 use buck2_interpreter::types::target_label::StarlarkConfiguredTargetLabel;
+use buck2_node::attrs::attr_type::arg::StringWithMacros;
+use buck2_node::attrs::attr_type::dict::DictLiteral;
+use buck2_node::attrs::attr_type::list::ListLiteral;
+use buck2_node::attrs::attr_type::query::QueryAttr;
+use buck2_node::attrs::attr_type::transition_dep::CoercedTransitionDep;
+use buck2_node::attrs::attr_type::tuple::TupleLiteral;
+use buck2_node::attrs::coerced_attr::CoercedAttr;
 use buck2_node::attrs::configured_attr::ConfiguredAttr;
 use buck2_node::attrs::configured_traversal::ConfiguredAttrTraversal;
 use buck2_node::attrs::display::AttrDisplayWithContext;
@@ -48,13 +58,13 @@ use derivative::Derivative;
 use derive_more::Display;
 use dupe::Dupe;
 use futures::FutureExt;
+use pagable::Pagable;
 use serde::Serialize;
 use serde::Serializer;
 use starlark::any::ProvidesStaticType;
 use starlark::collections::SmallMap;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
-use starlark::environment::MethodsStatic;
 use starlark::eval::Evaluator;
 use starlark::starlark_module;
 use starlark::starlark_simple_value;
@@ -81,18 +91,212 @@ use crate::bxl::starlark_defs::nodes::configured::attr_resolution_ctx::LazyAttrR
 
 mod attr_resolution_ctx;
 
-#[derive(Debug, Display, ProvidesStaticType, Allocative, Clone, Dupe)]
+fn attr_with_stripped_cfg(attr: &ConfiguredAttr) -> buck2_error::Result<CoercedAttr> {
+    Ok(match attr {
+        ConfiguredAttr::Bool(v) => CoercedAttr::Bool(*v),
+        ConfiguredAttr::Int(v) => CoercedAttr::Int(*v),
+        ConfiguredAttr::String(v) => CoercedAttr::String(v.dupe()),
+        ConfiguredAttr::EnumVariant(v) => CoercedAttr::EnumVariant(v.dupe()),
+        ConfiguredAttr::List(list) => CoercedAttr::List(ListLiteral(
+            list.iter()
+                .map(attr_with_stripped_cfg)
+                .collect::<buck2_error::Result<Vec<_>>>()?
+                .into(),
+        )),
+        ConfiguredAttr::Tuple(tuple) => CoercedAttr::Tuple(TupleLiteral(
+            tuple
+                .iter()
+                .map(attr_with_stripped_cfg)
+                .collect::<buck2_error::Result<Vec<_>>>()?
+                .into(),
+        )),
+        ConfiguredAttr::Dict(dict) => CoercedAttr::Dict(DictLiteral(
+            dict.iter()
+                .map(|(k, v)| Ok((attr_with_stripped_cfg(k)?, attr_with_stripped_cfg(v)?)))
+                .collect::<buck2_error::Result<Vec<_>>>()?
+                .into(),
+        )),
+        ConfiguredAttr::None => CoercedAttr::None,
+        ConfiguredAttr::OneOf(attr, i) => {
+            CoercedAttr::OneOf(Box::new(attr_with_stripped_cfg(attr)?), *i)
+        }
+        ConfiguredAttr::Visibility(v) => CoercedAttr::Visibility(v.dupe()),
+        ConfiguredAttr::WithinView(v) => CoercedAttr::WithinView(v.dupe()),
+        ConfiguredAttr::ExplicitConfiguredDep(dep) => {
+            // Platform information is lost during this conversion
+            // This is fine for most use cases since dep and configured dep display the same
+            CoercedAttr::Dep(dep.label.unconfigured())
+        }
+        ConfiguredAttr::SplitTransitionDep(dep) => {
+            let deps: StdBuckHashSet<_> = dep.deps.values().map(|l| l.unconfigured()).collect();
+            if deps.len() != 1 {
+                return Err(buck2_error::internal_error!(
+                    "ConfiguredSplitTransitionDep should have exactly one dep, but found {}",
+                    deps.len()
+                ));
+            }
+            // This loses the split transition information. This is fine for most use cases since
+            // dep and transition dep display the same
+            CoercedAttr::Dep(
+                deps.iter()
+                    .next()
+                    .ok_or_else(|| {
+                        buck2_error::internal_error!("deps is empty after checking length")
+                    })?
+                    .dupe(),
+            )
+        }
+        ConfiguredAttr::TransitionDep(dep) => {
+            // This loses the transition information. This is fine for most use cases since
+            // dep and transition dep display the same
+            CoercedAttr::TransitionDep(Box::new(CoercedTransitionDep {
+                dep: dep.dep.unconfigured(),
+                transition: None, // The transition information is not available in ConfiguredTransitionDep
+            }))
+        }
+        ConfiguredAttr::ConfigurationDep(dep) => CoercedAttr::ConfigurationDep(dep.dupe()),
+        ConfiguredAttr::PluginDep(dep, _) => CoercedAttr::PluginDep(dep.clone()),
+        ConfiguredAttr::Dep(dep) => CoercedAttr::Dep(dep.label.unconfigured()),
+        ConfiguredAttr::SourceLabel(dep) => CoercedAttr::SourceLabel(dep.unconfigured()),
+        ConfiguredAttr::Label(label) => CoercedAttr::Label(label.unconfigured()),
+        ConfiguredAttr::Arg(arg) => {
+            let unconfigured_parts = match &arg.string_with_macros {
+                StringWithMacros::StringPart(s) => StringWithMacros::StringPart(s.clone()),
+                StringWithMacros::ManyParts(parts) => StringWithMacros::ManyParts(
+                    parts
+                        .iter()
+                        .map(|part| match part {
+                            buck2_node::attrs::attr_type::arg::StringWithMacrosPart::String(s) => {
+                                buck2_node::attrs::attr_type::arg::StringWithMacrosPart::String(
+                                    s.clone(),
+                                )
+                            }
+                            buck2_node::attrs::attr_type::arg::StringWithMacrosPart::Macro(
+                                write_to_file,
+                                macr,
+                            ) => buck2_node::attrs::attr_type::arg::StringWithMacrosPart::Macro(
+                                *write_to_file,
+                                match macr {
+                                    buck2_node::attrs::attr_type::arg::MacroBase::Location {
+                                        label,
+                                        dep_kind,
+                                    } => buck2_node::attrs::attr_type::arg::MacroBase::Location {
+                                        label: label.unconfigured(),
+                                        dep_kind: *dep_kind,
+                                    },
+                                    buck2_node::attrs::attr_type::arg::MacroBase::Exe {
+                                        label,
+                                        exec_dep,
+                                    } => buck2_node::attrs::attr_type::arg::MacroBase::Exe {
+                                        label: label.unconfigured(),
+                                        exec_dep: *exec_dep,
+                                    },
+                                    buck2_node::attrs::attr_type::arg::MacroBase::UserUnkeyedPlaceholder(
+                                        var_name,
+                                    ) => {
+                                        buck2_node::attrs::attr_type::arg::MacroBase::UserUnkeyedPlaceholder(
+                                            var_name.clone(),
+                                        )
+                                    }
+                                    buck2_node::attrs::attr_type::arg::MacroBase::UserKeyedPlaceholder(
+                                        box_value,
+                                    ) => {
+                                        let (var_name, target, arg) = &**box_value;
+                                        buck2_node::attrs::attr_type::arg::MacroBase::UserKeyedPlaceholder(
+                                            Box::new((var_name.clone(), target.unconfigured(), arg.clone())),
+                                        )
+                                    }
+                                    buck2_node::attrs::attr_type::arg::MacroBase::Query(
+                                        query_macro,
+                                    ) => {
+                                        buck2_node::attrs::attr_type::arg::MacroBase::Query(
+                                            Box::new(
+                                                buck2_node::attrs::attr_type::query::QueryMacroBase {
+                                                    expansion_type: query_macro
+                                                        .expansion_type
+                                                        .clone(),
+                                                    query: buck2_node::attrs::attr_type::query::QueryAttrBase {
+                                                        query: query_macro.query.query.clone(),
+                                                        resolved_literals: buck2_node::attrs::attr_type::query::ResolvedQueryLiterals(
+                                                            query_macro
+                                                                .query
+                                                                .resolved_literals
+                                                                .0
+                                                                .iter()
+                                                                .map(|(k, v)| (*k, v.unconfigured()))
+                                                                .collect(),
+                                                        ),
+                                                    },
+                                                },
+                                            ),
+                                        )
+                                    }
+                                    buck2_node::attrs::attr_type::arg::MacroBase::Source(path) => {
+                                        buck2_node::attrs::attr_type::arg::MacroBase::Source(
+                                            path.clone(),
+                                        )
+                                    }
+                                    buck2_node::attrs::attr_type::arg::MacroBase::UnrecognizedMacro(
+                                        macr,
+                                    ) => {
+                                        buck2_node::attrs::attr_type::arg::MacroBase::UnrecognizedMacro(
+                                            macr.clone(),
+                                        )
+                                    }
+                                },
+                            ),
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                ),
+            };
+            CoercedAttr::Arg(unconfigured_parts)
+        }
+        ConfiguredAttr::Query(query) => CoercedAttr::Query(Box::new(QueryAttr {
+            providers: query.providers.clone(),
+            query: buck2_node::attrs::attr_type::query::QueryAttrBase {
+                query: query.query.query.clone(),
+                resolved_literals: buck2_node::attrs::attr_type::query::ResolvedQueryLiterals(
+                    query
+                        .query
+                        .resolved_literals
+                        .0
+                        .iter()
+                        .map(|(k, v)| (*k, v.unconfigured()))
+                        .collect(),
+                ),
+            },
+        })),
+        ConfiguredAttr::SourceFile(path) => CoercedAttr::SourceFile(path.clone()),
+        ConfiguredAttr::Metadata(m) => CoercedAttr::Metadata(m.clone()),
+        ConfiguredAttr::TargetModifiers(m) => CoercedAttr::TargetModifiers(m.clone()),
+    })
+}
+
+#[derive(
+    Debug,
+    Display,
+    ProvidesStaticType,
+    Allocative,
+    Clone,
+    Dupe,
+    pagable::Pagable,
+    starlark::StarlarkPagableViaPagable
+)]
 #[derive(NoSerialize)] // TODO probably should be serializable the same as how queries serialize
 #[display("configured_target_node(name = {}, ...)", self.0.label())]
 pub(crate) struct StarlarkConfiguredTargetNode(pub(crate) ConfiguredTargetNode);
 
 starlark_simple_value!(StarlarkConfiguredTargetNode);
 
+starlark::methods_static!(
+    CONFIGURED_TARGET_NODE_VALUE_METHODS = configured_target_node_value_methods
+);
+
 #[starlark_value(type = "bxl.ConfiguredTargetNode")]
 impl<'v> StarlarkValue<'v> for StarlarkConfiguredTargetNode {
     fn get_methods() -> Option<&'static Methods> {
-        static RES: MethodsStatic = MethodsStatic::new();
-        RES.methods(configured_target_node_value_methods)
+        Some(CONFIGURED_TARGET_NODE_VALUE_METHODS.methods())
     }
 }
 
@@ -153,7 +357,7 @@ fn configured_target_node_value_methods(builder: &mut MethodsBuilder) {
     fn get_attr<'v>(
         this: &StarlarkConfiguredTargetNode,
         #[starlark(require=pos)] key: &str,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> starlark::Result<NoneOr<Value<'v>>> {
         Ok(NodeAttributeGetter::get_attr(this, key, heap)?)
     }
@@ -169,7 +373,7 @@ fn configured_target_node_value_methods(builder: &mut MethodsBuilder) {
     /// ```
     fn get_attrs<'v>(
         this: &StarlarkConfiguredTargetNode,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> starlark::Result<SmallMap<StringValue<'v>, Value<'v>>> {
         Ok(NodeAttributeGetter::get_attrs(this, heap)?)
     }
@@ -217,7 +421,7 @@ fn configured_target_node_value_methods(builder: &mut MethodsBuilder) {
     /// ```
     fn attrs_eager<'v>(
         this: &StarlarkConfiguredTargetNode,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> starlark::Result<Value<'v>> {
         let attrs_iter = this.0.attrs(AttrInspectOptions::All);
         let special_attrs_iter = this.0.special_attrs();
@@ -368,7 +572,7 @@ fn configured_target_node_value_methods(builder: &mut MethodsBuilder) {
     /// ```
     fn unwrap_forward<'v>(
         this: ValueTyped<'v, StarlarkConfiguredTargetNode>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> starlark::Result<ValueTyped<'v, StarlarkConfiguredTargetNode>> {
         match this.0.forward_target() {
             Some(n) => Ok(heap.alloc_typed(StarlarkConfiguredTargetNode(n.dupe()))),
@@ -388,7 +592,7 @@ fn configured_target_node_value_methods(builder: &mut MethodsBuilder) {
     #[starlark(attribute)]
     fn rule_type<'v>(
         this: &'v StarlarkConfiguredTargetNode,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> starlark::Result<StringValue<'v>> {
         Ok(heap.alloc_str_intern(this.0.rule_type().to_string().as_str()))
     }
@@ -407,7 +611,7 @@ fn configured_target_node_value_methods(builder: &mut MethodsBuilder) {
     #[starlark(attribute)]
     fn rule_kind<'v>(
         this: &'v StarlarkConfiguredTargetNode,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> starlark::Result<StringValue<'v>> {
         Ok(heap.alloc_str_intern(this.0.rule_kind().as_str()))
     }
@@ -525,7 +729,7 @@ fn configured_target_node_value_methods(builder: &mut MethodsBuilder) {
     #[starlark(attribute)]
     fn oncall<'v>(
         this: &'v StarlarkConfiguredTargetNode,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> starlark::Result<NoneOr<StringValue<'v>>> {
         match this.0.oncall() {
             Some(oncall) => Ok(NoneOr::Other(heap.alloc_str_intern(oncall))),
@@ -550,13 +754,48 @@ fn configured_target_node_value_methods(builder: &mut MethodsBuilder) {
         Ok(AllocList(
             this.0
                 .deps()
-                .map(|node| StarlarkConfiguredTargetNode(node.dupe()))
-                .into_iter(),
+                .map(|node| StarlarkConfiguredTargetNode(node.dupe())),
         ))
+    }
+
+    /// Returns a `ConfigurationInfo` representing this node's configuration,
+    /// or `None` if the configuration is not bound.
+    ///
+    /// The returned `ConfigurationInfo` has a `constraints` dict mapping
+    /// `TargetLabel` (constraint settings) to `ConstraintValueInfo` (constraint values),
+    /// and an empty `values` dict.
+    ///
+    /// Sample usage:
+    /// ```python
+    /// def _impl_configuration_info(ctx):
+    ///     node = ctx.configured_targets("my_cell//bin:the_binary")
+    ///     cfg_info = node.configuration_info()
+    ///     if cfg_info != None:
+    ///         for setting, value in cfg_info.constraints.items():
+    ///             ctx.output.print(str(setting) + "=" + str(value))
+    /// ```
+    fn configuration_info<'v>(
+        this: &StarlarkConfiguredTargetNode,
+        heap: Heap<'v>,
+    ) -> starlark::Result<NoneOr<Value<'v>>> {
+        let cfg = this.0.label().cfg();
+        if !cfg.is_bound() {
+            return Ok(NoneOr::None);
+        }
+        let data = cfg.data()?;
+        let info = ConfigurationInfo::from_configuration_data(data, heap);
+        Ok(NoneOr::Other(heap.alloc(info)))
     }
 }
 
-#[derive(Debug, Clone, ProvidesStaticType, Allocative)]
+#[derive(
+    Debug,
+    Clone,
+    ProvidesStaticType,
+    Allocative,
+    Pagable,
+    starlark::StarlarkPagableViaPagable
+)]
 #[repr(C)]
 pub(crate) struct StarlarkConfiguredAttr(ConfiguredAttr, PackageLabel);
 
@@ -589,11 +828,12 @@ impl Serialize for StarlarkConfiguredAttr {
 
 starlark_simple_value!(StarlarkConfiguredAttr);
 
+starlark::methods_static!(CONFIGURED_ATTR_METHODS = configured_attr_methods);
+
 #[starlark_value(type = "bxl.ConfiguredAttr")]
 impl<'v> StarlarkValue<'v> for StarlarkConfiguredAttr {
     fn get_methods() -> Option<&'static Methods> {
-        static RES: MethodsStatic = MethodsStatic::new();
-        RES.methods(configured_attr_methods)
+        Some(CONFIGURED_ATTR_METHODS.methods())
     }
 }
 
@@ -612,7 +852,7 @@ fn configured_attr_methods(builder: &mut MethodsBuilder) {
     // FIXME(JakobDegen): Strings as types are mostly dead, users should be getting the value and
     // using `isinstance` instead. Remove this.
     #[starlark(attribute)]
-    fn r#type<'v>(this: &StarlarkConfiguredAttr, heap: &'v Heap) -> starlark::Result<&'v str> {
+    fn r#type<'v>(this: &StarlarkConfiguredAttr, heap: Heap<'v>) -> starlark::Result<&'v str> {
         Ok(this
             .0
             .to_value(PackageLabelOption::PackageLabel(this.1.dupe()), heap)?
@@ -628,10 +868,40 @@ fn configured_attr_methods(builder: &mut MethodsBuilder) {
     ///     attrs = node.attrs_eager()
     ///     ctx.output.print(attrs.name.value())
     /// ```
-    fn value<'v>(this: &StarlarkConfiguredAttr, heap: &'v Heap) -> starlark::Result<Value<'v>> {
+    fn value<'v>(this: &StarlarkConfiguredAttr, heap: Heap<'v>) -> starlark::Result<Value<'v>> {
         Ok(this
             .0
             .to_value(PackageLabelOption::PackageLabel(this.1.dupe()), heap)?)
+    }
+
+    /// Returns this attribute with all configurations stripped.
+    ///
+    /// This is useful when you want to display or compare attributes after configuration
+    /// without configuration-specific information in the output. For example, macros
+    /// like `$(location)` may include configuration strings when displayed that can be
+    /// removed with this method.
+    ///
+    /// Sample usage:
+    /// ```python
+    /// def _impl_strip_cfg(ctx):
+    ///     node = ctx.configured_targets("my_cell//:my_genrule")
+    ///     attrs = node.attrs_eager()
+    ///
+    ///     # With configuration: $(exe <dep> (<cfg>))
+    ///     ctx.output.print(attrs.bash)
+    ///
+    ///     # Without configuration: $(exe <dep>)
+    ///     ctx.output.print(attrs.bash.strip_cfg())
+    /// ```
+    fn strip_cfg<'v>(
+        this: &StarlarkConfiguredAttr,
+        _heap: Heap<'v>,
+    ) -> starlark::Result<StarlarkCoercedAttr> {
+        Ok(StarlarkCoercedAttr(
+            attr_with_stripped_cfg(&this.0)
+                .buck_error_context("Failed to strip configuration from attribute")?,
+            this.1.dupe(),
+        ))
     }
 }
 
@@ -653,16 +923,17 @@ pub(crate) struct StarlarkLazyAttrs<'v> {
     configured_target_node: &'v StarlarkConfiguredTargetNode,
 }
 
+starlark::methods_static!(LAZY_ATTRS_METHODS = lazy_attrs_methods);
+
 #[starlark_value(type = "bxl.LazyAttrs", StarlarkTypeRepr, UnpackValue)]
 impl<'v> StarlarkValue<'v> for StarlarkLazyAttrs<'v> {
     fn get_methods() -> Option<&'static Methods> {
-        static RES: MethodsStatic = MethodsStatic::new();
-        RES.methods(lazy_attrs_methods)
+        Some(LAZY_ATTRS_METHODS.methods())
     }
 }
 
 impl<'v> AllocValue<'v> for StarlarkLazyAttrs<'v> {
-    fn alloc_value(self, heap: &'v Heap) -> Value<'v> {
+    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
         heap.alloc_complex_no_freeze(self)
     }
 }
@@ -709,7 +980,7 @@ fn lazy_attrs_methods(builder: &mut MethodsBuilder) {
                         .configured_target_node
                         .0
                         .special_attrs()
-                        .collect::<HashMap<_, _>>();
+                        .collect::<StdBuckHashMap<_, _>>();
                     let attr = special_attrs.get(attr);
                     match attr {
                         None => NoneOr::None,
@@ -743,16 +1014,17 @@ pub(crate) struct StarlarkLazyResolvedAttrs<'v> {
     resolution_ctx_data: RefCell<LazyAttrResolutionCache>,
 }
 
+starlark::methods_static!(LAZY_RESOLVED_ATTRS_METHODS = lazy_resolved_attrs_methods);
+
 #[starlark_value(type = "bxl.LazyResolvedAttrs", StarlarkTypeRepr, UnpackValue)]
 impl<'v> StarlarkValue<'v> for StarlarkLazyResolvedAttrs<'v> {
     fn get_methods() -> Option<&'static Methods> {
-        static RES: MethodsStatic = MethodsStatic::new();
-        RES.methods(lazy_resolved_attrs_methods)
+        Some(LAZY_RESOLVED_ATTRS_METHODS.methods())
     }
 }
 
 impl<'v> AllocValue<'v> for StarlarkLazyResolvedAttrs<'v> {
-    fn alloc_value(self, heap: &'v Heap) -> Value<'v> {
+    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
         heap.alloc_complex_no_freeze(self)
     }
 }
@@ -818,7 +1090,7 @@ fn lazy_resolved_attrs_methods(builder: &mut MethodsBuilder) {
                         .configured_node
                         .0
                         .special_attrs()
-                        .collect::<HashMap<_, _>>();
+                        .collect::<StdBuckHashMap<_, _>>();
                     let attr = special_attrs.get(attr);
                     match attr {
                         None => NoneOr::None,

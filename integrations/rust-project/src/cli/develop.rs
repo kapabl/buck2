@@ -54,7 +54,10 @@ pub(crate) enum Output {
 }
 
 impl Develop {
-    pub(crate) fn from_command(command: Command) -> (Develop, Input, OutputCfg) {
+    pub(crate) fn from_command(
+        command: Command,
+        project_root: Option<PathBuf>,
+    ) -> (Develop, Input, OutputCfg) {
         if let crate::Command::Develop {
             files,
             targets,
@@ -86,7 +89,7 @@ impl Develop {
             };
 
             let mode = select_mode(mode.as_deref());
-            let buck = buck::Buck::new(buck2_command.clone(), mode);
+            let buck = buck::Buck::new(buck2_command.clone(), mode, project_root.clone());
 
             let develop = Develop {
                 sysroot,
@@ -137,7 +140,7 @@ impl Develop {
             };
 
             let mode = select_mode(mode.as_deref());
-            let buck = buck::Buck::new(buck2_command.clone(), mode);
+            let buck = buck::Buck::new(buck2_command.clone(), mode, project_root);
 
             let develop = Develop {
                 sysroot,
@@ -168,11 +171,14 @@ impl Develop {
 
 const DEFAULT_EXTRA_TARGETS: usize = 50;
 
+/// The final rust-project.json result for the rust-analyzer discovery protocol.
+///
+/// <https://rust-analyzer.github.io/book/configuration.html#workspace-discovery-protocol>
 #[derive(Serialize, Deserialize)]
-pub(crate) struct OutputData {
+pub(crate) struct DiscoverProjectFinished {
+    pub(crate) kind: String,
     pub(crate) buildfile: PathBuf,
     pub(crate) project: ProjectJson,
-    pub(crate) kind: String,
 }
 
 impl Develop {
@@ -237,7 +243,7 @@ impl Develop {
                 // we have to log before we write the output, because rust-analyzer will kill us after the write
                 crate::scuba::log_develop(start.elapsed(), input.clone(), self.invoked_by_ra);
 
-                let out = OutputData {
+                let out = DiscoverProjectFinished {
                     buildfile,
                     project,
                     kind: "finished".to_owned(),
@@ -286,7 +292,7 @@ impl Develop {
             },
             SysrootConfig::BuckConfig => {
                 let project_root = buck.resolve_project_root()?;
-                resolve_buckconfig_sysroot(&buck, &project_root)?
+                resolve_buckconfig_sysroot(buck, &project_root, &targets)?
             }
             SysrootConfig::Rustup => resolve_rustup_sysroot()?,
         };

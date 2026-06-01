@@ -7,10 +7,20 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
+# This script builds buck2 locally from source and then runs it.
+#
+# It uses the installed buck2 to build the buck2 bundle target, then executes
+# the freshly built binary with any additional arguments passed to this script.
+# This is useful for testing local changes to buck2 without a full installation.
+#
+# Example:
+#   ./buck2.py build //my:target
+
 import argparse
 import os
 import platform
 import subprocess
+import sys
 from typing import List, Optional, Tuple
 
 
@@ -86,7 +96,8 @@ def main() -> None:
     if __file__ is not None:
         cwd = os.path.dirname(__file__)
     cmd = build_command(args, extra_args, cwd)
-    subprocess.run(cmd, cwd=cwd)
+    result = subprocess.run(cmd, cwd=cwd)
+    sys.exit(result.returncode)
 
 
 if __name__ == "__main__":

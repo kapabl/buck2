@@ -26,25 +26,21 @@ impl syn::parse::Parse for InternalProviderArgs {
     fn parse(input: syn::parse::ParseStream) -> syn::parse::Result<Self> {
         let creator_func = syn::Ident::parse(input)?;
 
-        // Parse optional methods parameter
-        let methods_func = if input.peek(syn::Token![,]) {
-            input.parse::<syn::Token![,]>()?;
+        let mut methods_func = None;
 
-            // Check if it's methods = ...
-            if input.peek(syn::Ident) {
-                let key = syn::Ident::parse(input)?;
-                if key == "methods" {
-                    input.parse::<syn::Token![=]>()?;
-                    Some(syn::Ident::parse(input)?)
-                } else {
-                    return Err(syn::Error::new_spanned(key, "expected 'methods' parameter"));
-                }
-            } else {
-                None
+        while input.peek(syn::Token![,]) {
+            input.parse::<syn::Token![,]>()?;
+            if !input.peek(syn::Ident) {
+                break;
             }
-        } else {
-            None
-        };
+            let key = syn::Ident::parse(input)?;
+            if key == "methods" {
+                input.parse::<syn::Token![=]>()?;
+                methods_func = Some(syn::Ident::parse(input)?);
+            } else {
+                return Err(syn::Error::new_spanned(key, "expected `methods`"));
+            }
+        }
 
         Ok(InternalProviderArgs {
             creator_func,
@@ -254,43 +250,62 @@ impl ProviderCodegen {
         let provider_docstring = self.get_docstring_impl(&self.input.attrs);
         let create_func = &self.args.creator_func;
 
-        let field_docs = self.fields()?;
+        // Generate the documentation function based on whether custom methods are provided
+        if let Some(ref custom_methods) = self.args.methods_func {
+            // When using custom methods, we don't need the field arrays
+            Ok(syn::parse_quote_spanned! {self.span=>
+                fn documentation(&self) -> starlark::docs::DocItem {
+                    let docstring = #provider_docstring;
+                    buck2_build_api::interpreter::rule_defs::provider::doc::provider_callable_documentation(
+                        Some(#create_func),
+                        buck2_build_api::interpreter::rule_defs::provider::doc::ProviderMembersSource::FromMethods(#custom_methods),
+                        BUILTIN_PROVIDER_TY.instance(),
+                        &docstring,
+                    )
+                }
+            })
+        } else {
+            // When not using custom methods, generate field arrays
+            let field_docs = self.fields()?;
 
-        let mut field_names = vec![];
-        let mut field_docstrings = vec![];
-        let mut field_types = vec![];
+            let mut field_names = vec![];
+            let mut field_docstrings = vec![];
+            let mut field_types = vec![];
 
-        for doc in &field_docs {
-            let name = &doc.name;
-            let name = quote! { stringify!(#name) };
+            for doc in &field_docs {
+                let name = &doc.name;
+                let name = quote! { stringify!(#name) };
 
-            field_names.push(name);
-            field_docstrings.push(&doc.docstring);
-            field_types.push(doc.field_type_ty());
-        }
-
-        Ok(syn::parse_quote_spanned! {self.span=>
-            fn documentation(&self) -> starlark::docs::DocItem {
-                let docstring = #provider_docstring;
-                let field_names = [
-                    #(#field_names),*
-                ];
-                let field_docs = [
-                    #(#field_docstrings),*
-                ];
-                let field_types = [
-                    #(#field_types),*
-                ];
-                buck2_build_api::interpreter::rule_defs::provider::doc::provider_callable_documentation(
-                    Some(#create_func),
-                    BUILTIN_PROVIDER_TY.instance(),
-                    &docstring,
-                    &field_names,
-                    &field_docs,
-                    &field_types,
-                )
+                field_names.push(name);
+                field_docstrings.push(&doc.docstring);
+                field_types.push(doc.field_type_ty());
             }
-        })
+
+            Ok(syn::parse_quote_spanned! {self.span=>
+                fn documentation(&self) -> starlark::docs::DocItem {
+                    let docstring = #provider_docstring;
+                    let field_names: [&str; _] = [
+                        #(#field_names),*
+                    ];
+                    let field_docs: [std::option::Option<starlark::docs::DocString>; _] = [
+                        #(#field_docstrings),*
+                    ];
+                    let field_types: [starlark::typing::Ty; _] = [
+                        #(#field_types),*
+                    ];
+                    buck2_build_api::interpreter::rule_defs::provider::doc::provider_callable_documentation(
+                        Some(#create_func),
+                        buck2_build_api::interpreter::rule_defs::provider::doc::ProviderMembersSource::FromFields {
+                            fields: &field_names,
+                            field_docs: &field_docs,
+                            field_types: &field_types,
+                        },
+                        BUILTIN_PROVIDER_TY.instance(),
+                        &docstring,
+                    )
+                }
+            })
+        }
     }
 
     fn builtin_provider_ty(&self) -> syn::Result<syn::Item> {
@@ -347,25 +362,32 @@ impl ProviderCodegen {
         } else {
             self.provider_methods_func_name()?
         };
+        let methods_static_name = format_ident!(
+            "{}_PROVIDER_STATICS",
+            provider_methods_func_name.to_string().to_uppercase()
+        );
         let field_names = self.field_names()?;
+        let starlark_value_attr: syn::Attribute = syn::parse_quote_spanned! { self.span=>
+            #[starlark::values::starlark_value(type = #name_str)]
+        };
         Ok(vec![
             syn::parse_quote_spanned! { self.span=>
                 starlark::starlark_complex_value!(#vis #name);
             },
             syn::parse_quote_spanned! { self.span=>
-                #[starlark::values::starlark_value(type = #name_str)]
+                starlark::methods_static!(#methods_static_name = #provider_methods_func_name);
+            },
+            syn::parse_quote_spanned! { self.span=>
+                #starlark_value_attr
                 impl<'v, V: starlark::values::ValueLike<'v>> starlark::values::StarlarkValue<'v>
                     for #gen_name<V>
                 where
                     Self: starlark::any::ProvidesStaticType<'v>,
                 {
-                    fn get_methods() -> Option<&'static starlark::environment::Methods> {
-                        static RES: starlark::environment::MethodsStatic =
-                            starlark::environment::MethodsStatic::new();
+                    type Canonical = #gen_name<starlark::values::FrozenValue>;
 
-                        RES.methods(|x| {
-                            #provider_methods_func_name(x);
-                        })
+                    fn get_methods() -> Option<&'static starlark::environment::Methods> {
+                        Some(#methods_static_name.methods())
                     }
 
                     fn provide(&'v self, demand: &mut starlark::values::Demand<'_, 'v>) {
@@ -459,10 +481,13 @@ impl ProviderCodegen {
     fn callable_struct(&self) -> syn::Result<syn::Item> {
         let vis = &self.input.vis;
         let callable_name = self.callable_name()?;
+        // `StarlarkPagablePanic` is safe here: a `*Callable` value is only created from
+        // from the starlark `Globals` registry (registered via `register_provider`).
+        // The pagable of values on Globals is hanlded by Globals pagable support.
         Ok(syn::parse_quote_spanned! { self.span=>
-            #[derive(Debug, Clone, dupe::Dupe, starlark::any::ProvidesStaticType, starlark::values::NoSerialize, allocative::Allocative)]
+            #[derive(Debug, Clone, dupe::Dupe, starlark::any::ProvidesStaticType, starlark::values::NoSerialize, allocative::Allocative, starlark::values::StarlarkPagable)]
             #vis struct #callable_name {
-                id: &'static std::sync::Arc<buck2_core::provider::id::ProviderId>,
+
             }
         })
     }
@@ -473,10 +498,15 @@ impl ProviderCodegen {
         let typechecker_ty_function = self.typechecker_ty_function()?;
         let create_func = &self.args.creator_func;
         let callable_name_snake_str = callable_name.to_string().to_case(Case::Snake);
+        let callable_globals_static_name =
+            format_ident!("{}_GLOBALS_STATIC", callable_name_snake_str.to_uppercase());
 
         Ok(vec![
             syn::parse_quote_spanned! {self.span=>
                 starlark::starlark_simple_value!(#callable_name);
+            },
+            syn::parse_quote_spanned! {self.span=>
+                starlark::globals_static!(#callable_globals_static_name = #create_func);
             },
             syn::parse_quote_spanned! {self.span=>
                 #[starlark::values::starlark_value(type = #callable_name_snake_str)]
@@ -488,10 +518,8 @@ impl ProviderCodegen {
                         args: &starlark::eval::Arguments<'v, '_>,
                         eval: &mut starlark::eval::Evaluator<'v, '_, '_>,
                     ) -> starlark::Result<starlark::values::Value<'v>> {
-                        static RES: starlark::environment::GlobalsStatic =
-                            starlark::environment::GlobalsStatic::new();
                         starlark::values::ValueLike::invoke(
-                            RES.function(#create_func), args, eval)
+                            #callable_globals_static_name.function(), args, eval)
                     }
 
                     fn provide(&'v self, demand: &mut starlark::values::Demand<'_, 'v>) {
@@ -515,7 +543,7 @@ impl ProviderCodegen {
         Ok(syn::parse_quote_spanned! { self.span=>
             impl buck2_interpreter::types::provider::callable::ProviderCallableLike for #callable_name {
                 fn id(&self) -> buck2_error::Result<&std::sync::Arc<buck2_core::provider::id::ProviderId>> {
-                    Ok(self.id)
+                    Ok(Self::provider_id_t().id())
                 }
             }
         })
@@ -554,7 +582,6 @@ impl ProviderCodegen {
 
                 #vis fn new() -> Self {
                     Self {
-                        id: Self::provider_id(),
                     }
                 }
             }

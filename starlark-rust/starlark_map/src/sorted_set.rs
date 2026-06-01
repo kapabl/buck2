@@ -20,6 +20,10 @@
 use std::hash::Hash;
 
 use allocative::Allocative;
+#[cfg(feature = "pagable_dep")]
+use pagable::Pagable;
+use serde::Deserialize;
+use serde::Serialize;
 
 use crate::Equivalent;
 use crate::ordered_set::OrderedSet;
@@ -28,7 +32,19 @@ use crate::small_set::SmallSet;
 use crate::sorted_vec::SortedVec;
 
 /// An immutable `SmallSet` with values guaranteed to be sorted.
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Allocative)]
+#[derive(
+    Clone,
+    Debug,
+    Eq,
+    PartialEq,
+    Hash,
+    Ord,
+    PartialOrd,
+    Allocative,
+    Serialize,
+    Deserialize
+)]
+#[cfg_attr(feature = "pagable_dep", derive(Pagable))]
 pub struct SortedSet<T: Eq + Hash> {
     inner: OrderedSet<T>,
 }

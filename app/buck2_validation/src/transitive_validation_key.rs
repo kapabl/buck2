@@ -19,16 +19,21 @@ use buck2_build_api::analysis::calculation::RuleAnalysisCalculation;
 use buck2_build_api::validation::transitive_validations::TransitiveValidations;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
 use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use derivative::Derivative;
 use derive_more::Display;
 use dice::CancellationContext;
 use dice::DiceComputations;
 use dice::Key;
+use dice::OkPagableValueSerialize;
+use dice::ValueSerialize;
 use dice_error::DiceError;
 use dupe::Dupe;
 use dupe::IterDupedExt;
 use either::Either;
 use futures::future::FutureExt;
+use pagable::Pagable;
+use pagable::pagable_typetag;
 
 use crate::cached_validation_result::CachedValidationResult;
 use crate::cached_validation_result::CachedValidationResultData;
@@ -38,9 +43,10 @@ use crate::single_validation_key::SingleValidationKey;
 
 /// DICE key that corresponds to a validation of a whole target subgraph rooted at the given node.
 #[derive(
-    Clone, Display, Dupe, Allocative, Derivative, Hash, Eq, PartialEq, Debug
+    Clone, Display, Dupe, Allocative, Derivative, Hash, Eq, PartialEq, Debug, Pagable
 )]
 #[repr(transparent)]
+#[pagable_typetag(dice::DiceKeyDyn)]
 pub(crate) struct TransitiveValidationKey(pub ConfiguredTargetLabel);
 
 impl TransitiveValidationKey {
@@ -68,7 +74,6 @@ impl TransitiveValidationKey {
             .validations()
             .filter(|spec| !spec.optional() || enabled_optional_validations.contains(spec.name()))
             .map(|spec| spec.validation_result().get_bound_artifact())
-            .map(|r| r.map_err(buck2_error::Error::from))
             .collect::<buck2_error::Result<Vec<Artifact>>>()?;
         ctx.try_compute_join(artifacts, |ctx, output| {
             async move { compute_single_validation(ctx, output).await }.boxed()
@@ -154,6 +159,10 @@ impl Key for TransitiveValidationKey {
     fn validity(x: &Self::Value) -> bool {
         x.is_ok()
     }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        OkPagableValueSerialize::<Self::Value>::new()
+    }
 }
 
 /// Auxiliary error type to be able to stop running validations early during transitive check
@@ -188,7 +197,7 @@ async fn compute_single_validation(
 ) -> Result<(), TreatValidationFailureAsError> {
     let action_key = validation_result
         .action_key()
-        .internal_error("Expected validation to be a build artifact")?;
+        .ok_or_else(|| internal_error!("Expected validation to be a build artifact"))?;
     let key = SingleValidationKey(action_key.dupe());
     let result = ctx.compute(&key).await?;
     tighten_cached_validation_result(result)

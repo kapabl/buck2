@@ -28,8 +28,8 @@ use buck2_common::events::HasEvents;
 use buck2_common::scope::scope_and_collect_with_dice;
 use buck2_core::execution_types::execution::ExecutionPlatformResolution;
 use buck2_core::global_cfg_options::GlobalCfgOptions;
-use buck2_error::BuckErrorContext;
 use buck2_error::buck2_error;
+use buck2_error::internal_error;
 use buck2_execute::digest_config::HasDigestConfig;
 use buck2_interpreter::factory::BuckStarlarkModule;
 use buck2_interpreter::factory::StarlarkEvaluatorProvider;
@@ -75,6 +75,9 @@ use crate::bxl::starlark_defs::eval_extra::BxlEvalExtra;
 
 struct BxlAnonCallbackParamSpec;
 
+pagable::static_str!(BXL_ANON_BXL_CTX = "bxl_ctx");
+pagable::static_str!(BXL_ANON_ATTRS = "attrs");
+
 impl StarlarkCallableParamSpec for BxlAnonCallbackParamSpec {
     fn params() -> ParamSpec {
         ParamSpec::new_parts(
@@ -83,12 +86,12 @@ impl StarlarkCallableParamSpec for BxlAnonCallbackParamSpec {
             None,
             [
                 (
-                    ArcStr::new_static("bxl_ctx"),
+                    ArcStr::new_static(BXL_ANON_BXL_CTX),
                     ParamIsRequired::Yes,
                     BxlContext::starlark_type_repr(),
                 ),
                 (
-                    ArcStr::new_static("attrs"),
+                    ArcStr::new_static(BXL_ANON_ATTRS),
                     ParamIsRequired::Yes,
                     StructRef::starlark_type_repr(),
                 ),
@@ -257,8 +260,7 @@ async fn eval_bxl_for_anon_target_inner(
     let eval_kind = anon_target.dupe().eval_kind();
     let provider = StarlarkEvaluatorProvider::new(dice, eval_kind).await?;
 
-    BuckStarlarkModule::with_profiling(|env_provider| {
-        let env = env_provider.make();
+    BuckStarlarkModule::with_profiling(|env| {
         let bxl_dice = BxlDiceComputations::new(dice, liveness.dupe());
         let bxl_ctx_core_data = Arc::new(bxl_ctx_core_data);
         let mut extra = BxlEvalExtra::new_anon(bxl_dice, bxl_ctx_core_data.dupe());
@@ -311,8 +313,8 @@ async fn eval_bxl_for_anon_target_inner(
                 .get_fulfilled_promise_artifacts(promise_artifact_mappings, res, eval)
         })?;
 
-        let res =
-            ValueTypedComplex::new(res).internal_error("Just allocated the provider collection")?;
+        let res = ValueTypedComplex::new(res)
+            .ok_or_else(|| internal_error!("Just allocated the provider collection"))?;
 
         let analysis_registry = bxl_ctx.take_state_anon()?;
         analysis_registry
@@ -387,7 +389,9 @@ pub(crate) fn run_anon_target_promises<'v, 'a, 'e>(
     // with disadvantages, basically that it does not respect the "safety" of the standard
     // `via_dice` thing. Concretely, that means it doesn't respect cancellations and fails to report
     // a proper span for dice access.
-    tokio::runtime::Handle::current().block_on(actions.run_promises(&mut accessor))
+    tokio::runtime::Handle::current()
+        .block_on(actions.run_promises(&mut accessor))
+        .map(|_| ())
 }
 
 pub(crate) fn init_eval_bxl_for_anon_target() {

@@ -24,19 +24,23 @@ use buck2_build_api::actions::execute::error::ExecuteError;
 use buck2_build_api::artifact_groups::ArtifactGroup;
 use buck2_build_api::interpreter::rule_defs::artifact::associated::AssociatedArtifacts;
 use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact_like::ValueAsInputArtifactLike;
+use buck2_build_signals::env::WaitingData;
 use buck2_core::category::CategoryRef;
 use buck2_core::content_hash::ContentBasedPathHash;
 use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_execute::artifact::artifact_dyn::ArtifactDyn;
 use buck2_execute::artifact_utils::ArtifactValueBuilder;
 use buck2_execute::execute::command_executor::ActionExecutionTimingData;
 use buck2_execute::materialize::materializer::CopiedArtifact;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
+use buck2_hash::BuckIndexSet;
 use dupe::Dupe;
 use gazebo::prelude::*;
-use indexmap::IndexSet;
 use itertools::Itertools;
+use pagable::Pagable;
+use pagable::pagable_typetag;
 use starlark::values::OwnedFrozenValue;
 use starlark::values::ValueError;
 use starlark::values::dict::UnpackDictEntries;
@@ -163,7 +167,7 @@ impl UnregisteredSymlinkedDirAction {
 impl UnregisteredAction for UnregisteredSymlinkedDirAction {
     fn register(
         self: Box<Self>,
-        outputs: IndexSet<BuildArtifact>,
+        outputs: BuckIndexSet<BuildArtifact>,
         _starlark_data: Option<OwnedFrozenValue>,
         _error_handler: Option<OwnedFrozenValue>,
     ) -> buck2_error::Result<Box<dyn Action>> {
@@ -175,7 +179,7 @@ impl UnregisteredAction for UnregisteredSymlinkedDirAction {
     }
 }
 
-#[derive(Debug, Allocative)]
+#[derive(Debug, Allocative, Pagable)]
 struct SymlinkedDirAction {
     copy: CopyMode,
     args: Vec<(ArtifactGroup, Box<ForwardRelativePath>)>,
@@ -191,6 +195,7 @@ impl SymlinkedDirAction {
     }
 }
 
+#[pagable_typetag]
 #[async_trait]
 impl Action for SymlinkedDirAction {
     fn kind(&self) -> buck2_data::ActionKind {
@@ -220,6 +225,7 @@ impl Action for SymlinkedDirAction {
     async fn execute(
         &self,
         ctx: &mut dyn ActionExecutionCtx,
+        waiting_data: WaitingData,
     ) -> Result<(ActionOutputs, ActionExecutionMetadata), ExecuteError> {
         let fs = ctx.fs().fs();
         let temp_output = ctx.fs().resolve_build(
@@ -234,11 +240,13 @@ impl Action for SymlinkedDirAction {
                 .artifact_values(group)
                 .iter()
                 .into_singleton()
-                .buck_error_context("Input did not dereference to exactly one artifact")?;
+                .ok_or_else(|| {
+                    internal_error!("Input did not dereference to exactly one artifact")
+                })?;
 
             let src = src_artifact.resolve_path(
                 ctx.fs(),
-                if src_artifact.has_content_based_path() {
+                if src_artifact.path_resolution_requires_artifact_value() {
                     Some(value.content_based_path_hash())
                 } else {
                     None
@@ -265,7 +273,7 @@ impl Action for SymlinkedDirAction {
             };
         }
 
-        let value = builder.build(&temp_output.as_ref())?;
+        let value = builder.build(temp_output.as_ref())?;
         let actual_output = ctx.fs().resolve_build(
             self.output().get_path(),
             if self.output().get_path().is_content_based_path() {
@@ -292,8 +300,12 @@ impl Action for SymlinkedDirAction {
             })
             .collect_vec();
 
+        let configuration_path = ctx
+            .materializer()
+            .maybe_eager_configuration_path(ctx.fs(), self.output().get_path())?;
+
         ctx.materializer()
-            .declare_copy(actual_output, value.dupe(), srcs)
+            .declare_copy(actual_output, value.dupe(), srcs, configuration_path)
             .await?;
         Ok((
             ActionOutputs::from_single(self.output().get_path().dupe(), value),
@@ -301,6 +313,7 @@ impl Action for SymlinkedDirAction {
                 execution_kind: ActionExecutionKind::Simple,
                 timing: ActionExecutionTimingData::default(),
                 input_files_bytes: None,
+                waiting_data,
             },
         ))
     }

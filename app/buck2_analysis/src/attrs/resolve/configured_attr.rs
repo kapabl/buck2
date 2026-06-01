@@ -16,6 +16,7 @@ use buck2_build_api::interpreter::rule_defs::artifact::starlark_artifact::Starla
 use buck2_core::package::PackageLabel;
 use buck2_core::package::package_relative_path::PackageRelativePath;
 use buck2_core::package::source_path::SourcePath;
+use buck2_error::internal_error;
 use buck2_interpreter::types::configured_providers_label::StarlarkConfiguredProvidersLabel;
 use buck2_interpreter::types::opaque_metadata::OpaqueMetadata;
 use buck2_interpreter::types::target_label::StarlarkTargetLabel;
@@ -72,7 +73,7 @@ pub trait ConfiguredAttrExt {
     fn to_value<'v>(
         &self,
         pkg: PackageLabelOption,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> buck2_error::Result<Value<'v>>;
 }
 
@@ -175,7 +176,7 @@ impl ConfiguredAttrExt for ConfiguredAttr {
     fn to_value<'v>(
         &self,
         pkg: PackageLabelOption,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> buck2_error::Result<Value<'v>> {
         configured_attr_to_value(self, pkg, heap)
     }
@@ -184,37 +185,42 @@ impl ConfiguredAttrExt for ConfiguredAttr {
 fn configured_attr_to_value<'v>(
     this: &ConfiguredAttr,
     pkg: PackageLabelOption,
-    heap: &'v Heap,
+    heap: Heap<'v>,
 ) -> buck2_error::Result<Value<'v>> {
     Ok(match this {
         ConfiguredAttr::Bool(v) => heap.alloc(v.0),
         ConfiguredAttr::Int(v) => heap.alloc(*v),
         ConfiguredAttr::String(s) | ConfiguredAttr::EnumVariant(s) => heap.alloc(s.as_str()),
         ConfiguredAttr::List(list) => {
-            heap.alloc(list.try_map(|v| configured_attr_to_value(&v, pkg, heap))?)
+            heap.alloc(list.try_map(|v| configured_attr_to_value(v, pkg, heap))?)
         }
         ConfiguredAttr::Tuple(v) => heap.alloc(AllocTuple(
-            v.try_map(|v| configured_attr_to_value(&v, pkg, heap))?,
+            v.try_map(|v| configured_attr_to_value(v, pkg, heap))?,
         )),
         ConfiguredAttr::Dict(map) => {
             let mut res = SmallMap::with_capacity(map.len());
 
             for (k, v) in map.iter() {
                 res.insert_hashed(
-                    configured_attr_to_value(&k, pkg, heap)?.get_hashed()?,
-                    configured_attr_to_value(&v, pkg, heap)?,
+                    configured_attr_to_value(k, pkg, heap)?.get_hashed()?,
+                    configured_attr_to_value(v, pkg, heap)?,
                 );
             }
 
             heap.alloc(Dict::new(res))
         }
         ConfiguredAttr::None => Value::new_none(),
-        ConfiguredAttr::OneOf(box l, _) => configured_attr_to_value(&l, pkg, heap)?,
+        ConfiguredAttr::OneOf(box l, _) => configured_attr_to_value(l, pkg, heap)?,
         ConfiguredAttr::Visibility(VisibilitySpecification(specs))
         | ConfiguredAttr::WithinView(WithinViewSpecification(specs)) => match specs {
             VisibilityPatternList::Public => heap.alloc(AllocList(["PUBLIC"])),
             VisibilityPatternList::List(specs) => {
                 heap.alloc(AllocList(specs.iter().map(|s| s.to_string())))
+            }
+            VisibilityPatternList::Intersection(_) => {
+                return Err(internal_error!(
+                    "Intersection visibility cannot be serialized as attribute"
+                ));
             }
         },
         ConfiguredAttr::ExplicitConfiguredDep(d) => heap.alloc(

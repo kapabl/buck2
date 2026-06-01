@@ -1,0 +1,66 @@
+[package]
+description = "Some tui games"
+edition = "2024"
+name = "games"
+version = "0.1.0"
+
+[dependencies]
+anyhow = { workspace = true }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+image = { workspace = true }
+itertools = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+superconsole = { version = "0.2.0", path = "../superconsole" }
+tokio = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+termios = { workspace = true }
+
+[[bin]]
+name = "breakout"
+path = "bin/breakout.rs"
+
+[[bin]]
+name = "blocks"
+path = "bin/blocks.rs"
+
+[[bin]]
+name = "jump"
+path = "bin/jump.rs"
+
+[[bin]]
+name = "minesweeper"
+path = "bin/minesweeper.rs"
+
+[[bin]]
+name = "life"
+path = "bin/life.rs"
+
+[[bin]]
+name = "menu"
+path = "bin/menu.rs"
+
+[[bin]]
+name = "snake"
+path = "bin/snake.rs"
+
+[[bin]]
+name = "sokoban"
+path = "bin/sokoban.rs"
+
+[[bin]]
+name = "sokoban_gen"
+path = "bin/sokoban_gen.rs"
+
+[[bin]]
+name = "static"
+path = "bin/static.rs"
+
+[[bin]]
+name = "twenty48"
+path = "bin/twenty48.rs"

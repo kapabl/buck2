@@ -21,11 +21,14 @@ use std::sync::Arc;
 use allocative::Allocative;
 use async_condvar_fair::Condvar;
 use async_trait::async_trait;
+use buck2_build_signals::env::EXCLUSIVE_COMMAND_WAIT;
+use buck2_build_signals::env::EarlyCommandTimingBuilder;
 use buck2_cli_proto::client_context::ExitWhen;
 use buck2_cli_proto::client_context::PreemptibleWhen;
 use buck2_common::legacy_configs::dice::HasInjectedLegacyConfigs;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::soft_error;
+use buck2_data::CommandPreempted;
 use buck2_data::DiceBlockConcurrentCommandEnd;
 use buck2_data::DiceBlockConcurrentCommandStart;
 use buck2_data::DiceEqualityCheck;
@@ -260,11 +263,8 @@ pub trait DiceUpdater: Send + Sync {
     async fn update(
         &self,
         mut ctx: DiceTransactionUpdater,
-    ) -> buck2_error::Result<(
-        DiceTransactionUpdater,
-        UserComputationData,
-        buck2_util::time_span::TimeSpan,
-    )>;
+        early_timings: &mut EarlyCommandTimingBuilder,
+    ) -> buck2_error::Result<(DiceTransactionUpdater, UserComputationData)>;
 }
 
 #[derive(Allocative)]
@@ -364,47 +364,47 @@ impl ConcurrencyHandler {
         previous_command_data: Arc<LockedPreviousCommandData>,
         project_root: &ProjectRoot,
         exit_when: ExitWhen,
+        mut early_command_timing: EarlyCommandTimingBuilder,
     ) -> buck2_error::Result<R>
     where
-        F: FnOnce(
-            DiceTransaction,
-            buck2_util::time_span::TimeSpan,
-            Vec<buck2_util::time_span::TimeSpan>,
-        ) -> Fut,
+        F: FnOnce(DiceTransaction, EarlyCommandTimingBuilder) -> Fut,
         Fut: Future<Output = R> + Send,
     {
-        let (_exclusive_command_guard, exclusive_wait_time_span) = event_dispatcher
+        let _exclusive_command_guard = event_dispatcher
             .span_async(
                 ExclusiveCommandWaitStart {
                     command_name: self.exclusive_command_lock.owning_command(),
                 },
-                async move {
-                    let (guard, time_span) = if let Some(cmd_name) = exclusive_cmd {
-                        let start = buck2_util::time_span::TimeSpan::start_now();
-                        let guard = self.exclusive_command_lock.exclusive_lock(cmd_name).await;
-                        self.dice.wait_for_idle().await;
-                        let time_span = start.end_now();
-                        (guard, time_span)
-                    } else {
-                        (
-                            self.exclusive_command_lock.shared_lock().await,
-                            buck2_util::time_span::TimeSpan::empty_now(),
-                        )
-                    };
-                    ((guard, time_span), ExclusiveCommandWaitEnd {})
+                {
+                    let early_command_timing = &mut early_command_timing;
+                    async move {
+                        let guard = if let Some(cmd_name) = exclusive_cmd {
+                            early_command_timing.start_span(EXCLUSIVE_COMMAND_WAIT.to_owned());
+                            let guard = self.exclusive_command_lock.exclusive_lock(cmd_name).await;
+                            self.dice.wait_for_idle().await;
+
+                            guard
+                        } else {
+                            self.exclusive_command_lock.shared_lock().await
+                        };
+                        (guard, ExclusiveCommandWaitEnd {})
+                    }
                 },
             )
             .await;
 
         let events = event_dispatcher.dupe();
-        let (_guard, transaction, file_watcher_sync_time_spans, preempt_receiver) =
-            event_dispatcher
-                .span_async(DiceSynchronizeSectionStart {}, async move {
+        let (_guard, transaction, preempt_receiver) = event_dispatcher
+            .span_async(DiceSynchronizeSectionStart {}, {
+                let early_command_timing = &mut early_command_timing;
+
+                async move {
                     (
                         cancellations
                             .critical_section(|| {
                                 self.wait_for_others(
                                     updates,
+                                    early_command_timing,
                                     events,
                                     is_nested_invocation,
                                     sanitized_argv,
@@ -417,20 +417,18 @@ impl ConcurrencyHandler {
                             .await,
                         DiceSynchronizeSectionEnd {},
                     )
-                })
-                .await?;
+                }
+            })
+            .await?;
 
-        let result = exec(
-            transaction,
-            exclusive_wait_time_span,
-            file_watcher_sync_time_spans,
-        );
+        let result = exec(transaction, early_command_timing);
         pin_mut!(result);
         pin_mut!(preempt_receiver);
 
         match future::select(result, preempt_receiver).await {
             Either::Left((result, _)) => Ok(result),
             Either::Right((_preemption, _)) => {
+                event_dispatcher.instant_event(CommandPreempted {});
                 Err(ConcurrencyHandlerError::ExitOnPreemption.into())
             }
         }
@@ -443,6 +441,7 @@ impl ConcurrencyHandler {
     async fn wait_for_others(
         self: &Arc<Self>,
         updates: &dyn DiceUpdater,
+        early_timings: &mut EarlyCommandTimingBuilder,
         event_dispatcher: EventDispatcher,
         is_nested_invocation: bool,
         sanitized_argv: Vec<String>,
@@ -453,7 +452,6 @@ impl ConcurrencyHandler {
     ) -> buck2_error::Result<(
         OnExecExit,
         DiceTransaction,
-        Vec<buck2_util::time_span::TimeSpan>,
         impl Future<Output = Result<(), RecvError>> + use<>,
     )> {
         // Have to put it on the function unfortunately, https://github.com/rust-lang/rust-clippy/issues/9047
@@ -481,7 +479,6 @@ impl ConcurrencyHandler {
             preempt: Some(preempt_sender),
         };
 
-        let mut file_watcher_sync_time_spans: Vec<buck2_util::time_span::TimeSpan> = Vec::new();
         let (mut transaction, tainted) = loop {
             match &data.dice_status {
                 DiceStatus::Cleanup { future, epoch } => {
@@ -510,11 +507,11 @@ impl ConcurrencyHandler {
                     // this might cause some churn, but concurrent commands don't happen much and
                     // isn't a big perf bottleneck. Dice should be able to resurrect nodes properly.
 
-                    let (transaction, file_watcher_sync_time_span) = async {
+                    let transaction = async {
                         let updater = self.dice.updater();
 
-                        let (transaction, user_data, file_watcher_sync_time_span) =
-                            updates.update(updater).await?;
+                        let (transaction, user_data) =
+                            updates.update(updater, early_timings).await?;
 
                         let transaction = event_dispatcher
                             .span_async(buck2_data::DiceStateUpdateStart {}, async {
@@ -529,12 +526,9 @@ impl ConcurrencyHandler {
                                 )
                             })
                             .await?;
-                        buck2_error::Ok((transaction, file_watcher_sync_time_span))
+                        buck2_error::Ok(transaction)
                     }
                     .await?;
-
-                    // Collect each file watcher sync time span
-                    file_watcher_sync_time_spans.push(file_watcher_sync_time_span);
 
                     if let Some(active) = active {
                         // If the --exit-when=notidle option is set for the current command and there is
@@ -684,12 +678,7 @@ impl ConcurrencyHandler {
         let drop_guard = OnExecExit::new(self.dupe(), command_id, command_data, data)?;
         // This adds the task to the list of all tasks (see ::new impl)
 
-        Ok((
-            drop_guard,
-            transaction,
-            file_watcher_sync_time_spans,
-            preempt_receiver,
-        ))
+        Ok((drop_guard, transaction, preempt_receiver))
     }
 
     /// Access dice without locking for dumps.
@@ -706,12 +695,9 @@ impl ConcurrencyHandler {
             if is_same_state && cmd.preemption_setting == PreemptibleWhen::OnDifferentState {
                 continue;
             }
-            match cmd.preempt.take() {
-                Some(preempt) => {
-                    let _ = preempt.send(());
-                }
-                None => {}
-            };
+            if let Some(preempt) = cmd.preempt.take() {
+                let _ = preempt.send(());
+            }
         }
     }
 
@@ -741,18 +727,16 @@ impl ConcurrencyHandler {
     ) -> buck2_error::Result<()> {
         let active_commands = format_traces(active_commands, current_command);
 
-        match state {
-            RunState::NestedSameState => {
-                soft_error!(
-                    "nested_invocation_same_dice_state",
-                    ConcurrencyHandlerError::NestedInvocationWithSameStates(
-                        active_commands,
-                        current_command.format_argv(),
-                    )
-                    .into()
-                )?;
-            }
-            _ => {}
+        if let RunState::NestedSameState = state {
+            soft_error!(
+                "nested_invocation_same_dice_state",
+                ConcurrencyHandlerError::NestedInvocationWithSameStates(
+                    active_commands,
+                    current_command.format_argv(),
+                )
+                .into(),
+                error_on_oss: true
+            )?;
         }
 
         Ok(())
@@ -824,10 +808,13 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::task::Poll;
     use std::time::Duration;
+    use std::time::Instant;
 
     use allocative::Allocative;
     use assert_matches::assert_matches;
     use async_trait::async_trait;
+    use buck2_build_signals::env::EXCLUSIVE_COMMAND_WAIT;
+    use buck2_build_signals::env::FILE_WATCHER_WAIT;
     use buck2_common::legacy_configs::dice::SetLegacyConfigs;
     use buck2_core::fs::project::ProjectRootTemp;
     use buck2_core::is_open_source;
@@ -842,10 +829,14 @@ mod tests {
     use dice::DiceComputations;
     use dice::InjectedKey;
     use dice::Key;
+    use dice::PagableValueSerialize;
+    use dice::ValueSerialize;
     use dice_futures::cancellation::CancellationContext;
     use dupe::Dupe;
     use futures::pin_mut;
     use futures::poll;
+    use pagable::Pagable;
+    use pagable::pagable_typetag;
     use parking_lot::Mutex;
     use tokio::sync::Barrier;
     use tokio::sync::RwLock;
@@ -865,16 +856,9 @@ mod tests {
         async fn update(
             &self,
             ctx: DiceTransactionUpdater,
-        ) -> buck2_error::Result<(
-            DiceTransactionUpdater,
-            UserComputationData,
-            buck2_util::time_span::TimeSpan,
-        )> {
-            Ok((
-                ctx,
-                Default::default(),
-                buck2_util::time_span::TimeSpan::empty_now(),
-            ))
+            _early_timings: &mut EarlyCommandTimingBuilder,
+        ) -> buck2_error::Result<(DiceTransactionUpdater, UserComputationData)> {
+            Ok((ctx, Default::default()))
         }
     }
 
@@ -885,21 +869,15 @@ mod tests {
         async fn update(
             &self,
             mut ctx: DiceTransactionUpdater,
-        ) -> buck2_error::Result<(
-            DiceTransactionUpdater,
-            UserComputationData,
-            buck2_util::time_span::TimeSpan,
-        )> {
+            _early_timings: &mut EarlyCommandTimingBuilder,
+        ) -> buck2_error::Result<(DiceTransactionUpdater, UserComputationData)> {
             ctx.changed_to(vec![(K, ())])?;
-            Ok((
-                ctx,
-                Default::default(),
-                buck2_util::time_span::TimeSpan::empty_now(),
-            ))
+            Ok((ctx, Default::default()))
         }
     }
 
-    #[derive(Clone, Dupe, Display, Debug, Hash, Eq, PartialEq, Allocative)]
+    #[derive(Clone, Dupe, Display, Debug, Hash, Eq, PartialEq, Allocative, Pagable)]
+    #[pagable_typetag(dice::DiceKeyDyn)]
     struct K;
 
     #[async_trait]
@@ -908,6 +886,10 @@ mod tests {
 
         fn equality(_x: &Self::Value, _y: &Self::Value) -> bool {
             false
+        }
+
+        fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+            PagableValueSerialize::<Self::Value>::new()
         }
     }
 
@@ -939,7 +921,7 @@ mod tests {
         let fut1 = concurrency.enter(
             null_sink_with_trace(traces1),
             &NoChanges,
-            |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| {
+            |_, _timing| {
                 let b = barrier.dupe();
                 async move {
                     b.wait().await;
@@ -953,11 +935,12 @@ mod tests {
             LockedPreviousCommandData::default().into(),
             project_root_temp.path(),
             ExitWhen::ExitNever,
+            EarlyCommandTimingBuilder::new(Instant::now()),
         );
         let fut2 = concurrency.enter(
             null_sink_with_trace(traces2),
             &NoChanges,
-            |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| {
+            |_, _timing| {
                 let b = barrier.dupe();
                 async move {
                     b.wait().await;
@@ -971,11 +954,12 @@ mod tests {
             LockedPreviousCommandData::default().into(),
             project_root_temp.path(),
             ExitWhen::ExitNever,
+            EarlyCommandTimingBuilder::new(Instant::now()),
         );
         let fut3 = concurrency.enter(
             null_sink_with_trace(traces3),
             &NoChanges,
-            |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| {
+            |_, _timing| {
                 let b = barrier.dupe();
                 async move {
                     b.wait().await;
@@ -989,6 +973,7 @@ mod tests {
             LockedPreviousCommandData::default().into(),
             project_root_temp.path(),
             ExitWhen::ExitNever,
+            EarlyCommandTimingBuilder::new(Instant::now()),
         );
 
         let (r1, r2, r3) = futures::future::join3(fut1, fut2, fut3).await;
@@ -1012,7 +997,7 @@ mod tests {
         let fut1 = concurrency.enter(
             null_sink_with_trace(traces1),
             &NoChanges,
-            |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| {
+            |_, _timing| {
                 let b = barrier.dupe();
                 async move {
                     b.wait().await;
@@ -1026,12 +1011,13 @@ mod tests {
             LockedPreviousCommandData::default().into(),
             project_root_temp.path(),
             ExitWhen::ExitNever,
+            EarlyCommandTimingBuilder::new(Instant::now()),
         );
 
         let fut2 = concurrency.enter(
             null_sink_with_trace(traces2),
             &CtxDifferent,
-            |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| {
+            |_, _timing| {
                 let b = barrier.dupe();
                 async move {
                     b.wait().await;
@@ -1045,6 +1031,7 @@ mod tests {
             LockedPreviousCommandData::default().into(),
             project_root_temp.path(),
             ExitWhen::ExitNever,
+            EarlyCommandTimingBuilder::new(Instant::now()),
         );
 
         match futures::future::try_join(fut1, fut2).await {
@@ -1072,7 +1059,7 @@ mod tests {
         let fut1 = concurrency.enter(
             null_sink_with_trace(traces1),
             &NoChanges,
-            |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| {
+            |_, _timing| {
                 let b = barrier.dupe();
                 async move {
                     b.wait().await;
@@ -1086,11 +1073,12 @@ mod tests {
             LockedPreviousCommandData::default().into(),
             project_root_temp.path(),
             ExitWhen::ExitNever,
+            EarlyCommandTimingBuilder::new(Instant::now()),
         );
         let fut2 = concurrency.enter(
             null_sink_with_trace(traces2),
             &NoChanges,
-            |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| {
+            |_, _timing| {
                 let b = barrier.dupe();
                 async move {
                     b.wait().await;
@@ -1104,11 +1092,12 @@ mod tests {
             LockedPreviousCommandData::default().into(),
             project_root_temp.path(),
             ExitWhen::ExitNever,
+            EarlyCommandTimingBuilder::new(Instant::now()),
         );
         let fut3 = concurrency.enter(
             null_sink_with_trace(traces3),
             &NoChanges,
-            |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| {
+            |_, _timing| {
                 let b = barrier.dupe();
                 async move {
                     b.wait().await;
@@ -1122,6 +1111,7 @@ mod tests {
             LockedPreviousCommandData::default().into(),
             project_root_temp.path(),
             ExitWhen::ExitNever,
+            EarlyCommandTimingBuilder::new(Instant::now()),
         );
 
         let (r1, r2, r3) = futures::future::join3(fut1, fut2, fut3).await;
@@ -1161,7 +1151,7 @@ mod tests {
                     .enter(
                         null_sink_with_trace(traces1),
                         &NoChanges,
-                        |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                        |_, _timing| async move {
                             barrier.wait().await;
                             let _g = b.read().await;
                         },
@@ -1173,6 +1163,7 @@ mod tests {
                         LockedPreviousCommandData::default().into(),
                         ProjectRootTemp::new().unwrap().path(),
                         ExitWhen::ExitNever,
+                        EarlyCommandTimingBuilder::new(Instant::now()),
                     )
                     .await
             }
@@ -1188,7 +1179,7 @@ mod tests {
                     .enter(
                         null_sink_with_trace(traces2),
                         &NoChanges,
-                        |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                        |_, _timing| async move {
                             barrier.wait().await;
                             let _g = b.read().await;
                         },
@@ -1200,6 +1191,7 @@ mod tests {
                         LockedPreviousCommandData::default().into(),
                         ProjectRootTemp::new().unwrap().path(),
                         ExitWhen::ExitNever,
+                        EarlyCommandTimingBuilder::new(Instant::now()),
                     )
                     .await
             }
@@ -1218,7 +1210,7 @@ mod tests {
                     .enter(
                         null_sink_with_trace(traces_different),
                         &CtxDifferent,
-                        |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                        |_, _timing| async move {
                             arrived.store(true, Ordering::Relaxed);
                         },
                         false,
@@ -1229,6 +1221,7 @@ mod tests {
                         LockedPreviousCommandData::default().into(),
                         ProjectRootTemp::new().unwrap().path(),
                         ExitWhen::ExitNever,
+                        EarlyCommandTimingBuilder::new(Instant::now()),
                     )
                     .await
             }
@@ -1255,9 +1248,6 @@ mod tests {
 
     #[tokio::test]
     async fn parallel_invocation_exit_when_different_state() -> buck2_error::Result<()> {
-        // NOTE: The --exit-when-different-state flag is deprecated in favor of the
-        // --exit-when=differentstate enum value. If a users passes the deprecated flag
-        // the client will catch it and set the enum value instead.
         let dice = make_default_dice().await;
 
         let concurrency = ConcurrencyHandler::new(dice.dupe());
@@ -1287,7 +1277,7 @@ mod tests {
                     .enter(
                         null_sink_with_trace(traces1),
                         &NoChanges,
-                        |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                        |_, _timing| async move {
                             barrier.wait().await;
                             let _g = b.read().await;
                         },
@@ -1299,6 +1289,7 @@ mod tests {
                         LockedPreviousCommandData::default().into(),
                         ProjectRootTemp::new().unwrap().path(),
                         ExitWhen::ExitDifferentState,
+                        EarlyCommandTimingBuilder::new(Instant::now()),
                     )
                     .await
             }
@@ -1314,7 +1305,7 @@ mod tests {
                     .enter(
                         null_sink_with_trace(traces2),
                         &NoChanges,
-                        |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                        |_, _timing| async move {
                             barrier.wait().await;
                             let _g = b.read().await;
                         },
@@ -1326,6 +1317,7 @@ mod tests {
                         LockedPreviousCommandData::default().into(),
                         ProjectRootTemp::new().unwrap().path(),
                         ExitWhen::ExitDifferentState,
+                        EarlyCommandTimingBuilder::new(Instant::now()),
                     )
                     .await
             }
@@ -1344,7 +1336,7 @@ mod tests {
                     .enter(
                         null_sink_with_trace(traces_different),
                         &CtxDifferent,
-                        |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                        |_, _timing| async move {
                             arrived.store(true, Ordering::Relaxed);
                         },
                         false,
@@ -1355,6 +1347,7 @@ mod tests {
                         LockedPreviousCommandData::default().into(),
                         ProjectRootTemp::new().unwrap().path(),
                         ExitWhen::ExitDifferentState,
+                        EarlyCommandTimingBuilder::new(Instant::now()),
                     )
                     .await
             }
@@ -1374,7 +1367,7 @@ mod tests {
 
         let fut3_result = fut3.await?;
 
-        let fut3_error: buck2_error::Error = fut3_result.unwrap_err().into();
+        let fut3_error: buck2_error::Error = fut3_result.unwrap_err();
         assert!(
             fut3_error
                 .tags()
@@ -1415,7 +1408,7 @@ mod tests {
                     .enter(
                         null_sink_with_trace(traces1),
                         &NoChanges,
-                        |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                        |_, _timing| async move {
                             barrier.wait().await;
                             let _g = b.read().await;
                         },
@@ -1427,6 +1420,7 @@ mod tests {
                         LockedPreviousCommandData::default().into(),
                         ProjectRootTemp::new().unwrap().path(),
                         ExitWhen::ExitNever,
+                        EarlyCommandTimingBuilder::new(Instant::now()),
                     )
                     .await
             }
@@ -1442,7 +1436,7 @@ mod tests {
                     .enter(
                         null_sink_with_trace(traces2),
                         &NoChanges,
-                        |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                        |_, _timing| async move {
                             barrier.wait().await;
                             let _g = b.read().await;
                         },
@@ -1454,6 +1448,7 @@ mod tests {
                         LockedPreviousCommandData::default().into(),
                         ProjectRootTemp::new().unwrap().path(),
                         ExitWhen::ExitNever,
+                        EarlyCommandTimingBuilder::new(Instant::now()),
                     )
                     .await
             }
@@ -1472,7 +1467,7 @@ mod tests {
                     .enter(
                         null_sink_with_trace(traces_different),
                         &CtxDifferent,
-                        |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                        |_, _timing| async move {
                             arrived.store(true, Ordering::Relaxed);
                         },
                         false,
@@ -1483,6 +1478,7 @@ mod tests {
                         LockedPreviousCommandData::default().into(),
                         ProjectRootTemp::new().unwrap().path(),
                         ExitWhen::ExitNever,
+                        EarlyCommandTimingBuilder::new(Instant::now()),
                     )
                     .await
             }
@@ -1494,7 +1490,7 @@ mod tests {
 
         drop(blocked1);
         let fut1_result = fut1.await?;
-        let fut1_error: buck2_error::Error = fut1_result.unwrap_err().into();
+        let fut1_error: buck2_error::Error = fut1_result.unwrap_err();
         assert!(
             fut1_error
                 .tags()
@@ -1510,11 +1506,13 @@ mod tests {
         Ok(())
     }
 
-    #[derive(Clone, Dupe, Derivative, Allocative, Display)]
+    #[derive(Clone, Dupe, Derivative, Allocative, Display, Pagable)]
     #[derivative(Hash, Eq, PartialEq, Debug)]
     #[display("CleanupTestKey")]
+    #[pagable_typetag(dice::DiceKeyDyn)]
     struct CleanupTestKey {
         #[derivative(Debug = "ignore", Hash = "ignore", PartialEq = "ignore")]
+        #[pagable(discard = "Arc::new(Mutex::new(()))")]
         is_executing: Arc<Mutex<()>>,
     }
 
@@ -1522,6 +1520,7 @@ mod tests {
     impl Key for CleanupTestKey {
         type Value = ();
 
+        #[allow(clippy::await_holding_lock)] // Intentional: testing exclusive access
         async fn compute(
             &self,
             _ctx: &mut DiceComputations,
@@ -1529,15 +1528,17 @@ mod tests {
         ) -> Self::Value {
             let _guard = self.is_executing.lock();
 
-            // TODO: use critical_section as it's simpler, but this stack doesn't have it and
-            // this works equally well here :)
             cancellation
-                .with_structured_cancellation(|_obs| tokio::time::sleep(Duration::from_secs(1)))
+                .critical_section(|| tokio::time::sleep(Duration::from_secs(1)))
                 .await;
         }
 
         fn equality(_me: &Self::Value, _other: &Self::Value) -> bool {
             true
+        }
+
+        fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+            PagableValueSerialize::<Self::Value>::new()
         }
     }
 
@@ -1559,7 +1560,7 @@ mod tests {
             .enter(
                 EventDispatcher::null(),
                 &NoChanges,
-                |mut dice, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                |mut dice, _timing| async move {
                     let compute = dice.compute(key).fuse();
 
                     let started = async {
@@ -1588,6 +1589,7 @@ mod tests {
                 LockedPreviousCommandData::default().into(),
                 ProjectRootTemp::new().unwrap().path(),
                 ExitWhen::ExitNever,
+                EarlyCommandTimingBuilder::new(Instant::now()),
             )
             .await?;
 
@@ -1597,7 +1599,7 @@ mod tests {
             .enter(
                 EventDispatcher::null(),
                 &NoChanges,
-                |_dice, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                |_dice, _timing| async move {
                     // The key should still be evaluating by now.
                     assert!(key.is_executing.is_locked());
                 },
@@ -1609,6 +1611,7 @@ mod tests {
                 LockedPreviousCommandData::default().into(),
                 ProjectRootTemp::new().unwrap().path(),
                 ExitWhen::ExitNever,
+                EarlyCommandTimingBuilder::new(Instant::now()),
             )
             .await?;
 
@@ -1618,7 +1621,7 @@ mod tests {
             .enter(
                 EventDispatcher::null(),
                 &CtxDifferent,
-                |_dice, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                |_dice, _timing| async move {
                     assert!(!key.is_executing.is_locked());
                 },
                 false,
@@ -1629,6 +1632,7 @@ mod tests {
                 LockedPreviousCommandData::default().into(),
                 ProjectRootTemp::new().unwrap().path(),
                 ExitWhen::ExitNever,
+                EarlyCommandTimingBuilder::new(Instant::now()),
             )
             .await?;
 
@@ -1642,8 +1646,8 @@ mod tests {
     where
         F: Fn(&BuckEvent) -> bool + Send,
     {
-        // 2 millis was too short on windows, fails concurrency::tests::exclusive_command_lock
-        tokio::time::timeout(Duration::from_millis(4), async {
+        // Short timeouts are too flaky in OD environments under load.
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if let Some(event) = source.try_receive() {
                     if let Some(event) = event.unpack_buck() {
@@ -1705,6 +1709,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // Intentional: testing exclusive access
     async fn exclusive_command_lock() -> buck2_error::Result<()> {
         let dice = make_default_dice().await;
         let concurrency = ConcurrencyHandler::new(dice.dupe());
@@ -1724,7 +1729,7 @@ mod tests {
                         .enter(
                             dispatcher,
                             &NoChanges,
-                            |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                            |_, _timing| async move {
                                 let _guard = mutex.try_lock().expect("Not exclusive!");
                                 if let Some(barriers) = barriers {
                                     barriers.0.wait().await;
@@ -1740,6 +1745,7 @@ mod tests {
                             LockedPreviousCommandData::default().into(),
                             ProjectRootTemp::new().unwrap().path(),
                             ExitWhen::ExitNever,
+                            EarlyCommandTimingBuilder::new(Instant::now()),
                         )
                         .await
                 }
@@ -1804,7 +1810,7 @@ mod tests {
                 .enter(
                     EventDispatcher::null(),
                     &CtxDifferent,
-                    |mut dice, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                    |mut dice, _timing| async move {
                         // NOTE: We need to actually compute something for DICE to be not-idle.
                         dice.compute(&K).await.unwrap();
                         tokio::task::yield_now().await;
@@ -1817,6 +1823,7 @@ mod tests {
                     LockedPreviousCommandData::default().into(),
                     ProjectRootTemp::new().unwrap().path(),
                     ExitWhen::ExitNever,
+                    EarlyCommandTimingBuilder::new(Instant::now()),
                 )
                 .await
         });
@@ -1851,18 +1858,11 @@ mod tests {
             async fn update(
                 &self,
                 ctx: DiceTransactionUpdater,
-            ) -> buck2_error::Result<(
-                DiceTransactionUpdater,
-                UserComputationData,
-                buck2_util::time_span::TimeSpan,
-            )> {
+                _early_timings: &mut EarlyCommandTimingBuilder,
+            ) -> buck2_error::Result<(DiceTransactionUpdater, UserComputationData)> {
                 self.on_enter.store(true, Ordering::Relaxed);
                 wait_on(&self.allow_exit).await;
-                Ok((
-                    ctx,
-                    Default::default(),
-                    buck2_util::time_span::TimeSpan::empty_now(),
-                ))
+                Ok((ctx, Default::default()))
             }
         }
 
@@ -1874,7 +1874,7 @@ mod tests {
         let fut1 = concurrency.enter(
             EventDispatcher::null(),
             &updater1,
-            |_dice, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+            |_dice, _timing| async move {
                 tokio::task::yield_now().await;
             },
             false,
@@ -1885,6 +1885,7 @@ mod tests {
             LockedPreviousCommandData::default().into(),
             project_root_temp.path(),
             ExitWhen::ExitNever,
+            EarlyCommandTimingBuilder::new(Instant::now()),
         );
         pin_mut!(fut1);
 
@@ -1897,7 +1898,7 @@ mod tests {
         let fut2 = concurrency.enter(
             EventDispatcher::null(),
             &updater2,
-            |_dice, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+            |_dice, _timing| async move {
                 tokio::task::yield_now().await;
             },
             false,
@@ -1908,6 +1909,7 @@ mod tests {
             LockedPreviousCommandData::default().into(),
             project_root_temp.path(),
             ExitWhen::ExitNever,
+            EarlyCommandTimingBuilder::new(Instant::now()),
         );
         pin_mut!(fut2);
 
@@ -1961,7 +1963,7 @@ mod tests {
                     .enter(
                         null_sink_with_trace(traces1),
                         &NoChanges,
-                        |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                        |_, _timing| async move {
                             barrier.wait().await;
                             let _g = b.read().await;
                         },
@@ -1973,6 +1975,7 @@ mod tests {
                         LockedPreviousCommandData::default().into(),
                         ProjectRootTemp::new().unwrap().path(),
                         ExitWhen::ExitNever,
+                        EarlyCommandTimingBuilder::new(Instant::now()),
                     )
                     .await
             }
@@ -1986,7 +1989,7 @@ mod tests {
                 .enter(
                     null_sink_with_trace(traces2),
                     &NoChanges,
-                    |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                    |_, _timing| async move {
                         // Should never reach here
                         panic!("Command should have failed before execution");
                     },
@@ -1998,13 +2001,14 @@ mod tests {
                     LockedPreviousCommandData::default().into(),
                     ProjectRootTemp::new().unwrap().path(),
                     ExitWhen::ExitNotIdle,
+                    EarlyCommandTimingBuilder::new(Instant::now()),
                 )
                 .await
         }));
 
         // Second command should fail immediately
         let fut2_result = fut2.await?;
-        let fut2_error: buck2_error::Error = fut2_result.unwrap_err().into();
+        let fut2_error: buck2_error::Error = fut2_result.unwrap_err();
         assert!(
             fut2_error
                 .tags()
@@ -2043,7 +2047,7 @@ mod tests {
                     .enter(
                         null_sink_with_trace(traces1),
                         &NoChanges,
-                        |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                        |_, _timing| async move {
                             barrier.wait().await;
                             let _g = b.read().await;
                         },
@@ -2055,6 +2059,7 @@ mod tests {
                         LockedPreviousCommandData::default().into(),
                         ProjectRootTemp::new().unwrap().path(),
                         ExitWhen::ExitNever,
+                        EarlyCommandTimingBuilder::new(Instant::now()),
                     )
                     .await
             }
@@ -2068,7 +2073,7 @@ mod tests {
                 .enter(
                     null_sink_with_trace(traces2),
                     &CtxDifferent, // Different state
-                    |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                    |_, _timing| async move {
                         // Should never reach here
                         panic!("Command should have failed before execution");
                     },
@@ -2080,13 +2085,14 @@ mod tests {
                     LockedPreviousCommandData::default().into(),
                     ProjectRootTemp::new().unwrap().path(),
                     ExitWhen::ExitNotIdle,
+                    EarlyCommandTimingBuilder::new(Instant::now()),
                 )
                 .await
         }));
 
         // Second command should fail immediately
         let fut2_result = fut2.await?;
-        let fut2_error: buck2_error::Error = fut2_result.unwrap_err().into();
+        let fut2_error: buck2_error::Error = fut2_result.unwrap_err();
         assert!(
             fut2_error
                 .tags()
@@ -2129,7 +2135,7 @@ mod tests {
                     .enter(
                         null_sink_with_trace(traces1),
                         &NoChanges,
-                        |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                        |_, _timing| async move {
                             barrier.wait().await;
                             let _g = b.read().await;
                         },
@@ -2141,6 +2147,7 @@ mod tests {
                         LockedPreviousCommandData::default().into(),
                         ProjectRootTemp::new().unwrap().path(),
                         ExitWhen::ExitNotIdle,
+                        EarlyCommandTimingBuilder::new(Instant::now()),
                     )
                     .await
             }
@@ -2154,7 +2161,7 @@ mod tests {
                 .enter(
                     null_sink_with_trace(traces2),
                     &NoChanges,
-                    |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                    |_, _timing| async move {
                         panic!("Should not execute");
                     },
                     false,
@@ -2165,6 +2172,7 @@ mod tests {
                     LockedPreviousCommandData::default().into(),
                     ProjectRootTemp::new().unwrap().path(),
                     ExitWhen::ExitNotIdle,
+                    EarlyCommandTimingBuilder::new(Instant::now()),
                 )
                 .await
         }));
@@ -2174,7 +2182,7 @@ mod tests {
                 .enter(
                     null_sink_with_trace(traces3),
                     &NoChanges,
-                    |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                    |_, _timing| async move {
                         panic!("Should not execute");
                     },
                     false,
@@ -2185,13 +2193,14 @@ mod tests {
                     LockedPreviousCommandData::default().into(),
                     ProjectRootTemp::new().unwrap().path(),
                     ExitWhen::ExitNotIdle,
+                    EarlyCommandTimingBuilder::new(Instant::now()),
                 )
                 .await
         }));
 
         // Both second and third commands should fail
         let fut2_result = fut2.await?;
-        let fut2_error: buck2_error::Error = fut2_result.unwrap_err().into();
+        let fut2_error: buck2_error::Error = fut2_result.unwrap_err();
         assert!(
             fut2_error
                 .tags()
@@ -2199,7 +2208,7 @@ mod tests {
         );
 
         let fut3_result = fut3.await?;
-        let fut3_error: buck2_error::Error = fut3_result.unwrap_err().into();
+        let fut3_error: buck2_error::Error = fut3_result.unwrap_err();
         assert!(
             fut3_error
                 .tags()
@@ -2237,7 +2246,7 @@ mod tests {
                     .enter(
                         null_sink_with_trace(traces1),
                         &NoChanges,
-                        |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                        |_, _timing| async move {
                             barrier.wait().await;
                             let _g = b.read().await;
                         },
@@ -2249,6 +2258,7 @@ mod tests {
                         LockedPreviousCommandData::default().into(),
                         ProjectRootTemp::new().unwrap().path(),
                         ExitWhen::ExitNever,
+                        EarlyCommandTimingBuilder::new(Instant::now()),
                     )
                     .await
             }
@@ -2264,7 +2274,7 @@ mod tests {
                 .enter(
                     null_sink_with_trace(traces2),
                     &NoChanges,
-                    |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                    |_, _timing| async move {
                         // Should never reach here
                         panic!("Command should have failed before execution");
                     },
@@ -2276,13 +2286,14 @@ mod tests {
                     LockedPreviousCommandData::default().into(),
                     ProjectRootTemp::new().unwrap().path(),
                     ExitWhen::ExitNotIdle,
+                    EarlyCommandTimingBuilder::new(Instant::now()),
                 )
                 .await
         }));
 
         // Second command should fail immediately, even though first is preemptible
         let fut2_result = fut2.await?;
-        let fut2_error: buck2_error::Error = fut2_result.unwrap_err().into();
+        let fut2_error: buck2_error::Error = fut2_result.unwrap_err();
         assert!(
             fut2_error
                 .tags()
@@ -2330,7 +2341,7 @@ mod tests {
                     .enter(
                         null_sink_with_trace(traces1),
                         &NoChanges,
-                        |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                        |_, _timing| async move {
                             barrier.wait().await;
                             // This should never complete because we'll be preempted
                             let _g = b.read().await;
@@ -2343,12 +2354,13 @@ mod tests {
                         LockedPreviousCommandData::default().into(),
                         ProjectRootTemp::new().unwrap().path(),
                         ExitWhen::ExitNotIdle,
+                        EarlyCommandTimingBuilder::new(Instant::now()),
                     )
                     .await;
 
                 // Check if we got preempted
                 if let Err(ref e) = result {
-                    let error: buck2_error::Error = e.clone().into();
+                    let error: buck2_error::Error = e.clone();
                     if error
                         .tags()
                         .contains(&buck2_error::ErrorTag::DaemonPreempted)
@@ -2369,7 +2381,7 @@ mod tests {
                 .enter(
                     null_sink_with_trace(traces2),
                     &NoChanges,
-                    |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                    |_, _timing| async move {
                         // Just a quick task
                         tokio::task::yield_now().await;
                     },
@@ -2381,6 +2393,7 @@ mod tests {
                     LockedPreviousCommandData::default().into(),
                     ProjectRootTemp::new().unwrap().path(),
                     ExitWhen::ExitNever,
+                    EarlyCommandTimingBuilder::new(Instant::now()),
                 )
                 .await
         }));
@@ -2427,7 +2440,7 @@ mod tests {
                     .enter(
                         null_sink_with_trace(traces1),
                         &NoChanges,
-                        |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                        |_, _timing| async move {
                             barrier.wait().await;
                             let _g = b.read().await;
                         },
@@ -2439,6 +2452,7 @@ mod tests {
                         LockedPreviousCommandData::default().into(),
                         ProjectRootTemp::new().unwrap().path(),
                         ExitWhen::ExitNotIdle,
+                        EarlyCommandTimingBuilder::new(Instant::now()),
                     )
                     .await
             }
@@ -2452,7 +2466,7 @@ mod tests {
                 .enter(
                     null_sink_with_trace(traces2),
                     &CtxDifferent,
-                    |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                    |_, _timing| async move {
                         // Just a quick task
                         tokio::task::yield_now().await;
                     },
@@ -2464,13 +2478,14 @@ mod tests {
                     LockedPreviousCommandData::default().into(),
                     ProjectRootTemp::new().unwrap().path(),
                     ExitWhen::ExitNotIdle,
+                    EarlyCommandTimingBuilder::new(Instant::now()),
                 )
                 .await
         }));
 
         // Both second and third commands should fail
         let fut2_result = fut2.await?;
-        let fut2_error: buck2_error::Error = fut2_result.unwrap_err().into();
+        let fut2_error: buck2_error::Error = fut2_result.unwrap_err();
         assert!(
             fut2_error
                 .tags()
@@ -2501,7 +2516,7 @@ mod tests {
             .enter(
                 null_sink_with_trace(traces1),
                 &NoChanges,
-                |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                |_, _timing| async move {
                     // Quick task that finishes
                     tokio::task::yield_now().await;
                 },
@@ -2513,6 +2528,7 @@ mod tests {
                 LockedPreviousCommandData::default().into(),
                 ProjectRootTemp::new().unwrap().path(),
                 ExitWhen::ExitNever,
+                EarlyCommandTimingBuilder::new(Instant::now()),
             )
             .await?;
 
@@ -2525,7 +2541,7 @@ mod tests {
             .enter(
                 null_sink_with_trace(traces2),
                 &NoChanges, // Same state as first command
-                |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                |_, _timing| async move {
                     // Quick task
                     tokio::task::yield_now().await;
                     "success"
@@ -2538,6 +2554,7 @@ mod tests {
                 LockedPreviousCommandData::default().into(),
                 ProjectRootTemp::new().unwrap().path(),
                 ExitWhen::ExitNotIdle,
+                EarlyCommandTimingBuilder::new(Instant::now()),
             )
             .await;
 
@@ -2565,7 +2582,7 @@ mod tests {
             .enter(
                 null_sink_with_trace(traces1),
                 &NoChanges,
-                |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                |_, _timing| async move {
                     // Quick task that finishes
                     tokio::task::yield_now().await;
                 },
@@ -2577,6 +2594,7 @@ mod tests {
                 LockedPreviousCommandData::default().into(),
                 ProjectRootTemp::new().unwrap().path(),
                 ExitWhen::ExitNever,
+                EarlyCommandTimingBuilder::new(Instant::now()),
             )
             .await?;
 
@@ -2589,7 +2607,7 @@ mod tests {
             .enter(
                 null_sink_with_trace(traces2),
                 &CtxDifferent, // Different state than first command
-                |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                |_, _timing| async move {
                     // Quick task
                     tokio::task::yield_now().await;
                     "success"
@@ -2602,6 +2620,7 @@ mod tests {
                 LockedPreviousCommandData::default().into(),
                 ProjectRootTemp::new().unwrap().path(),
                 ExitWhen::ExitNotIdle,
+                EarlyCommandTimingBuilder::new(Instant::now()),
             )
             .await;
 
@@ -2610,6 +2629,31 @@ mod tests {
         assert_eq!(result.unwrap(), "success");
 
         Ok(())
+    }
+
+    fn get_early_command_timing_duration(
+        timing: EarlyCommandTimingBuilder,
+        key: &str,
+    ) -> Option<Duration> {
+        let timing = timing.finish_early_command_timing();
+        let mut end = timing.early_command_end;
+        let mut duration = None;
+        for s in timing.early_spans.iter().rev() {
+            if s.1 == key {
+                let d = end - s.0;
+                if let Some(s) = &mut duration {
+                    *s += d;
+                } else {
+                    duration = Some(d)
+                }
+            }
+            end = s.0;
+        }
+        duration
+    }
+
+    fn get_exclusive_command_wait_duration(timing: EarlyCommandTimingBuilder) -> Option<Duration> {
+        get_early_command_timing_duration(timing, EXCLUSIVE_COMMAND_WAIT)
     }
 
     #[tokio::test]
@@ -2639,7 +2683,7 @@ mod tests {
                     .enter(
                         null_sink_with_trace(traces1),
                         &NoChanges,
-                        |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                        |_, _timing| async move {
                             barrier.wait().await;
                             let _g = b.read().await;
                         },
@@ -2651,6 +2695,7 @@ mod tests {
                         LockedPreviousCommandData::default().into(),
                         ProjectRootTemp::new().unwrap().path(),
                         ExitWhen::ExitNever,
+                        EarlyCommandTimingBuilder::new(Instant::now()),
                     )
                     .await
             }
@@ -2668,11 +2713,10 @@ mod tests {
                     .enter(
                         null_sink_with_trace(traces2),
                         &NoChanges,
-                        |_, exclusive_wait_elapsed, _file_watcher_sync_duration| {
-                            let duration_captured = duration_captured.dupe();
+                        |_, timing| {
+                            *duration_captured.lock() =
+                                get_exclusive_command_wait_duration(timing).unwrap();
                             async move {
-                                // Capture the elapsed duration
-                                *duration_captured.lock() = exclusive_wait_elapsed.duration();
                                 tokio::task::yield_now().await;
                             }
                         },
@@ -2684,6 +2728,7 @@ mod tests {
                         LockedPreviousCommandData::default().into(),
                         ProjectRootTemp::new().unwrap().path(),
                         ExitWhen::ExitNever,
+                        EarlyCommandTimingBuilder::new(Instant::now()),
                     )
                     .await
             }
@@ -2724,11 +2769,10 @@ mod tests {
             .enter(
                 null_sink_with_trace(traces),
                 &NoChanges,
-                |_, exclusive_wait_elapsed, _file_watcher_sync_duration| {
-                    let duration_captured = duration_captured.dupe();
+                |_, timing| {
+                    *duration_captured.lock() =
+                        get_exclusive_command_wait_duration(timing).unwrap_or(Duration::ZERO);
                     async move {
-                        // Capture the elapsed duration
-                        *duration_captured.lock() = exclusive_wait_elapsed.duration();
                         tokio::task::yield_now().await;
                     }
                 },
@@ -2740,6 +2784,7 @@ mod tests {
                 LockedPreviousCommandData::default().into(),
                 ProjectRootTemp::new().unwrap().path(),
                 ExitWhen::ExitNever,
+                EarlyCommandTimingBuilder::new(Instant::now()),
             )
             .await?;
 
@@ -2767,15 +2812,13 @@ mod tests {
             async fn update(
                 &self,
                 ctx: DiceTransactionUpdater,
-            ) -> buck2_error::Result<(
-                DiceTransactionUpdater,
-                UserComputationData,
-                buck2_util::time_span::TimeSpan,
-            )> {
+                early_timings: &mut EarlyCommandTimingBuilder,
+            ) -> buck2_error::Result<(DiceTransactionUpdater, UserComputationData)> {
                 // Simulate file watcher sync taking 50ms
-                let start = buck2_util::time_span::TimeSpan::start_now();
+                early_timings.start_span(FILE_WATCHER_WAIT.to_owned());
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                Ok((ctx, Default::default(), start.end_now()))
+                early_timings.end_known_span();
+                Ok((ctx, Default::default()))
             }
         }
 
@@ -2787,14 +2830,12 @@ mod tests {
             .enter(
                 null_sink_with_trace(traces),
                 &UpdaterWithDelay,
-                |_, _exclusive_wait_elapsed, file_watcher_sync_durations| {
+                |_, timing| {
                     let duration_captured = file_watcher_duration_captured.dupe();
                     async move {
                         // Capture the file watcher sync duration (sum of all syncs)
-                        let total_duration: std::time::Duration = file_watcher_sync_durations
-                            .iter()
-                            .map(|ts| ts.duration())
-                            .sum();
+                        let total_duration: std::time::Duration =
+                            get_early_command_timing_duration(timing, FILE_WATCHER_WAIT).unwrap();
                         *duration_captured.lock() = total_duration;
                         tokio::task::yield_now().await;
                     }
@@ -2807,6 +2848,7 @@ mod tests {
                 LockedPreviousCommandData::default().into(),
                 ProjectRootTemp::new().unwrap().path(),
                 ExitWhen::ExitNever,
+                EarlyCommandTimingBuilder::new(Instant::now()),
             )
             .await?;
 
@@ -2840,7 +2882,7 @@ mod tests {
             .enter(
                 null_sink_with_trace(traces_init),
                 &NoChanges,
-                |_, _exclusive_wait_elapsed, _file_watcher_sync_duration| async move {
+                |_, _timing| async move {
                     // Just establish the initial state
                     tokio::task::yield_now().await;
                 },
@@ -2852,6 +2894,7 @@ mod tests {
                 LockedPreviousCommandData::default().into(),
                 ProjectRootTemp::new().unwrap().path(),
                 ExitWhen::ExitNever,
+                EarlyCommandTimingBuilder::new(Instant::now()),
             )
             .await?;
 
@@ -2865,20 +2908,18 @@ mod tests {
             async fn update(
                 &self,
                 mut ctx: DiceTransactionUpdater,
-            ) -> buck2_error::Result<(
-                DiceTransactionUpdater,
-                UserComputationData,
-                buck2_util::time_span::TimeSpan,
-            )> {
+                early_timings: &mut EarlyCommandTimingBuilder,
+            ) -> buck2_error::Result<(DiceTransactionUpdater, UserComputationData)> {
                 // First call changes state, second call doesn't
                 let is_first = !self.call_count.swap(true, Ordering::Relaxed);
                 if is_first {
                     ctx.changed_to(vec![(K, ())])?;
                 }
                 // Each call simulates 30ms of file watcher sync
-                let start = buck2_util::time_span::TimeSpan::start_now();
+                early_timings.start_span(FILE_WATCHER_WAIT.to_owned());
                 tokio::time::sleep(Duration::from_millis(30)).await;
-                Ok((ctx, Default::default(), start.end_now()))
+                early_timings.end_known_span();
+                Ok((ctx, Default::default()))
             }
         }
 
@@ -2894,15 +2935,10 @@ mod tests {
             .enter(
                 null_sink_with_trace(traces),
                 &updater,
-                |_, _exclusive_wait_elapsed, file_watcher_sync_durations| {
-                    let duration_captured = file_watcher_duration_captured.dupe();
+                |_, timing| {
+                    *file_watcher_duration_captured.lock() =
+                        get_early_command_timing_duration(timing, FILE_WATCHER_WAIT).unwrap();
                     async move {
-                        // Capture the accumulated file watcher sync duration (sum of all syncs)
-                        let total_duration: std::time::Duration = file_watcher_sync_durations
-                            .iter()
-                            .map(|ts| ts.duration())
-                            .sum();
-                        *duration_captured.lock() = total_duration;
                         tokio::task::yield_now().await;
                     }
                 },
@@ -2914,6 +2950,7 @@ mod tests {
                 LockedPreviousCommandData::default().into(),
                 ProjectRootTemp::new().unwrap().path(),
                 ExitWhen::ExitNever,
+                EarlyCommandTimingBuilder::new(Instant::now()),
             )
             .await?;
 

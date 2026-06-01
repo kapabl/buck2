@@ -23,6 +23,7 @@ use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
 use serde::Deserialize;
 use tracing::Level;
+use tracing::debug;
 use tracing::enabled;
 use tracing::info;
 use tracing::instrument;
@@ -98,7 +99,7 @@ pub(crate) fn to_project_json(
 
     let mut crates: Vec<Crate> = Vec::with_capacity(targets_vec.len());
     for target in &targets_vec {
-        let info = target_index.get(&target).unwrap();
+        let info = target_index.get(target).unwrap();
 
         let dep_targets = resolve_aliases(&info.deps, &aliases, &proc_macros);
         let deps = as_deps(&dep_targets, info, &targets_to_ids, &target_index);
@@ -171,6 +172,22 @@ pub(crate) fn to_project_json(
             include_dirs.push(parent.to_owned());
         }
 
+        // If an include directory ends with __srcs, use its parent directory.
+        // Buck generates __srcs directories that mirror the source layout,
+        // and rust-analyzer should resolve to the real source directory.
+        include_dirs = include_dirs
+            .into_iter()
+            .map(|p| {
+                if p.file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with("__srcs"))
+                {
+                    p.parent().unwrap_or(&p).to_owned()
+                } else {
+                    p
+                }
+            })
+            .collect();
+
         include_dirs = remove_duplicates_preserve_order(include_dirs);
 
         let build = if include_all_buildfiles || info.in_workspace {
@@ -189,7 +206,7 @@ pub(crate) fn to_project_json(
             root_module,
             edition,
             deps,
-            is_workspace_member: info.in_workspace,
+            is_workspace_member: info.is_workspace_member(),
             source: Some(Source {
                 include_dirs,
                 exclude_dirs: vec![],
@@ -438,13 +455,21 @@ fn merge_unit_test_targets(
 pub(crate) struct Buck {
     command: String,
     mode: Option<String>,
+    project_root: Option<PathBuf>,
 }
 
 impl Buck {
-    pub(crate) fn new(command: Option<String>, mode: Option<String>) -> Self {
+    pub(crate) fn new(
+        command: Option<String>,
+        mode: Option<String>,
+        project_root: Option<PathBuf>,
+    ) -> Self {
+        tracing::info!(?project_root, "Project root was set");
+
         Buck {
             command: command.unwrap_or_else(|| "buck2".into()),
             mode,
+            project_root,
         }
     }
 
@@ -459,8 +484,25 @@ impl Buck {
     {
         let mut cmd = self.command_without_config(subcommands);
         cmd.args([
-            "-c=client.id=rust-project",
             "-c=rust.rust_project_build=true",
+            // Buck owner() queries stop at the innermost BUCK file unless
+            // package_boundary_exceptions is set.
+            //
+            // This is arguably a bug in buck, because it's possible for a parent BUCK
+            // file to own a file in a subdirectory that has its own BUCK file.
+            //
+            // Buck probably didn't intend to allow this pattern: it doesn't work when you
+            // use `srcs = glob()`, but it does work for srcs with explicit paths.
+            //
+            // The intent of package_boundary_exceptions (added to buck2 in D34073360,
+            // rolled out in D4339610) was to enforce boundaries with an explicit opt-out
+            // list.
+            //
+            // However, due to the confusion with srcs, we can end up with owner() not
+            // finding the target even when the package is not opted-out. Instead, opt-out
+            // all packages for this query, so owner() always looks at parent BUCK files
+            // and finds the relevant target.
+            "-c=project.package_boundary_exceptions=.",
         ]);
 
         cmd
@@ -485,8 +527,13 @@ impl Buck {
             .env_remove("RUST_LIB_BACKTRACE");
 
         cmd.args(["--isolation-dir", ".rust-analyzer"]);
+        cmd.arg(CLIENT_METADATA_RUST_PROJECT);
         cmd.args(subcommands);
         cmd.args(["--oncall", "rust_devx"]);
+
+        if let Some(root) = &self.project_root {
+            cmd.current_dir(root);
+        }
 
         cmd
     }
@@ -590,7 +637,19 @@ impl Buck {
             "--targets",
         ]);
         command.args(targets);
-        deserialize_file_output(command.output(), &command)
+
+        let mut res: ExpandedAndResolved = deserialize_file_output(command.output(), &command)?;
+
+        res.expanded_targets = res
+            .expanded_targets
+            .into_iter()
+            .collect::<FxHashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        res.expanded_targets.sort();
+
+        Ok(res)
     }
 
     /// Given a list of `targets`, find all the aliases in their transitive dependencies, and
@@ -606,13 +665,17 @@ impl Buck {
         // Recursively expand aliases until we find a target that isn't an alias, or
         // we've queried buck 5 times.
         for _ in 0..5 {
-            let alias_destinations = alias_map
+            let mut alias_destinations = alias_map
                 .values()
                 .map(|info| info.actual.clone())
+                .collect::<FxHashSet<_>>()
+                .into_iter()
                 .collect::<Vec<_>>();
 
+            alias_destinations.sort();
+
             let new_aliases =
-                match self.query_aliased_targets(&alias_destinations, &universe_targets) {
+                match self.query_aliased_targets(&alias_destinations, universe_targets) {
                     Ok(new_aliases) => new_aliases,
                     Err(_) => {
                         warn!("buck cquery failed, falling back to best-effort uquery");
@@ -632,6 +695,42 @@ impl Buck {
         }
 
         Ok(alias_map)
+    }
+
+    /// Work out which items in `sysroot_package` (e.g. `fbsource//xplat/rust/toolchain/sysroot/1.93.0:`) are
+    /// visible to `universe_targets` (e.g. `fbcode//your/wonderful:project`).
+    pub(crate) fn query_sysroot_targets(
+        &self,
+        sysroot_package: &str,
+        universe_targets: &[Target],
+    ) -> Vec<Target> {
+        let mut command = self.command(["cquery"]);
+        if let Some(mode) = &self.mode {
+            command.arg(mode);
+        }
+
+        command.args(["--json", sysroot_package]);
+
+        let universe_arg = universe_targets
+            .iter()
+            .map(|t| format!("{t}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        command.args(["--target-universe", &universe_arg]);
+
+        let mut sysroot_targets =
+            match deserialize_output::<Vec<Target>>(command.output(), &command) {
+                Ok(targets) => targets,
+                Err(e) => {
+                    tracing::warn!("Failed to query sysroot targets: {e:?}");
+                    vec![Target::new(sysroot_package)]
+                }
+            };
+
+        sysroot_targets.sort();
+        sysroot_targets.dedup();
+
+        sysroot_targets
     }
 
     /// Given a list of targets, for all targets that are aliases, return the targets
@@ -764,7 +863,12 @@ impl Buck {
         let out: FxHashMap<PathBuf, Vec<Target>> = deserialize_output(command.output(), &command)?;
 
         for (k, v) in out.iter() {
-            info!("Found {} with {} targets", k.display(), v.len());
+            debug!(
+                "Found {} with {} target{}",
+                k.display(),
+                v.len(),
+                if v.len() == 1 { "" } else { "s" }
+            );
         }
 
         Ok(out)
@@ -814,6 +918,14 @@ where
             stderr,
             status,
         }) => {
+            let stderr_str = String::from_utf8_lossy(&stderr);
+
+            for line in stderr_str.lines() {
+                if let Some(pos) = line.find("Buck UI") {
+                    tracing::info!("{}", &line[pos..]);
+                }
+            }
+
             // If we have a non-zero exit code due to a compiler crash (a rustc
             // ICE), then we should exit with a non-zero exit code. If the
             // compiler is crashing, we may not be showing all diagnostics, so
@@ -823,14 +935,13 @@ where
             // a build to fail on warnings, such that we get well-formed JSON of
             // the rustc diagnostics but the exit code is non-zero (D46666035).
             if !status.success() {
-                let stderr_str = String::from_utf8_lossy(&stderr);
                 if stderr_str.contains("error: the compiler unexpectedly panicked") {
                     return Err(anyhow::anyhow!("{}", stderr_str));
                 }
             }
 
             tracing::debug!(?command, "parsing command output");
-            serde_json::from_slice(&stdout)
+            deserialize_json_bytes(&stdout)
                 .with_context(|| cmd_err(command, status, &stderr))
                 .context("failed to deserialize command output")
         }
@@ -854,6 +965,13 @@ where
             status,
         }) => {
             tracing::debug!(?command, "parsing file output");
+
+            for line in String::from_utf8_lossy(&stderr).lines() {
+                if let Some(pos) = line.find("Buck UI") {
+                    tracing::info!("{}", &line[pos..]);
+                }
+            }
+
             serde_json_from_stdout_path(&stdout)
                 .with_context(|| cmd_err(command, status, &stderr))
                 .context("failed to deserialize command output")
@@ -872,7 +990,7 @@ where
     let file_path = Path::new(file_path.lines().next().context("no file path in output")?);
     let contents =
         fs::read_to_string(file_path).with_context(|| format!("failed to read {file_path:?}"))?;
-    serde_json::from_str(&contents).context("failed to deserialize file")
+    deserialize_json_str(&contents).context("failed to deserialize file")
 }
 
 fn cmd_err(command: &Command, status: ExitStatus, stderr: &[u8]) -> anyhow::Error {
@@ -882,6 +1000,38 @@ fn cmd_err(command: &Command, status: ExitStatus, stderr: &[u8]) -> anyhow::Erro
         status,
         String::from_utf8_lossy(stderr),
     )
+}
+
+/// Deserialize bytes with serde_path_to_error so error messages report
+/// the offending fields.
+fn deserialize_json_bytes<T>(bytes: &[u8]) -> Result<T, anyhow::Error>
+where
+    T: for<'a> Deserialize<'a>,
+{
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    serde_path_to_error::deserialize(&mut deserializer).map_err(|err| {
+        anyhow::anyhow!(
+            "JSON parse error in object '{}': {}",
+            err.path(),
+            err.inner()
+        )
+    })
+}
+
+/// Deserialize string with serde_path_to_error so error messages report
+/// the offending fields.
+fn deserialize_json_str<T>(s: &str) -> Result<T, anyhow::Error>
+where
+    T: for<'a> Deserialize<'a>,
+{
+    let mut deserializer = serde_json::Deserializer::from_str(s);
+    serde_path_to_error::deserialize(&mut deserializer).map_err(|err| {
+        anyhow::anyhow!(
+            "JSON parse error in object '{}': {}",
+            err.path(),
+            err.inner()
+        )
+    })
 }
 
 /// Trim a trailing new line from `String`.
@@ -988,6 +1138,7 @@ fn merge_tests_no_cycles() {
         TargetInfo {
             name: "foo".to_owned(),
             label: "foo".to_owned(),
+            labels: vec![],
             kind: Kind::Library,
             edition: None,
             srcs: vec![],
@@ -1013,6 +1164,7 @@ fn merge_tests_no_cycles() {
         TargetInfo {
             name: "foo-unittest".to_owned(),
             label: "foo-unittest".to_owned(),
+            labels: vec![],
             kind: Kind::Test,
             edition: None,
             srcs: vec![],
@@ -1047,6 +1199,7 @@ fn merge_target_multiple_tests_no_cycles() {
         TargetInfo {
             name: "foo".to_owned(),
             label: "foo".to_owned(),
+            labels: vec![],
             kind: Kind::Library,
             edition: None,
             srcs: vec![],
@@ -1075,6 +1228,7 @@ fn merge_target_multiple_tests_no_cycles() {
         TargetInfo {
             name: "foo@rust".to_owned(),
             label: "foo@rust".to_owned(),
+            labels: vec![],
             kind: Kind::Library,
             edition: None,
             srcs: vec![],
@@ -1103,6 +1257,7 @@ fn merge_target_multiple_tests_no_cycles() {
         TargetInfo {
             name: "foo_test".to_owned(),
             label: "foo_test".to_owned(),
+            labels: vec![],
             kind: Kind::Test,
             edition: None,
             srcs: vec![],
@@ -1131,6 +1286,7 @@ fn merge_target_multiple_tests_no_cycles() {
         TargetInfo {
             name: "foo@rust-unittest".to_owned(),
             label: "foo@rust-unittest".to_owned(),
+            labels: vec![],
             kind: Kind::Test,
             edition: None,
             srcs: vec![],
@@ -1176,6 +1332,7 @@ fn integration_tests_preserved() {
         TargetInfo {
             name: "foo".to_owned(),
             label: "foo".to_owned(),
+            labels: vec![],
             kind: Kind::Library,
             edition: None,
             srcs: vec![],
@@ -1201,6 +1358,7 @@ fn integration_tests_preserved() {
         TargetInfo {
             name: "foo-integration-test".to_owned(),
             label: "foo-integration-test".to_owned(),
+            labels: vec![],
             kind: Kind::Test,
             edition: None,
             srcs: vec![],
@@ -1233,6 +1391,7 @@ fn named_deps_underscores() {
         TargetInfo {
             name: "bar".to_owned(),
             label: "bar".to_owned(),
+            labels: vec![],
             kind: Kind::Library,
             edition: None,
             srcs: vec![],
@@ -1259,6 +1418,7 @@ fn named_deps_underscores() {
     let info = TargetInfo {
         name: "foo".to_owned(),
         label: "foo".to_owned(),
+        labels: vec![],
         kind: Kind::Library,
         edition: None,
         srcs: vec![],

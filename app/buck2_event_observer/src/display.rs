@@ -27,6 +27,7 @@ use buck2_data::TargetLabel;
 use buck2_data::action_key;
 use buck2_data::span_start_event::Data;
 use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_events::BuckEvent;
 use buck2_test_api::data::TestStatus;
 use buck2_util::commas::commas;
@@ -136,7 +137,7 @@ pub fn display_analysis_target(
             match dynamic
                 .owner
                 .as_ref()
-                .buck_error_context("Missing `owner`")?
+                .ok_or_else(|| internal_error!("Missing `owner`"))?
             {
                 Owner::TargetLabel(target_label) => {
                     display_configured_target_label(target_label, opts)
@@ -238,18 +239,19 @@ pub fn display_event(event: &BuckEvent, opts: TargetDisplayOptions) -> buck2_err
                 let build = &materialization
                     .artifact
                     .as_ref()
-                    .ok_or(ParseEventError::MissingArtifact)?;
+                    .ok_or_else(|| buck2_error::Error::from(ParseEventError::MissingArtifact))?;
 
                 let key = display_action_key(
-                    build
-                        .key
-                        .as_ref()
-                        .ok_or(ParseEventError::MissingActionKey)?,
+                    build.key.as_ref().ok_or_else(|| {
+                        buck2_error::Error::from(ParseEventError::MissingActionKey)
+                    })?,
                     opts,
                 )?;
                 let path = {
                     if build.path.is_empty() {
-                        Err(ParseEventError::MissingMaterializationPath)
+                        Err(buck2_error::Error::from(
+                            ParseEventError::MissingMaterializationPath,
+                        ))
                     } else {
                         Ok(&build.path)
                     }
@@ -267,7 +269,7 @@ pub fn display_event(event: &BuckEvent, opts: TargetDisplayOptions) -> buck2_err
                 let stage = info
                     .stage
                     .as_ref()
-                    .buck_error_context("analysis stage is missing")?;
+                    .ok_or_else(|| internal_error!("analysis stage is missing"))?;
                 let stage = display_analysis_stage(stage);
                 Ok(stage.into())
             }
@@ -284,16 +286,16 @@ pub fn display_event(event: &BuckEvent, opts: TargetDisplayOptions) -> buck2_err
                 let stage = info
                     .stage
                     .as_ref()
-                    .buck_error_context("executor stage is missing")?;
-                let stage =
-                    display_executor_stage(stage).buck_error_context("unknown executor stage")?;
+                    .ok_or_else(|| internal_error!("executor stage is missing"))?;
+                let stage = display_executor_stage(stage)
+                    .ok_or_else(|| internal_error!("unknown executor stage"))?;
                 Ok(stage.into())
             }
             Data::TestDiscovery(discovery) => Ok(format!(
                 "Test {} -- discovering tests",
                 discovery.suite_name
             )),
-            Data::TestStart(start) => match &start.suite {
+            Data::TestRun(start) => match &start.suite {
                 Some(suite) => {
                     let tests = {
                         if suite.test_names.len() < 100 {
@@ -360,7 +362,11 @@ pub fn display_event(event: &BuckEvent, opts: TargetDisplayOptions) -> buck2_err
             }
             Data::DeferredPreparationStage(prep) => {
                 use buck2_data::deferred_preparation_stage_start::Stage;
-                match prep.stage.as_ref().buck_error_context("Missing `stage`")? {
+                match prep
+                    .stage
+                    .as_ref()
+                    .ok_or_else(|| internal_error!("Missing `stage`"))?
+                {
                     Stage::MaterializedArtifacts(_) => Ok("local_materialize_inputs".to_owned()),
                 }
             }
@@ -370,7 +376,7 @@ pub fn display_event(event: &BuckEvent, opts: TargetDisplayOptions) -> buck2_err
                 let label = match lambda
                     .owner
                     .as_ref()
-                    .buck_error_context("Missing `owner`")?
+                    .ok_or_else(|| internal_error!("Missing `owner`"))?
                 {
                     Owner::TargetLabel(target_label) => {
                         display_configured_target_label(target_label, opts)
@@ -390,7 +396,10 @@ pub fn display_event(event: &BuckEvent, opts: TargetDisplayOptions) -> buck2_err
                 Ok(format!("Connecting to installer on port {tcp_port}"))
             }
             Data::Fake(fake) => Ok(format!("{} -- speak of the devil", fake.caramba)),
-            Data::LocalResources(..) => Ok("Local resources setup".to_owned()),
+            Data::LocalResources(res) => {
+                let target = display_configured_target_label_opt(res.target_label.as_ref(), opts)?;
+                Ok(format!("{target} -- Local resources setup"))
+            }
             Data::ReleaseLocalResources(..) => Ok("Releasing local resources".to_owned()),
             Data::BxlEnsureArtifacts(..) => Err(ParseEventError::UnexpectedEvent.into()),
             Data::ActionErrorHandlerExecution(..) => {
@@ -441,6 +450,8 @@ pub fn display_file_watcher_end(file_watcher_end: &buck2_data::FileWatcherEnd) -
         // duplicates on the same file, then our "additional file change events" count is slightly high.
         // Shouldn't be a big deal in practice, since it is rare, and fairly big numbers already.
 
+        let is_fresh_instance = stats.fresh_instance;
+
         let mut to_print = OrderedSet::new();
         for x in &stats.events {
             to_print.insert((&x.path, x.kind()));
@@ -450,7 +461,11 @@ pub fn display_file_watcher_end(file_watcher_end: &buck2_data::FileWatcherEnd) -
                 FileWatcherKind::Directory => "Directory",
                 FileWatcherKind::File | FileWatcherKind::Symlink => "File",
             };
-            res.push(format!("{kind} changed: {path}"));
+            if is_fresh_instance {
+                res.push(format!("{kind} changed (since mergebase): {path}"));
+            } else {
+                res.push(format!("{kind} changed: {path}"));
+            }
         }
         let unprinted_paths =
             // those we have the names of but didn't print
@@ -458,7 +473,13 @@ pub fn display_file_watcher_end(file_watcher_end: &buck2_data::FileWatcherEnd) -
                 // plus those we didn't get the names for
                 (stats.events_processed as usize).saturating_sub(stats.events.len());
         if unprinted_paths > 0 {
-            res.push(format!("{unprinted_paths} additional file change events"));
+            if is_fresh_instance {
+                res.push(format!(
+                    "{unprinted_paths} additional file change events (since mergebase)"
+                ));
+            } else {
+                res.push(format!("{unprinted_paths} additional file change events"));
+            }
         }
 
         if let Some(fresh_instance) = &stats.fresh_instance_data {
@@ -574,6 +595,7 @@ pub struct InvalidBuckEvent(pub Arc<BuckEvent>);
 
 pub fn format_test_result(
     test_result: &buck2_data::TestResult,
+    verbosity: Verbosity,
 ) -> buck2_error::Result<Option<Lines>> {
     let buck2_data::TestResult {
         name,
@@ -585,9 +607,12 @@ pub fn format_test_result(
     let status = TestStatus::try_from(*status)?;
 
     // Pass results normally have no details, unless the --print-passing-details is set.
-    // Do not display anything for passing tests unless details are present to avoid
-    // cluttering the UI with unimportant test results.
-    if matches!(&status, TestStatus::PASS | TestStatus::LISTING_SUCCESS) && details.is_empty() {
+    // Do not display anything for passing tests unless verbosity is high or details are present
+    // to avoid cluttering the UI with unimportant test results.
+    if matches!(&status, TestStatus::PASS | TestStatus::LISTING_SUCCESS)
+        && details.is_empty()
+        && !verbosity.print_all_commands()
+    {
         return Ok(None);
     }
 
@@ -639,12 +664,27 @@ fn strip_trailing_newline(stream_contents: &str) -> &str {
     }
 }
 
+/// Controls whether stdout/stderr stream contents are included in action error
+/// formatting.
+#[derive(Copy, Clone, Debug)]
+pub enum ActionErrorOutputFormat {
+    /// Include stdout/stderr stream contents in the output.
+    IncludeOutputStreams,
+    /// Exclude stdout/stderr stream contents (metadata only).
+    ExcludeOutputStreams,
+    /// Exclude stdout/stderr and append a substitute message (e.g. output limit exceeded).
+    SubstituteOutputStreams(&'static str),
+}
+
 impl ActionErrorDisplay<'_> {
     /// Format the error message in a way that is suitable for use with the build report
     ///
     /// The output may include terminal colors that need to be sanitized.
     pub fn simple_format_for_build_report(&self) -> String {
-        let s = self.simple_format_inner(None::<&'static mut dyn for<'x> FnMut(&'x str) -> String>);
+        let s = self.simple_format_inner(
+            None::<&'static mut dyn for<'x> FnMut(&'x str) -> String>,
+            ActionErrorOutputFormat::IncludeOutputStreams,
+        );
         sanitize_output_colors(s.as_bytes())
     }
 
@@ -654,13 +694,15 @@ impl ActionErrorDisplay<'_> {
     pub fn simple_format_with_timestamps(
         &self,
         with_timestamps: impl FnMut(&str) -> String,
+        output_format: ActionErrorOutputFormat,
     ) -> String {
-        self.simple_format_inner(Some(with_timestamps))
+        self.simple_format_inner(Some(with_timestamps), output_format)
     }
 
     fn simple_format_inner(
         &self,
         mut with_timestamps: Option<impl FnMut(&str) -> String>,
+        output_format: ActionErrorOutputFormat,
     ) -> String {
         let mut s = String::new();
         macro_rules! append {
@@ -716,6 +758,15 @@ impl ActionErrorDisplay<'_> {
             };
         }
 
+        match output_format {
+            ActionErrorOutputFormat::IncludeOutputStreams => {}
+            ActionErrorOutputFormat::ExcludeOutputStreams => return s,
+            ActionErrorOutputFormat::SubstituteOutputStreams(msg) => {
+                append!("{msg}");
+                return s;
+            }
+        }
+
         let mut append_stream = |name, contents: &str| {
             if contents.is_empty() {
                 append!("{name}: <empty>");
@@ -764,6 +815,14 @@ impl ActionErrorDisplay<'_> {
         }
         s
     }
+
+    /// Returns an estimate of the stdout/stderr byte count in this error.
+    pub fn output_stream_byte_count(&self) -> usize {
+        let Some(command) = &self.command else {
+            return 0;
+        };
+        command.cmd_stdout.len() + command.cmd_stderr.len()
+    }
 }
 
 pub fn get_action_error_reason(error: &buck2_data::ActionError) -> buck2_error::Result<String> {
@@ -773,7 +832,7 @@ pub fn get_action_error_reason(error: &buck2_data::ActionError) -> buck2_error::
         match error
             .error
             .as_ref()
-            .buck_error_context("Internal error: Missing error in action error")?
+            .ok_or_else(|| internal_error!("Internal error: Missing error in action error"))?
         {
             Error::MissingOutputs(missing_outputs) => {
                 format!("Required outputs are missing: {}", missing_outputs.message)
@@ -819,12 +878,12 @@ fn failure_reason_for_command_execution(
     let command = command_execution
         .details
         .as_ref()
-        .buck_error_context("CommandExecution did not include a `command`")?;
+        .ok_or_else(|| internal_error!("CommandExecution did not include a `command`"))?;
 
     let status = command_execution
         .status
         .as_ref()
-        .buck_error_context("CommandExecution did not include a `status`")?;
+        .ok_or_else(|| internal_error!("CommandExecution did not include a `status`"))?;
 
     let locality = if let Some(command_kind) = command.command_kind.as_ref() {
         use buck2_data::command_execution_kind::Command;
@@ -873,7 +932,7 @@ fn failure_reason_for_command_execution(
         Status::Timeout(Timeout { duration }) => {
             let duration = duration
                 .as_ref()
-                .buck_error_context("Timeout did not include a `duration`")?
+                .ok_or_else(|| internal_error!("Timeout did not include a `duration`"))?
                 .try_into_duration()
                 .buck_error_context("Timeout `duration` was invalid")?;
 
@@ -899,7 +958,7 @@ pub fn success_stderr(
             &command
                 .details
                 .as_ref()
-                .buck_error_context("CommandExecution did not include a `command`")?
+                .ok_or_else(|| internal_error!("CommandExecution did not include a `command`"))?
                 .cmd_stderr
         }
         None => return Ok(None),
@@ -926,6 +985,159 @@ pub fn sanitize_output_colors(stderr: &[u8]) -> String {
         _ => {}
     });
     sanitized
+}
+
+/// Display information extracted from a CriticalPathEntry2.
+pub struct CriticalPathEntryDisplay<'a> {
+    /// The kind of critical path entry (e.g., "action", "analysis", "materialization").
+    pub kind: &'a str,
+    /// The name/label of the entry (e.g., target label, package name).
+    pub name: String,
+    /// Optional category (e.g., for actions).
+    pub category: Option<&'a str>,
+    /// Optional identifier (e.g., action identifier, file path for materializations).
+    pub identifier: Option<&'a str>,
+    /// Optional execution kind for actions (e.g., "local", "remote").
+    pub execution_kind: Option<&'static str>,
+}
+
+impl<'a> CriticalPathEntryDisplay<'a> {
+    /// Extracts display information from a CriticalPathEntry2.
+    pub fn from_entry(
+        entry: &'a buck2_data::CriticalPathEntry2,
+        opts: TargetDisplayOptions,
+    ) -> buck2_error::Result<Option<Self>> {
+        use buck2_data::critical_path_entry2::Entry;
+
+        let entry_data = match &entry.entry {
+            Some(entry) => entry,
+            None => return Ok(None),
+        };
+
+        let (kind, name, category, identifier, execution_kind) = match entry_data {
+            Entry::Analysis(analysis) => {
+                use buck2_data::critical_path_entry2::analysis::Target;
+
+                let name = match &analysis.target {
+                    Some(Target::StandardTarget(t)) => display_configured_target_label(t, opts)?,
+                    None => "unknown".to_owned(),
+                };
+                let kind = match analysis.part {
+                    Some(1) => "analysis[part1]",
+                    Some(2) => "analysis[part2]",
+                    _ => "analysis",
+                };
+                (kind, name, None, None, None)
+            }
+            Entry::AnonAnalysis(anon_analysis) => {
+                let name = match &anon_analysis.anon_target {
+                    Some(t) => display_anon_target(t)?,
+                    None => "unknown".to_owned(),
+                };
+                let kind = match anon_analysis.part {
+                    Some(1) => "anon_analysis[part1]",
+                    Some(2) => "anon_analysis[part2]",
+                    _ => "anon_analysis",
+                };
+                (kind, name, None, None, None)
+            }
+            Entry::DynamicAnalysis(analysis) => {
+                use buck2_data::critical_path_entry2::dynamic_analysis::Target;
+
+                let name = match &analysis.target {
+                    Some(Target::StandardTarget(t)) => display_configured_target_label(t, opts)?,
+                    None => "anon-unknown".to_owned(),
+                };
+                ("dynamic_analysis", name, None, None, None)
+            }
+            Entry::ActionExecution(action_execution) => {
+                use buck2_data::critical_path_entry2::action_execution::Owner;
+
+                let category = action_execution.name.as_ref().map(|n| n.category.as_str());
+                let identifier = action_execution
+                    .name
+                    .as_ref()
+                    .map(|n| n.identifier.as_str());
+
+                let execution_kind = Some(
+                    buck2_data::ActionExecutionKind::try_from(action_execution.execution_kind)
+                        .unwrap_or(buck2_data::ActionExecutionKind::NotSet)
+                        .as_str_name(),
+                );
+
+                let name = match &action_execution.owner {
+                    Some(Owner::TargetLabel(t)) => display_configured_target_label(t, opts)?,
+                    Some(Owner::BxlKey(t)) => display_bxl_key(t)?,
+                    Some(Owner::AnonTarget(t)) => display_anon_target(t)?,
+                    None => "unknown".to_owned(),
+                };
+                ("action", name, category, identifier, execution_kind)
+            }
+            Entry::FinalMaterialization(materialization) => {
+                use buck2_data::critical_path_entry2::final_materialization::Owner;
+
+                let identifier = Some(materialization.path.as_str());
+
+                let name = match &materialization.owner {
+                    Some(Owner::TargetLabel(t)) => display_configured_target_label(t, opts)?,
+                    Some(Owner::BxlKey(t)) => display_bxl_key(t)?,
+                    Some(Owner::AnonTarget(t)) => display_anon_target(t)?,
+                    None => "unknown".to_owned(),
+                };
+                ("materialization", name, None, identifier, None)
+            }
+            Entry::ComputeCriticalPath(..) => {
+                ("compute-critical-path", String::new(), None, None, None)
+            }
+            Entry::Load(load) => ("load", load.package.clone(), None, None, None),
+            Entry::Listing(listing) => ("listing", listing.package.clone(), None, None, None),
+            Entry::GenericEntry(generic_entry) => {
+                (generic_entry.kind.as_str(), String::new(), None, None, None)
+            }
+            Entry::Waiting(entry) => {
+                let name = entry.category.clone().unwrap_or_default();
+                ("waiting", name, None, None, None)
+            }
+            Entry::TestExecution(test_execution) => {
+                let name = match &test_execution.target_label {
+                    Some(t) => display_configured_target_label(t, opts)?,
+                    None => "unknown".to_owned(),
+                };
+                ("test-execution", name, None, None, None)
+            }
+            Entry::TestListing(test_listing) => {
+                let name = match &test_listing.target_label {
+                    Some(t) => display_configured_target_label(t, opts)?,
+                    None => "unknown".to_owned(),
+                };
+                ("test-listing", name, None, None, None)
+            }
+            Entry::EnsureTransitiveSetProjection(..) => (
+                "ensure-transitive-set-projection",
+                String::new(),
+                None,
+                None,
+                None,
+            ),
+        };
+
+        Ok(Some(CriticalPathEntryDisplay {
+            kind,
+            name,
+            category,
+            identifier,
+            execution_kind,
+        }))
+    }
+
+    /// Returns a formatted display name combining kind and name.
+    pub fn display_name(&self) -> String {
+        if self.name.is_empty() {
+            self.kind.to_owned()
+        } else {
+            format!("{}: {}", self.kind, self.name)
+        }
+    }
 }
 
 #[cfg(test)]

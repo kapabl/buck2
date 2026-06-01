@@ -14,6 +14,7 @@ use buck2_artifact::actions::key::ActionKey;
 use buck2_artifact::artifact::build_artifact::BuildArtifact;
 use buck2_build_signals::env::DeferredBuildSignals;
 use buck2_build_signals::env::NodeDuration;
+use buck2_build_signals::env::WaitingData;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
 use buck2_events::span::SpanId;
 use buck2_util::late_binding::LateBinding;
@@ -21,6 +22,7 @@ use dice::ActivationTracker;
 use dice::UserComputationData;
 use dupe::Dupe;
 
+use crate::artifact_groups::ArtifactGroup;
 use crate::artifact_groups::ResolvedArtifactGroupBuildSignalsKey;
 
 pub static CREATE_BUILD_SIGNALS: LateBinding<
@@ -46,11 +48,18 @@ pub trait BuildSignals: Send + Sync + 'static {
         artifacts: Vec<ResolvedArtifactGroupBuildSignalsKey>,
     );
 
+    /// Record a final materialization event for the critical path.
+    ///
+    /// `from_group` is the top-level `ArtifactGroup` that triggered this materialization.
+    /// When the group is a transitive set projection, the critical path dependency is
+    /// recorded against the tset ensure step rather than the individual build action.
     fn final_materialization(
         &self,
         artifact: BuildArtifact,
+        from_group: ArtifactGroup,
         duration: NodeDuration,
         span_id: Option<SpanId>,
+        waiting_data: WaitingData,
     );
 
     fn test_listing(

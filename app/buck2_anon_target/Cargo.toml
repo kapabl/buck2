@@ -11,7 +11,7 @@ async-trait = { workspace = true }
 derive_more = { workspace = true }
 either = { workspace = true }
 futures = { workspace = true }
-fxhash = { workspace = true }
+rustc-hash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
@@ -20,6 +20,7 @@ cmp_any = { workspace = true }
 dice = { workspace = true }
 dupe = { workspace = true }
 gazebo = { workspace = true }
+pagable = { workspace = true }
 starlark = { workspace = true }
 starlark_map = { workspace = true }
 strong_hash = { workspace = true }
@@ -27,6 +28,7 @@ strong_hash = { workspace = true }
 buck2_analysis = { workspace = true }
 buck2_artifact = { workspace = true }
 buck2_build_api = { workspace = true }
+buck2_build_signals = { workspace = true }
 buck2_configured = { workspace = true }
 buck2_core = { workspace = true }
 buck2_data = { workspace = true }
@@ -34,6 +36,7 @@ buck2_error = { workspace = true }
 buck2_events = { workspace = true }
 buck2_execute = { workspace = true }
 buck2_fs = { workspace = true }
+buck2_hash = { workspace = true }
 buck2_interpreter = { workspace = true }
 buck2_interpreter_for_build = { workspace = true }
 buck2_node = { workspace = true }

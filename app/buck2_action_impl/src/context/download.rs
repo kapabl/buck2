@@ -19,9 +19,9 @@ use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
 use buck2_error::BuckErrorContext;
 use buck2_execute::execute::request::OutputType;
 use buck2_execute::materialize::http::Checksum;
+use buck2_hash::buck_indexset;
 use chrono::TimeZone;
 use chrono::Utc;
-use indexmap::indexset;
 use starlark::environment::MethodsBuilder;
 use starlark::eval::Evaluator;
 use starlark::starlark_module;
@@ -36,8 +36,6 @@ use crate::actions::impls::download_file::UnregisteredDownloadFileAction;
 #[derive(buck2_error::Error, Debug)]
 #[buck2(tag = Tier0)]
 enum CasArtifactError {
-    #[error("Not a valid RE digest: `{0}`")]
-    InvalidDigest(String),
     #[error("is_tree and is_directory are mutually exclusive")]
     TreeAndDirectory,
 }
@@ -58,8 +56,6 @@ pub(crate) fn analysis_actions_methods_download(methods: &mut MethodsBuilder) {
         #[starlark(require = named, default = NoneOr::None)] sha256: NoneOr<&str>,
         #[starlark(require = named, default = NoneOr::None)] size_bytes: NoneOr<u64>,
         #[starlark(require = named, default = false)] is_executable: bool,
-        #[starlark(require = named, default = NoneOr::None)]
-        uses_experimental_content_based_path_hashing: NoneOr<bool>,
         #[starlark(require = named, default = NoneOr::None)] has_content_based_path: NoneOr<bool>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<ValueTyped<'v, StarlarkDeclaredArtifact<'v>>> {
@@ -68,15 +64,13 @@ pub(crate) fn analysis_actions_methods_download(methods: &mut MethodsBuilder) {
             eval,
             output,
             OutputType::File,
-            uses_experimental_content_based_path_hashing
-                .into_option()
-                .or(has_content_based_path.into_option()),
+            has_content_based_path.into_option(),
         )?;
 
         let checksum = Checksum::new(sha1.into_option(), sha256.into_option())?;
 
         this.register_action(
-            indexset![output_artifact],
+            buck_indexset![output_artifact],
             UnregisteredDownloadFileAction::new(
                 checksum,
                 size_bytes.into_option(),
@@ -113,15 +107,15 @@ pub(crate) fn analysis_actions_methods_download(methods: &mut MethodsBuilder) {
         #[starlark(require = named, default = false)] is_executable: bool,
         #[starlark(require = named, default = false)] is_tree: bool,
         #[starlark(require = named, default = false)] is_directory: bool,
-        #[starlark(require = named, default = NoneOr::None)]
-        uses_experimental_content_based_path_hashing: NoneOr<bool>,
-        #[starlark(require = named, default = NoneOr::None)] has_content_based_path: NoneOr<bool>,
+        #[starlark(require = named, default = NoneOr::Other(true))] has_content_based_path: NoneOr<
+            bool,
+        >,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<ValueTyped<'v, StarlarkDeclaredArtifact<'v>>> {
         let mut registry = this.state()?;
 
         let digest = CasDigest::parse_digest(digest, this.digest_config.cas_digest_config())
-            .with_buck_error_context(|| CasArtifactError::InvalidDigest(digest.to_owned()))?
+            .with_buck_error_context(|| format!("Not a valid RE digest: `{}`", digest))?
             .0;
 
         let use_case = RemoteExecutorUseCase::new(use_case.to_owned());
@@ -145,13 +139,11 @@ pub(crate) fn analysis_actions_methods_download(methods: &mut MethodsBuilder) {
             eval,
             output,
             output_type,
-            uses_experimental_content_based_path_hashing
-                .into_option()
-                .or(has_content_based_path.into_option()),
+            has_content_based_path.into_option(),
         )?;
 
         registry.register_action(
-            indexset![output_artifact],
+            buck_indexset![output_artifact],
             UnregisteredCasArtifactAction {
                 digest,
                 re_use_case: use_case,

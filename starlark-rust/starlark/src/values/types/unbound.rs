@@ -21,10 +21,10 @@ use std::fmt;
 use std::fmt::Debug;
 use std::fmt::Formatter;
 
+use crate as starlark;
 use crate::eval::Arguments;
 use crate::eval::Evaluator;
 use crate::eval::runtime::frame_span::FrameSpan;
-use crate::values::FrozenRef;
 use crate::values::FrozenValue;
 use crate::values::FrozenValueTyped;
 use crate::values::Heap;
@@ -35,7 +35,7 @@ use crate::values::function::NativeAttribute;
 use crate::values::function::NativeMethod;
 
 /// A value or an unbound method or unbound attribute.
-#[derive(Clone)]
+#[derive(Clone, crate::StarlarkPagable)]
 pub(crate) enum UnboundValue {
     /// A method with `this` unbound.
     Method(FrozenValueTyped<'static, NativeMethod>),
@@ -60,7 +60,7 @@ impl UnboundValue {
 
     /// Bind this object to given `this` value.
     #[inline]
-    pub(crate) fn bind<'v>(&self, this: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub(crate) fn bind<'v>(&self, this: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         match self {
             UnboundValue::Method(m) => {
                 Ok(heap.alloc_complex(BoundMethodGen::new(this.to_value(), *m)))
@@ -73,7 +73,7 @@ impl UnboundValue {
     pub(crate) fn invoke_method<'v>(
         &self,
         this: Value<'v>,
-        span: FrozenRef<'static, FrameSpan>,
+        span: &'static FrameSpan,
         args: &Arguments<'v, '_>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> crate::Result<Value<'v>> {

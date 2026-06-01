@@ -9,6 +9,7 @@
  */
 
 use allocative::Allocative;
+use pagable::Pagable;
 
 use crate::cells::cell_root_path::CellRootPath;
 use crate::cells::name::CellName;
@@ -19,7 +20,7 @@ use crate::cells::unchecked_cell_rel_path::UncheckedCellRelativePath;
 /// Paths to cells which reside inside current cell.
 ///
 /// Target labels cannot cross cell boundaries. This utility helps to identify such targets.
-#[derive(Eq, PartialEq, Debug, Allocative, Clone)]
+#[derive(Eq, PartialEq, Debug, Allocative, Clone, Pagable)]
 pub struct NestedCells {
     paths: Vec<(CellRelativePathBuf, CellName)>,
 }
@@ -54,10 +55,7 @@ impl NestedCells {
     ) -> NestedCells {
         Self::from_cell_paths_relative_to_this_cell(all_cells.iter().filter_map(
             |(cell_name, cell_root_path)| {
-                let Some(path_relative_to_this_cell) = cell_root_path.strip_prefix_opt(this_cell)
-                else {
-                    return None;
-                };
+                let path_relative_to_this_cell = cell_root_path.strip_prefix_opt(this_cell)?;
 
                 Some((
                     CellRelativePath::new(path_relative_to_this_cell),

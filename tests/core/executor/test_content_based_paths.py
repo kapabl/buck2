@@ -11,9 +11,11 @@
 
 import json
 import subprocess
+import time
 from pathlib import Path
 
 from buck2.tests.e2e_util.api.buck import Buck
+from buck2.tests.e2e_util.api.buck_result import ExitCodeV2
 from buck2.tests.e2e_util.asserts import expect_failure
 from buck2.tests.e2e_util.buck_workspace import buck_test
 from buck2.tests.e2e_util.helper.utils import filter_events, read_what_ran
@@ -37,6 +39,10 @@ async def is_eligible_for_action_dedup(buck: Buck) -> bool:
 ELIGIBLE_FOR_DEDUPE = 0
 INELIGIBLE_INPUT = 1
 INELIGIBLE_OUTPUT = 2
+EXECUTION_PLATFORM_UNKNOWN_ELIGIBILITY = 3
+
+EXPECTED_INELIGIBLE_FOR_DEDUPE = 1
+UNKNOWN_ELIGIBILITY = 2
 
 
 async def build_target_with_different_platforms_and_verify_output_paths_are_identical(
@@ -67,6 +73,7 @@ async def build_target_with_different_platforms_and_verify_output_paths_are_iden
     path2 = result2.get_target_to_build_output().get(target)
 
     assert path1 is not None
+    assert path2 is not None
     assert "output_artifact" not in path1
     assert path1 != path2
 
@@ -132,6 +139,7 @@ async def test_run_remote_with_content_based_path(buck: Buck) -> None:
     path2 = result2.get_target_to_build_output().get(target)
 
     assert path1 is not None
+    assert path2 is not None
     assert "output_artifact" not in path1
     assert path1 != path2
 
@@ -442,6 +450,7 @@ async def test_output_symlink_is_updated(buck: Buck) -> None:
     )
     path1 = result1.get_target_to_build_output().get(target)
 
+    assert path1 is not None
     actual1 = (buck.cwd / path1).resolve()
     assert actual1.exists()
     with open(actual1) as f:
@@ -452,6 +461,7 @@ async def test_output_symlink_is_updated(buck: Buck) -> None:
     )
     path2 = result2.get_target_to_build_output().get(target)
 
+    assert path2 is not None
     assert path2 == path1
 
     actual2 = (buck.cwd / path2).resolve()
@@ -533,14 +543,35 @@ async def test_resolve_promise_artifact(
 
 
 @buck_test()
+async def test_pass_cbp_promise_artifact_to_anon_target(
+    buck: Buck,
+) -> None:
+    await buck.build(
+        "root//:pass_cbp_promise_to_anon_target",
+    )
+
+
+@buck_test()
+async def test_run_with_anon_non_cbp_dep_eligible_for_dedupe(buck: Buck) -> None:
+    await buck.build(
+        "root//:run_with_anon_non_cbp_dep",
+        "--target-platforms",
+        "root//:p_default",
+    )
+    assert await is_eligible_for_action_dedup(buck) == ELIGIBLE_FOR_DEDUPE
+
+
+@buck_test()
 async def test_not_eligible_for_dedupe(buck: Buck) -> None:
     await buck.build(
         "root//:not_eligible_for_dedupe",
         "--target-platforms",
         "root//:p_default",
+        "-c",
+        "test.expect_eligible_for_dedupe=false",
     )
 
-    events = await filter_events(
+    eligible_for_dedupe_events = await filter_events(
         buck,
         "Event",
         "data",
@@ -550,7 +581,22 @@ async def test_not_eligible_for_dedupe(buck: Buck) -> None:
         "eligible_for_dedupe",
     )
 
-    assert events == [INELIGIBLE_OUTPUT, INELIGIBLE_INPUT]
+    assert eligible_for_dedupe_events == [INELIGIBLE_OUTPUT, INELIGIBLE_INPUT]
+
+    expected_eligible_for_dedupe_events = await filter_events(
+        buck,
+        "Event",
+        "data",
+        "SpanEnd",
+        "data",
+        "ActionExecution",
+        "expected_eligible_for_dedupe",
+    )
+
+    assert expected_eligible_for_dedupe_events == [
+        UNKNOWN_ELIGIBILITY,
+        EXPECTED_INELIGIBLE_FOR_DEDUPE,
+    ]
 
 
 @buck_test()
@@ -568,6 +614,19 @@ async def test_expect_eligible_for_dedupe_ineligible_input(buck: Buck) -> None:
 
 
 @buck_test()
+async def test_expect_eligible_for_dedupe_ineligible_input_for_execution_platform(
+    buck: Buck,
+) -> None:
+    buck.build(
+        "root//:not_eligible_for_dedupe",
+        "--target-platforms",
+        "root//platforms:default",
+        "-c",
+        "test.expect_eligible_for_dedupe=true",
+    )
+
+
+@buck_test()
 async def test_expect_eligible_for_dedupe_ineligible_output(buck: Buck) -> None:
     await expect_failure(
         buck.build(
@@ -581,3 +640,81 @@ async def test_expect_eligible_for_dedupe_ineligible_output(buck: Buck) -> None:
         ),
         stderr_regex="Action is marked with `expect_eligible_for_dedupe` but output `out` is not content-based",
     )
+
+
+@buck_test()
+async def test_execution_platform_returns_unknown_eligibility(buck: Buck) -> None:
+    # When an action's owner is configured for an execution platform (i.e. via
+    # exec_dep), eligible_for_dedupe will return EXECUTION_PLATFORM_UNKNOWN_ELIGIBILITY
+    # if an input is configured for the same platform as the action itself.
+    await buck.build(
+        "root//:uses_exec_dep",
+        "--target-platforms",
+        "root//:p_default",
+    )
+
+    eligible_for_dedupe_events = await filter_events(
+        buck,
+        "Event",
+        "data",
+        "SpanEnd",
+        "data",
+        "ActionExecution",
+        "eligible_for_dedupe",
+    )
+
+    # The exec dep (non_content_based_exec_dep) has a single run action that hits this.
+    assert eligible_for_dedupe_events.count(EXECUTION_PLATFORM_UNKNOWN_ELIGIBILITY) == 1
+
+
+@buck_test()
+async def test_failing_run_with_run_info(buck: Buck) -> None:
+    failure = await expect_failure(
+        buck.build(
+            "root//:failing_run_with_content_based_path",
+            "--target-platforms",
+            "root//:p_default",
+            "--show-output",
+        ),
+        exit_code=ExitCodeV2.USER_ERROR,
+        stderr_regex="Remote command returned non-zero exit code 1",
+    )
+    assert (
+        "Tried to resolve a content-based path out without providing the content hash!"
+        not in failure.stderr
+    )
+
+
+@buck_test()
+async def test_shared_content_hash_race(buck: Buck) -> None:
+    """Regression test for a writer-vs-writer race on shared content-based paths.
+
+    Mirrors the pattern from prelude/rust/build.bzl
+    _create_transitive_dependency_symlinks: a write_json output with
+    has_content_based_path = True whose content does not depend on
+    configuration. A single producer target is analyzed under N different
+    platforms (via N consumer targets with distinct default_target_platform),
+    so every analysis's write_json resolves to the SAME
+    __<target>__/<content_hash>/artifacts.json on-disk path. Concurrently
+    running those N writes exercises the cleanup_path -> write_file
+    sequence in immediate::write_to_disk; before the fix, two writers
+    would race on the same path and one's remove would return ENOENT,
+    failing the build with:
+        Action failed: ... (write_json artifacts.json)
+        remove_file(.../<target>/<content_hash>/artifacts.json):
+        No such file or directory (os error 2)
+    """
+    N = 200
+    targets = [f"root//:rust_pattern_consumer_{i}" for i in range(N)]
+    # Embed a distinct seed per iteration via buckconfig so every iteration
+    # writes different JSON content and therefore misses the RE action cache
+    # and the local materializer cache. All N consumers within an iteration
+    # share the same seed, so they share the same content-hash path.
+    base_seed = int(time.time() * 1000)
+    for i in range(3):
+        await buck.build(
+            "-c",
+            f"cbp_race.seed={base_seed + i}",
+            *targets,
+        )
+        await buck.clean()

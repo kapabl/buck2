@@ -23,6 +23,7 @@ use buck2_error::classify::ErrorLike;
 use buck2_error::classify::ErrorTagExtra;
 use buck2_error::classify::best_error;
 use buck2_error::conversion::from_any_with_tag;
+use buck2_fs::error::IoResultExt;
 use buck2_fs::fs_util;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_fs::paths::abs_path::AbsPathBuf;
@@ -76,11 +77,7 @@ impl ExitResult {
     }
 
     pub fn is_success(&self) -> bool {
-        if let ExitResultVariant::Status(ExitCode::Success) = &self.variant {
-            true
-        } else {
-            false
-        }
+        matches!(self.variant, ExitResultVariant::Status(ExitCode::Success))
     }
 
     /// Return the stored error that hasn't been shown to the user yet, if there is one.
@@ -154,7 +151,7 @@ impl ExitResult {
 
     pub fn err(err: buck2_error::Error) -> Self {
         Self {
-            variant: ExitResultVariant::StatusWithErr(err.exit_code(), err.into()),
+            variant: ExitResultVariant::StatusWithErr(err.exit_code(), err),
             stdout: Vec::new(),
             emitted_errors: Vec::new(),
         }
@@ -162,7 +159,7 @@ impl ExitResult {
 
     pub fn err_with_exit_code(err: buck2_error::Error, exit_code: ExitCode) -> Self {
         Self {
-            variant: ExitResultVariant::StatusWithErr(exit_code, err.into()),
+            variant: ExitResultVariant::StatusWithErr(exit_code, err),
             stdout: Vec::new(),
             emitted_errors: Vec::new(),
         }
@@ -199,8 +196,7 @@ impl ExitResult {
         }
         let exit_code = best_error(&errors)
             .and_then(|e| e.best_tag())
-            .map(|t| t.exit_code())
-            .unwrap_or(ExitCode::UnknownFailure);
+            .map_or(ExitCode::UnknownFailure, |t| t.exit_code());
         status_with_error_report(exit_code, errors)
     }
 
@@ -264,7 +260,7 @@ impl ExitResult {
             // No buck_log_dir, no command_report_path, do nothing.
             return Ok(());
         };
-        let file = fs_util::create_file(&path)?;
+        let file = fs_util::create_file(&path).categorize_internal()?;
         let mut file = std::io::BufWriter::new(file);
 
         let error_messages = self
@@ -290,7 +286,8 @@ impl ExitResult {
                 }
                 // buck wrapper depends on command report being written.
                 file.flush()?;
-                fs_util::copy(path, report_path)?;
+                // input path from --command-report-path
+                fs_util::copy(path, report_path).categorize_input()?;
             }
         }
 

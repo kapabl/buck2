@@ -17,7 +17,7 @@ use buck2_core::cells::paths::CellRelativePath;
 use buck2_core::configuration::data::ConfigurationData;
 use buck2_core::package::PackageLabel;
 use buck2_core::target::label::label::TargetLabel;
-use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_interpreter_for_build::interpreter::package_file_calculation::EvalPackageFile;
 use buck2_node::cfg_constructor::CfgConstructorCalculationImpl;
 use buck2_node::cfg_constructor::CfgConstructorImpl;
@@ -29,16 +29,21 @@ use derive_more::Display;
 use dice::CancellationContext;
 use dice::DiceComputations;
 use dice::Key;
+use dice::OkPagableValueSerialize;
+use dice::ValueSerialize;
 use dupe::Dupe;
 use dupe::OptionDupedExt;
+use pagable::Pagable;
+use pagable::pagable_typetag;
 
 #[derive(Debug, buck2_error::Error)]
 #[buck2(tag = Input)]
 enum CalculationCfgConstructorError {
     #[error(
-        "Usage of both `modifiers` attribute and modifiers in metadata is not allowed for target `{0}`"
+        "Target `{0}` sets `metadata[\"buck.cfg_modifiers\"]` which is no longer supported. \
+         Use the first-class `modifiers` attribute instead."
     )]
-    TargetModifiersAttrAndMetadataNotAllowed(TargetLabel),
+    MetadataModifiersNotSupported(TargetLabel),
 }
 
 pub struct CfgConstructorCalculationInstance;
@@ -56,7 +61,8 @@ async fn get_cfg_constructor_uncached(
 async fn get_cfg_constructor(
     ctx: &mut DiceComputations<'_>,
 ) -> buck2_error::Result<Option<Arc<dyn CfgConstructorImpl>>> {
-    #[derive(Clone, Dupe, Display, Debug, Eq, Hash, PartialEq, Allocative)]
+    #[derive(Clone, Dupe, Display, Debug, Eq, Hash, PartialEq, Allocative, Pagable)]
+    #[pagable_typetag(dice::DiceKeyDyn)]
     struct GetCfgConstructorKey;
 
     #[async_trait]
@@ -68,19 +74,19 @@ async fn get_cfg_constructor(
             ctx: &mut DiceComputations,
             _cancellations: &CancellationContext,
         ) -> Self::Value {
-            get_cfg_constructor_uncached(ctx)
-                .await
-                .map_err(buck2_error::Error::from)
+            get_cfg_constructor_uncached(ctx).await
         }
 
         fn equality(_x: &Self::Value, _y: &Self::Value) -> bool {
             false
         }
+
+        fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+            OkPagableValueSerialize::<Self::Value>::new()
+        }
     }
 
-    ctx.compute(&GetCfgConstructorKey)
-        .await?
-        .map_err(buck2_error::Error::from)
+    ctx.compute(&GetCfgConstructorKey).await?
 }
 
 #[async_trait]
@@ -93,15 +99,18 @@ impl CfgConstructorCalculationImpl for CfgConstructorCalculationInstance {
         cfg: ConfigurationData,
         cli_modifiers: &Arc<Vec<String>>,
         rule_type: &RuleType,
+        configuring_exec_dep: bool,
     ) -> buck2_error::Result<ConfigurationData> {
-        #[derive(Clone, Display, Dupe, Debug, Eq, Hash, PartialEq, Allocative)]
+        #[derive(Clone, Display, Dupe, Debug, Eq, Hash, PartialEq, Allocative, Pagable)]
         #[display("CfgConstructorInvocationKey")]
+        #[pagable_typetag(dice::DiceKeyDyn)]
         struct CfgConstructorInvocationKey {
             package_cfg_modifiers: Option<MetadataValue>,
             target_cfg_modifiers: Option<MetadataValue>,
             cfg: ConfigurationData,
             cli_modifiers: Arc<Vec<String>>,
             rule_type: RuleType,
+            configuring_exec_dep: bool,
         }
 
         #[async_trait]
@@ -113,9 +122,9 @@ impl CfgConstructorCalculationImpl for CfgConstructorCalculationInstance {
                 ctx: &mut DiceComputations,
                 cancellation: &CancellationContext,
             ) -> Self::Value {
-                let cfg_constructor = get_cfg_constructor(ctx).await?.buck_error_context(
-                    "Internal error: Global cfg constructor instance should exist",
-                )?;
+                let cfg_constructor = get_cfg_constructor(ctx).await?.ok_or_else(|| {
+                    internal_error!("Global cfg constructor instance should exist")
+                })?;
                 cfg_constructor
                     .eval(
                         ctx,
@@ -124,10 +133,10 @@ impl CfgConstructorCalculationImpl for CfgConstructorCalculationInstance {
                         self.target_cfg_modifiers.as_ref(),
                         &self.cli_modifiers,
                         &self.rule_type,
+                        self.configuring_exec_dep,
                         cancellation,
                     )
                     .await
-                    .map_err(buck2_error::Error::from)
             }
 
             fn equality(x: &Self::Value, y: &Self::Value) -> bool {
@@ -135,6 +144,10 @@ impl CfgConstructorCalculationImpl for CfgConstructorCalculationInstance {
                     (Ok(x), Ok(y)) => x == y,
                     _ => false,
                 }
+            }
+
+            fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+                OkPagableValueSerialize::<Self::Value>::new()
             }
         }
 
@@ -149,21 +162,24 @@ impl CfgConstructorCalculationImpl for CfgConstructorCalculationInstance {
             .map(|m| m.to_value())
             .map(MetadataValue::new);
 
-        let metadata_modifiers = target.metadata()?.and_then(|m| m.get(modifier_key));
-        let target_modifiers = target.target_modifiers()?;
-        let target_cfg_modifiers = match (metadata_modifiers, target_modifiers) {
-            (None, Some(t)) if !t.is_empty() => Some(MetadataValue(t.as_json())),
-            (Some(_), Some(t)) if !t.is_empty() => {
-                return Err(
-                    CalculationCfgConstructorError::TargetModifiersAttrAndMetadataNotAllowed(
-                        target.label().dupe(),
-                    )
-                    .into(),
-                );
-            }
-            (Some(m), _) => Some(m.dupe()),
-            _ => None,
-        };
+        // metadata["buck.cfg_modifiers"] is no longer supported. Fail loudly so the developer
+        // knows the modifier they wrote won't be applied.
+        if target
+            .metadata()?
+            .is_some_and(|m| m.get(modifier_key).is_some())
+        {
+            return Err(
+                CalculationCfgConstructorError::MetadataModifiersNotSupported(
+                    target.label().dupe(),
+                )
+                .into(),
+            );
+        }
+
+        let target_cfg_modifiers = target
+            .target_modifiers()?
+            .filter(|t| !t.is_empty())
+            .map(|t| MetadataValue(t.as_json()));
 
         // If there are no PACKAGE/target/cli modifiers, return the original configuration without computing DICE call
         // TODO(scottcao): This is just for rollout purpose. Remove once modifier is rolled out
@@ -180,6 +196,7 @@ impl CfgConstructorCalculationImpl for CfgConstructorCalculationInstance {
             cfg,
             cli_modifiers: cli_modifiers.dupe(),
             rule_type: rule_type.dupe(),
+            configuring_exec_dep,
         };
         Ok(ctx.compute(&key).await??)
     }

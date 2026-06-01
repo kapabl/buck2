@@ -19,19 +19,19 @@ use buck2_build_api::interpreter::rule_defs::artifact_tagging::ArtifactTag;
 use buck2_build_api::interpreter::rule_defs::cmd_args::ArtifactPathMapper;
 use buck2_build_api::interpreter::rule_defs::cmd_args::CommandLineArgLike;
 use buck2_build_api::interpreter::rule_defs::cmd_args::CommandLineArtifactVisitor;
-use buck2_build_api::interpreter::rule_defs::cmd_args::CommandLineContext;
 use buck2_build_api::interpreter::rule_defs::cmd_args::StarlarkCmdArgs;
 use buck2_build_api::interpreter::rule_defs::cmd_args::StarlarkCommandLineValueUnpack;
 use buck2_build_api::interpreter::rule_defs::cmd_args::WriteToFileMacroVisitor;
 use buck2_build_api::interpreter::rule_defs::cmd_args::value::CommandLineArg;
 use buck2_build_api::interpreter::rule_defs::context::AnalysisActions;
 use buck2_build_api::interpreter::rule_defs::resolved_macro::ResolvedMacro;
+use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
+use buck2_execute::artifact::fs::ExecutorFs;
 use buck2_execute::execute::request::OutputType;
+use buck2_hash::BuckHashMap;
+use buck2_hash::buck_indexset;
 use dupe::Dupe;
 use either::Either;
-use fxhash::FxHashMap;
-use indexmap::indexset;
-use relative_path::RelativePathBuf;
 use sha1::Digest;
 use sha1::Sha1;
 use starlark::environment::MethodsBuilder;
@@ -132,8 +132,6 @@ pub(crate) fn analysis_actions_methods_write(methods: &mut MethodsBuilder) {
         #[starlark(require = named, default = false)] with_inputs: bool,
         #[starlark(require = named, default = false)] pretty: bool,
         #[starlark(require = named, default = false)] absolute: bool,
-        #[starlark(require = named, default = NoneOr::None)]
-        uses_experimental_content_based_path_hashing: NoneOr<bool>,
         #[starlark(require = named, default = NoneOr::None)] has_content_based_path: NoneOr<bool>,
         #[starlark(require = named, default = false)]
         use_dep_files_placeholder_for_content_based_paths: bool,
@@ -144,9 +142,7 @@ pub(crate) fn analysis_actions_methods_write(methods: &mut MethodsBuilder) {
             eval,
             output,
             OutputType::File,
-            uses_experimental_content_based_path_hashing
-                .into_option()
-                .or(has_content_based_path.into_option()),
+            has_content_based_path.into_option(),
         )?;
 
         let value = declaration.into_declared_artifact(AssociatedArtifacts::new());
@@ -156,7 +152,7 @@ pub(crate) fn analysis_actions_methods_write(methods: &mut MethodsBuilder) {
         cli.visit_contents(&mut visitor)?;
 
         this.register_action(
-            indexset![output_artifact],
+            buck_indexset![output_artifact],
             UnregisteredWriteJsonAction::new(
                 pretty,
                 absolute,
@@ -207,8 +203,6 @@ pub(crate) fn analysis_actions_methods_write(methods: &mut MethodsBuilder) {
         // If set, add artifacts in content as associated artifacts of the output. This will only work for bound artifacts.
         #[starlark(require = named, default = false)] with_inputs: bool,
         #[starlark(require = named, default = false)] absolute: bool,
-        #[starlark(require = named, default = NoneOr::None)]
-        uses_experimental_content_based_path_hashing: NoneOr<bool>,
         #[starlark(require = named, default = NoneOr::None)] has_content_based_path: NoneOr<bool>,
         #[starlark(require = named, default = false)]
         use_dep_files_placeholder_for_content_based_paths: bool,
@@ -244,20 +238,16 @@ pub(crate) fn analysis_actions_methods_write(methods: &mut MethodsBuilder) {
                     Ok(())
                 }
 
-                fn set_current_relative_to_path(
-                    &mut self,
-                    _gen: &dyn Fn(
-                        &dyn CommandLineContext,
-                    )
-                        -> buck2_error::Result<Option<RelativePathBuf>>,
-                ) -> buck2_error::Result<()> {
-                    Ok(())
+                fn set_current_relative_to_path(&mut self, _p: ProjectRelativePathBuf) {}
+
+                fn fs(&self) -> Option<&ExecutorFs<'_>> {
+                    None
                 }
             }
 
             let mut counter = WriteToFileMacrosCounter { count: 0 };
             // At this point the mapping doesn't matter because we're only doing a count
-            cli.visit_write_to_file_macros(&mut counter, &FxHashMap::default())?;
+            cli.visit_write_to_file_macros(&mut counter, &BuckHashMap::default())?;
             Ok(counter.count)
         }
 
@@ -275,9 +265,7 @@ pub(crate) fn analysis_actions_methods_write(methods: &mut MethodsBuilder) {
             eval,
             output,
             OutputType::File,
-            uses_experimental_content_based_path_hashing
-                .into_option()
-                .or(has_content_based_path.into_option()),
+            has_content_based_path.into_option(),
         )?;
 
         let (content_cli, written_macro_count, mut associated_artifacts) = match content {
@@ -311,7 +299,7 @@ pub(crate) fn analysis_actions_methods_write(methods: &mut MethodsBuilder) {
                 format!("__macros/{sha}")
             };
 
-            let mut written_macro_files = indexset![];
+            let mut written_macro_files = buck_indexset![];
             for i in 0..written_macro_count {
                 let macro_file = this.declare_output(
                     None,
@@ -340,12 +328,12 @@ pub(crate) fn analysis_actions_methods_write(methods: &mut MethodsBuilder) {
 
             written_macro_files
         } else {
-            indexset![]
+            buck_indexset![]
         };
 
         let action = {
             let maybe_macro_files = if allow_args {
-                let mut macro_files = indexset![];
+                let mut macro_files = buck_indexset![];
                 for a in &written_macro_files {
                     let artifact = a.dupe().ensure_bound()?.into_artifact();
                     macro_files.insert(artifact.dupe());
@@ -362,7 +350,7 @@ pub(crate) fn analysis_actions_methods_write(methods: &mut MethodsBuilder) {
             }
         };
         this.register_action(
-            indexset![output_artifact],
+            buck_indexset![output_artifact],
             action,
             Some(content_cli.to_value()),
             None,

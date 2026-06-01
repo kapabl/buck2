@@ -22,8 +22,10 @@ use async_compression::tokio::bufread::ZstdDecoder;
 use buck2_cli_proto::protobuf_util::ProtobufSplitter;
 use buck2_cli_proto::*;
 use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_events::BuckEvent;
 use buck2_fs::async_fs_util;
+use buck2_fs::error::IoResultExt;
 use buck2_fs::paths::abs_path::AbsPath;
 use buck2_fs::paths::abs_path::AbsPathBuf;
 use buck2_wrapper_common::invocation_id::TraceId;
@@ -51,6 +53,39 @@ use crate::utils::KNOWN_ENCODINGS;
 use crate::utils::LogMode;
 
 type EventLogReader<'a> = Box<dyn AsyncRead + Send + Sync + Unpin + 'a>;
+
+/// Check if an error is caused by a truncated compressed stream. This
+/// can happen when reading in-progress event logs that don't have a
+/// proper compression footer yet.
+fn is_truncated_stream_error(error: &buck2_error::Error) -> bool {
+    // Match exact error messages from compression-codecs library:
+    // - zstd/bzip2/lz4: "... stream did not finish"
+    // - gzip: "unexpected end of file" (default UnexpectedEof message)
+    let msg = error.to_string().to_lowercase();
+    msg.contains("did not finish") || msg.contains("unexpected end of file")
+}
+
+/// Wrap a stream to treat truncated compressed stream errors as EOF.
+/// This allows reading in-progress event logs that may not have a
+/// proper compression footer yet.
+fn tolerant_of_truncation<T>(
+    stream: impl Stream<Item = buck2_error::Result<T>>,
+) -> impl Stream<Item = buck2_error::Result<T>> {
+    stream.scan(false, |stopped, result| {
+        if *stopped {
+            return futures::future::ready(None);
+        }
+        match result {
+            Ok(item) => futures::future::ready(Some(Ok(item))),
+            Err(e) if is_truncated_stream_error(&e) => {
+                // Treat truncation error as end of stream
+                *stopped = true;
+                futures::future::ready(None)
+            }
+            Err(e) => futures::future::ready(Some(Err(e))),
+        }
+    })
+}
 
 pub struct ReaderStats {
     compressed_bytes: AtomicUsize,
@@ -143,9 +178,9 @@ impl EventLogPathBuf {
     fn file_name(path: &AbsPathBuf) -> buck2_error::Result<&str> {
         let name = path
             .file_name()
-            .with_buck_error_context(|| EventLogInferenceError::NoFilename(path.clone()))?
+            .ok_or_else(|| EventLogInferenceError::NoFilename(path.clone()))?
             .to_str()
-            .with_buck_error_context(|| EventLogInferenceError::InvalidFilename(path.clone()))?;
+            .ok_or_else(|| EventLogInferenceError::InvalidFilename(path.clone()))?;
         Ok(name)
     }
 
@@ -206,7 +241,7 @@ impl EventLogPathBuf {
             .next_line()
             .await
             .buck_error_context("Error reading header line")?
-            .buck_error_context("No header line")?;
+            .ok_or_else(|| internal_error!("No header line"))?;
         let invocation = Invocation::parse_json_line(&header)?;
 
         let events = LinesStream::new(log_lines).map(|line| {
@@ -214,6 +249,9 @@ impl EventLogPathBuf {
             serde_json::from_str::<StreamValue>(&line)
                 .with_buck_error_context(|| format!("Invalid line: {}", line.trim_end()))
         });
+
+        // Wrap in tolerant_of_truncation to handle in-progress logs
+        let events = tolerant_of_truncation(events);
 
         Ok((invocation, events.boxed()))
     }
@@ -230,7 +268,7 @@ impl EventLogPathBuf {
         let invocation = stream
             .try_next()
             .await?
-            .buck_error_context("No invocation found")?;
+            .ok_or_else(|| internal_error!("No invocation found"))?;
         let invocation = buck2_data::Invocation::decode_length_delimited(invocation)
             .buck_error_context("Invalid Invocation")?;
         let invocation = Invocation::from_proto(invocation);
@@ -250,6 +288,9 @@ impl EventLogPathBuf {
                 )),
             }
         });
+
+        // Wrap in tolerant_of_truncation to handle in-progress logs
+        let events = tolerant_of_truncation(events);
 
         Ok((invocation, events.boxed()))
     }
@@ -305,7 +346,9 @@ impl EventLogPathBuf {
             None => (None, None),
         };
 
-        let file = async_fs_util::open(&self.path).await?;
+        let file = async_fs_util::open(&self.path)
+            .await
+            .categorize_internal()?;
         let file = CountingReader::new(file, compressed_bytes);
         let file = match self.encoding.compression {
             Compression::None => {

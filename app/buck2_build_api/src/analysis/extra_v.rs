@@ -11,9 +11,11 @@
 use std::cell::OnceCell;
 
 use allocative::Allocative;
-use buck2_error::BuckErrorContext;
 use buck2_error::conversion::from_any_with_tag;
+use buck2_error::internal_error;
 use gazebo::prelude::OptionExt;
+use starlark::StarlarkPagable;
+use starlark::StarlarkPagablePanic;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::FrozenModule;
 use starlark::environment::Module;
@@ -31,17 +33,26 @@ use starlark::values::any_complex::StarlarkAnyComplex;
 use crate::analysis::registry::AnalysisValueStorage;
 use crate::analysis::registry::FrozenAnalysisValueStorage;
 
-#[derive(Default, Debug, ProvidesStaticType, Allocative, Trace)]
+#[derive(
+    Default,
+    Debug,
+    ProvidesStaticType,
+    Allocative,
+    Trace,
+    StarlarkPagablePanic
+)]
 pub struct AnalysisExtraValue<'v> {
     pub analysis_value_storage:
         OnceCell<ValueTyped<'v, StarlarkAnyComplex<AnalysisValueStorage<'v>>>>,
 }
 
-#[derive(Debug, ProvidesStaticType, Allocative)]
+#[derive(Debug, ProvidesStaticType, Allocative, StarlarkPagable)]
 pub struct FrozenAnalysisExtraValue {
     pub(crate) analysis_value_storage:
         Option<FrozenValueTyped<'static, StarlarkAnyComplex<FrozenAnalysisValueStorage>>>,
 }
+
+starlark::register_starlark_any_complex!(AnalysisExtraValue<'_>, frozen FrozenAnalysisExtraValue);
 
 impl<'v> Freeze for AnalysisExtraValue<'v> {
     type Frozen = FrozenAnalysisExtraValue;
@@ -65,7 +76,7 @@ impl<'v> Freeze for AnalysisExtraValue<'v> {
 }
 
 impl<'v> AnalysisExtraValue<'v> {
-    pub fn get(module: &'v Module) -> buck2_error::Result<Option<&'v AnalysisExtraValue<'v>>> {
+    pub fn get(module: &Module<'v>) -> buck2_error::Result<Option<&'v AnalysisExtraValue<'v>>> {
         let Some(extra) = module.extra_value() else {
             return Ok(None);
         };
@@ -76,7 +87,7 @@ impl<'v> AnalysisExtraValue<'v> {
         ))
     }
 
-    pub fn get_or_init(module: &'v Module) -> buck2_error::Result<&'v AnalysisExtraValue<'v>> {
+    pub fn get_or_init(module: &Module<'v>) -> buck2_error::Result<&'v AnalysisExtraValue<'v>> {
         if let Some(extra) = Self::get(module)? {
             return Ok(extra);
         }
@@ -87,7 +98,7 @@ impl<'v> AnalysisExtraValue<'v> {
                     .alloc(StarlarkAnyComplex::new(AnalysisExtraValue::default())),
             )
             .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?;
-        Self::get(module)?.internal_error("extra_value must be set")
+        Self::get(module)?.ok_or_else(|| internal_error!("extra_value must be set"))
     }
 }
 
@@ -98,7 +109,7 @@ impl FrozenAnalysisExtraValue {
     {
         Ok(module
             .owned_extra_value()
-            .internal_error("extra_value not set")?
+            .ok_or_else(|| internal_error!("extra_value not set"))?
             .downcast_starlark()?)
     }
 }

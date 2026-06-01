@@ -17,6 +17,8 @@ use buck2_common::init::DaemonStartupConfig;
 use buck2_common::invocation_roots::InvocationRoots;
 use buck2_common::invocation_roots::find_invocation_roots;
 use buck2_common::legacy_configs::cells::BuckConfigBasedCells;
+#[cfg(fbcode_build)]
+use buck2_common::legacy_configs::key::BuckconfigKeyRef;
 use buck2_core::buck2_env;
 use buck2_core::cells::CellAliasResolver;
 use buck2_core::cells::CellResolver;
@@ -24,6 +26,7 @@ use buck2_core::cells::cell_path::CellPathRef;
 use buck2_core::cells::cell_root_path::CellRootPathBuf;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_fs::fs_util;
 use buck2_fs::paths::abs_norm_path::AbsNormPath;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
@@ -36,6 +39,8 @@ struct ImmediateConfig {
     cell_resolver: CellResolver,
     cwd_cell_alias_resolver: CellAliasResolver,
     daemon_startup_config: DaemonStartupConfig,
+    #[cfg(fbcode_build)]
+    show_sentiment: bool,
 }
 
 impl ImmediateConfig {
@@ -58,6 +63,14 @@ impl ImmediateConfig {
             cwd_cell_alias_resolver,
             daemon_startup_config: DaemonStartupConfig::new(&cells.root_config)
                 .buck_error_context("Error loading daemon startup config")?,
+            #[cfg(fbcode_build)]
+            show_sentiment: cells
+                .root_config
+                .get(BuckconfigKeyRef {
+                    section: "experiments",
+                    property: "sentiment",
+                })
+                .is_some_and(|v| v == "true"),
         })
     }
 }
@@ -69,6 +82,8 @@ struct ImmediateConfigContextData {
     cwd_cell_alias_resolver: CellAliasResolver,
     daemon_startup_config: DaemonStartupConfig,
     project_filesystem: ProjectRoot,
+    #[cfg(fbcode_build)]
+    show_sentiment: bool,
 }
 
 pub struct ImmediateConfigContext<'a> {
@@ -101,6 +116,11 @@ impl<'a> ImmediateConfigContext<'a> {
 
     pub fn daemon_startup_config(&self) -> buck2_error::Result<&DaemonStartupConfig> {
         Ok(&self.data()?.daemon_startup_config)
+    }
+
+    #[cfg(fbcode_build)]
+    pub fn show_sentiment(&self) -> bool {
+        self.data().map(|d| d.show_sentiment).unwrap_or(false)
     }
 
     /// Resolves a cell path (i.e., contains `//`) into an absolute path. The cell path must have
@@ -171,6 +191,8 @@ impl<'a> ImmediateConfigContext<'a> {
                     cwd_cell_alias_resolver: cfg.cwd_cell_alias_resolver,
                     daemon_startup_config,
                     project_filesystem: roots.project_root,
+                    #[cfg(fbcode_build)]
+                    show_sentiment: cfg.show_sentiment,
                 })
             })
             .buck_error_context("Error creating cell resolver")
@@ -217,8 +239,10 @@ fn is_paranoid_enabled(path: &AbsPath) -> buck2_error::Result<bool> {
         .buck_error_context("Invalid data ")?;
 
     let now = SystemTime::now();
-    let expires_at =
-        SystemTime::try_from(info.expires_at.buck_error_context("Missing expires_at")?)
-            .buck_error_context("Invalid expires_at")?;
+    let expires_at = SystemTime::try_from(
+        info.expires_at
+            .ok_or_else(|| internal_error!("Missing expires_at"))?,
+    )
+    .buck_error_context("Invalid expires_at")?;
     Ok(now < expires_at)
 }

@@ -26,13 +26,17 @@ use buck2_common::invocation_paths::InvocationPaths;
 use buck2_common::memory;
 use buck2_core::buck2_env;
 use buck2_core::logging::LogConfigurationReloadHandle;
+use buck2_core::soft_error;
 use buck2_error::BuckErrorContext;
+use buck2_error::ErrorTag;
+use buck2_error::buck2_error;
 use buck2_error::conversion::clap::buck_error_clap_parser;
 use buck2_events::daemon_id::DaemonId;
 use buck2_events::daemon_id::set_daemon_id_for_panics;
+use buck2_fs::error::IoResultExt;
 use buck2_fs::fs_util;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
-use buck2_resource_control::buck_cgroup_tree::BuckCgroupTree;
+use buck2_resource_control::buck_cgroup_tree::PreppedBuckCgroups;
 use buck2_server::daemon::daemon_tcp::create_listener;
 use buck2_server::daemon::server::BuckdServer;
 use buck2_server::daemon::server::BuckdServerDelegate;
@@ -47,8 +51,6 @@ use futures::channel::mpsc;
 use futures::channel::mpsc::UnboundedSender;
 use futures::pin_mut;
 use futures::select;
-use rand::Rng;
-use tokio::runtime::Builder;
 
 use crate::daemon_lower_priority::daemon_lower_priority;
 use crate::schedule_termination::maybe_schedule_termination;
@@ -133,6 +135,9 @@ pub(crate) fn write_process_info(
 ) -> buck2_error::Result<()> {
     let file = File::create(daemon_dir.buckd_info())?;
     serde_json::to_writer(&file, &process_info)?;
+    // Fsync so the endpoint/auth token are durable before clients race
+    // to read this file; a crash here would otherwise lose them.
+    file.sync_all()?;
     Ok(())
 }
 
@@ -140,7 +145,10 @@ fn verify_current_daemon(daemon_dir: &DaemonDir) -> buck2_error::Result<()> {
     let file = daemon_dir.buckd_pid();
     let my_pid = process::id();
 
-    let recorded_pid: u32 = fs_util::read_to_string(&file)?.trim().parse()?;
+    let recorded_pid: u32 = fs_util::read_to_string(&file)
+        .categorize_internal()?
+        .trim()
+        .parse()?;
     if recorded_pid != my_pid {
         return Err(
             DaemonError::PidFileMismatch(file.into_path_buf(), my_pid, recorded_pid).into(),
@@ -151,15 +159,15 @@ fn verify_current_daemon(daemon_dir: &DaemonDir) -> buck2_error::Result<()> {
 }
 
 fn gen_auth_token() -> String {
-    (0..20)
-        .map(|_| rand::thread_rng().gen_range('a'..='z'))
-        .collect()
+    (0..20).map(|_| rand::random_range('a'..='z')).collect()
 }
 
 fn terminate_on_panic() {
     let orig_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         orig_hook(panic_info);
+        // Flush PGO profile data before _exit, which skips atexit handlers.
+        buck2_util::pgo::flush_pgo_profile();
         // We are using `_exit` instead of `exit` to avoid running global destructors.
         // This is similar to what default rust panic handler does
         // when there `panic=abort`: it does `abort`.
@@ -169,7 +177,17 @@ fn terminate_on_panic() {
 
 fn verify_buck_out_dir(paths: &InvocationPaths) -> buck2_error::Result<()> {
     let path = paths.buck_out_path();
-    fs_util::create_dir_all(path.clone())?;
+
+    fs_util::create_dir_all(path.clone()).map_err(|e| {
+        e.tag([ErrorTag::InvalidBuckOut]).context(format!(
+            "Failed to create buck-out directory `{}`. \
+             The path or a parent directory may be on a stale mount, \
+             be a broken symlink, a file, or the project root may no longer be \
+             accessible. \
+             Try running `buck2 kill` and re-run your command.",
+            path,
+        ))
+    })?;
 
     const CACHEDIR_TAG_CONTENTS: &str = r#"Signature: 8a477f597d28d172789f06886806bc55
 # This file is a cache directory tag created by Buck2.
@@ -194,29 +212,26 @@ impl DaemonCommand {
         in_process: bool,
         listener_created: impl FnOnce() + Send,
     ) -> buck2_error::Result<()> {
-        let cgroup_tree = if self.has_cgroup {
+        let prepped_cgroups = if self.has_cgroup {
             // Note: It's important that we do this before daemonizing, as otherwise there may be
             // stray processes laying around in this cgroup
-            //
-            // FIXME(JakobDegen): It'd be better if we could do this even earlier, ideally spawning
-            // the daemon directly into the cgroup it's supposed to be in. With memory controllers
-            // enabled, moving an existing process is always a bit suspicious
-            Some(BuckCgroupTree::set_up_for_process(
-                &self.daemon_startup_config.resource_control,
-            )?)
+            Some(PreppedBuckCgroups::prep_current_process()?)
         } else {
             None
         };
         // NOTE: Do not create any threads before this point.
         //   Daemonize does not preserve threads.
 
-        daemon_lower_priority(self.skip_macos_qos)?;
+        daemon_lower_priority(
+            self.skip_macos_qos,
+            self.daemon_startup_config.macos_qos_class.as_deref(),
+        )?;
 
         // TODO(nga): this breaks relative paths in `--no-buckd`.
         //   `--no-buckd` should capture correct directories earlier.
         //   Or even better, client should set current directory to project root,
         //   and resolve all paths relative to original cwd.
-        fs_util::set_current_dir(paths.project_root().root())?;
+        fs_util::set_current_dir(paths.project_root().root()).categorize_internal()?;
 
         let server_init_ctx = BuckdServerInitPreferences {
             detect_cycles: buck2_env!("DICE_DETECT_CYCLES_UNSTABLE", type=DetectCycles)?,
@@ -227,6 +242,17 @@ impl DaemonCommand {
 
         let span = tracing::info_span!("daemon_listener");
         let span_guard = span.enter();
+
+        if buck2_env!(
+            "BUCK2_TEST_DAEMON_STARTUP_SIGNAL",
+            bool,
+            applicability = testing
+        )? {
+            #[cfg(unix)]
+            unsafe {
+                libc::raise(libc::SIGTERM);
+            }
+        }
 
         let daemon_dir = paths.daemon_dir()?;
         let pid_path = daemon_dir.buckd_pid();
@@ -249,13 +275,13 @@ impl DaemonCommand {
 
             Self::daemonize(stdout, stderr)?;
 
-            fs_util::write(&pid_path, format!("{}", process::id()))?;
+            fs_util::write(&pid_path, format!("{}", process::id())).categorize_internal()?;
 
             let pid = process::id();
             let process_info = DaemonProcessInfo {
                 pid: pid as i64,
                 endpoint: endpoint.to_string(),
-                version: BuckVersion::get().unique_id().to_owned(),
+                version: BuckVersion::get()?.unique_id().to_owned(),
                 auth_token,
             };
 
@@ -267,7 +293,7 @@ impl DaemonCommand {
 
             (listener, process_info, endpoint)
         } else {
-            fs_util::write(&pid_path, format!("{}", process::id()))?;
+            fs_util::write(&pid_path, format!("{}", process::id())).categorize_internal()?;
 
             if !in_process {
                 Self::redirect_output(stdout, stderr)?;
@@ -278,7 +304,7 @@ impl DaemonCommand {
             let process_info = DaemonProcessInfo {
                 pid: process::id() as i64,
                 endpoint: endpoint.to_string(),
-                version: BuckVersion::get().unique_id().to_owned(),
+                version: BuckVersion::get()?.unique_id().to_owned(),
                 auth_token,
             };
 
@@ -291,7 +317,7 @@ impl DaemonCommand {
         set_daemon_id_for_panics(daemon_id.dupe());
 
         tracing::info!("Starting Buck2 daemon");
-        tracing::info!("Version: {}", BuckVersion::get_version());
+        tracing::info!("Version: {}", BuckVersion::get_version()?);
         tracing::info!("PID: {}", process::id());
         tracing::info!("ID: {}", daemon_id);
         tracing::info!("Endpoint: {}", endpoint);
@@ -351,6 +377,31 @@ impl DaemonCommand {
             builder.max_blocking_threads(threads);
         }
 
+        // Enable the per-worker poll-time histogram, used for tokio telemetry.
+        //
+        // Tokio documents the cost of this as being 2 `Instant::new` calls per poll. Telemetry from
+        // real builds shows that we cap out at ~10k polls/sec/worker. With `Instant::new` being
+        // ~50ns, that puts the cost of these polls at 0.1% CPU, which is an acceptable cost to pay
+        // for the value of the telemetry.
+        //
+        // The histogram config is sized for `buck2_webconsole`'s display bands, which bin polls at
+        // decade boundaries between 1µs and 1s. `precision_exact(0)` gives one bucket per power of
+        // 2 (≈3 buckets per decade — finer than the bands but coarse enough to not blow up event
+        // log size); `min_value` and `max_value` pin the bucket range so we don't carry hundreds
+        // of empty buckets covering the sub-ns and >1-minute extremes that tokio's default range
+        // would include. End result: ~24 buckets per worker per snapshot instead of the default
+        // ~237 — a ~10x reduction in histogram payload.
+        builder.enable_metrics_poll_time_histogram();
+        builder.metrics_poll_time_histogram_configuration(
+            tokio::runtime::HistogramConfiguration::log(
+                tokio::runtime::LogHistogram::builder()
+                    .min_value(std::time::Duration::from_nanos(500))
+                    .max_value(std::time::Duration::from_secs(1))
+                    .precision_exact(0)
+                    .build(),
+            ),
+        );
+
         tracing::info!("Starting tokio runtime...");
 
         let rt = builder
@@ -390,6 +441,7 @@ impl DaemonCommand {
                 hard_shutdown_sender: hard_shutdown_sender.clone(),
             });
             let daemon_dir = paths.daemon_dir()?;
+            let project_root = paths.project_root().root().as_path().to_path_buf();
 
             listener.set_nonblocking(true)?;
             let listener = tokio::net::TcpListener::from_std(listener)?;
@@ -423,7 +475,7 @@ impl DaemonCommand {
                 delegate,
                 server_init_ctx,
                 process_info,
-                cgroup_tree,
+                prepped_cgroups,
                 daemon_constraints,
                 Box::pin(listener),
                 handle,
@@ -436,15 +488,14 @@ impl DaemonCommand {
 
             let checker_interval_seconds = self.checker_interval_seconds;
 
-            thread_spawn("check-daemon-dir", move || {
-                Self::check_daemon_dir_thread(
+            thread_spawn("check-daemon-dirs", move || {
+                Self::check_daemon_dirs_thread(
                     checker_interval_seconds,
                     daemon_dir,
+                    project_root,
                     hard_shutdown_sender,
                 )
             })?;
-
-            tracing::info!("Initialization complete, running the server.");
 
             select! {
                 res = buckd_server => {
@@ -462,37 +513,70 @@ impl DaemonCommand {
 
     /// We start a dedicated thread to periodically check that the files in the daemon
     /// dir still reflect that we are the current buckd and verify that when you connect
-    /// to the server it is our server.
+    /// to the server it is our server. Also checks that the project root is still
+    /// accessible.
     /// It gets a dedicated thread so that if somehow the main runtime gets all jammed up,
     /// this will still run (and presumably connecting to the server or our request would
     /// then fail and we'd do a hard shutdown).
-    fn check_daemon_dir_thread(
+    fn check_daemon_dirs_thread(
         checker_interval_seconds: u64,
         daemon_dir: DaemonDir,
+        project_root: PathBuf,
         hard_shutdown_sender: UnboundedSender<String>,
     ) {
-        let this_rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let checker_interval_seconds = buck2_env!(
+            "BUCK2_TESTING_CHECKER_INTERVAL_SECONDS",
+            type = u64,
+            applicability = testing
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(checker_interval_seconds);
 
-        this_rt.block_on(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(checker_interval_seconds)).await;
-                match verify_current_daemon(&daemon_dir) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        // This bit of code cannot relay errors, ignoring that we can't log
-                        // a warning is reasonable.
-                        let _ignored = buck2_client_ctx::eprintln!(
-                            "daemon verification failed, forcing shutdown: {:#}",
-                            e
-                        );
+        loop {
+            std::thread::sleep(Duration::from_secs(checker_interval_seconds));
+            match verify_current_daemon(&daemon_dir) {
+                Ok(()) => {}
+                Err(e) => {
+                    // This bit of code cannot relay errors, ignoring that we can't log
+                    // a warning is reasonable.
+                    let _ignored = buck2_client_ctx::eprintln!(
+                        "daemon verification failed, forcing shutdown: {:#}",
+                        e
+                    );
 
-                        // If this is already shutting down, we don't need to do it again.
-                        let _ignored = hard_shutdown_sender
-                            .unbounded_send("Daemon verification failed".to_owned());
-                    }
-                };
+                    // If this is already shutting down, we don't need to do it again.
+                    let _ignored = hard_shutdown_sender
+                        .unbounded_send("Daemon verification failed".to_owned());
+                }
+            };
+
+            // Check if the project root has gone stale. This is increasingly
+            // important as people use more temporary checkouts.
+            let dir_check = std::fs::metadata(&project_root);
+            if let Err(e) = dir_check {
+                let msg = format!(
+                    "Project root {} is no longer accessible: {:#}",
+                    project_root.display(),
+                    e
+                );
+                let _ignored = buck2_client_ctx::eprintln!("{}", msg);
+
+                let _ignored = soft_error!(
+                    "daemon_project_root_unavailable",
+                    buck2_error!(
+                        ErrorTag::MissingProjectRoot,
+                        "Project root `{}` is no longer accessible: {:#}",
+                        project_root.display(),
+                        e
+                    ),
+                    quiet: true,
+                    task: false,
+                );
+
+                let _ignored = hard_shutdown_sender.unbounded_send(msg);
             }
-        })
+        }
     }
 
     pub fn exec(
@@ -512,8 +596,12 @@ impl DaemonCommand {
             fs_util::write(
                 daemon_dir.buckd_error_log(),
                 serde_json::to_string(&buck2_data::ErrorReport::from(err))?,
-            )?;
+            )
+            .categorize_internal()?;
         }
+        // Flush PGO profile data on all daemon exit paths (graceful kill,
+        // dir mismatch, inactivity timeout, errors).
+        buck2_util::pgo::flush_pgo_profile();
         res
     }
 
@@ -532,8 +620,8 @@ impl DaemonCommand {
             let stdout_fd = libc::open_osfhandle(stdout.as_raw_handle() as isize, libc::O_RDWR);
             let stderr_fd = libc::open_osfhandle(stderr.as_raw_handle() as isize, libc::O_RDWR);
             if stdout_fd == -1 || stderr_fd == -1 {
-                return Err(buck2_error::buck2_error!(
-                    buck2_error::ErrorTag::DaemonRedirect,
+                return Err(buck2_error!(
+                    ErrorTag::DaemonRedirect,
                     "Can't get file descriptors for output files",
                 ));
             }
@@ -541,8 +629,8 @@ impl DaemonCommand {
             let stdout_exit_code = libc::dup2(stdout_fd, 1);
             let stderr_exit_code = libc::dup2(stderr_fd, 2);
             if stdout_exit_code == -1 || stderr_exit_code == -1 {
-                return Err(buck2_error::buck2_error!(
-                    buck2_error::ErrorTag::DaemonRedirect,
+                return Err(buck2_error!(
+                    ErrorTag::DaemonRedirect,
                     "Failed to redirect daemon output"
                 ));
             }
@@ -564,8 +652,8 @@ impl DaemonCommand {
     #[cfg(windows)]
     /// Restart current process in detached mode with '--dont-daemonize' flag.
     fn daemonize(_stdout: File, _stderr: File) -> buck2_error::Result<()> {
-        Err(buck2_error::buck2_error!(
-            buck2_error::ErrorTag::WindowsUnsupported,
+        Err(buck2_error!(
+            ErrorTag::WindowsUnsupported,
             "Cannot daemonize on Windows"
         ))
     }
@@ -596,7 +684,7 @@ mod tests {
     use buck2_server::daemon::server::BuckdServerDelegate;
     use buck2_server::daemon::server::BuckdServerInitPreferences;
     use dupe::Dupe;
-    use rand::RngCore;
+    use rand::Rng as _;
     use rand::SeedableRng;
     use tokio::runtime::Handle;
 

@@ -76,6 +76,22 @@ pub(crate) enum ConfiguredProvidersLabelArg<'v> {
     ProvidersLabel(&'v StarlarkConfiguredProvidersLabel),
 }
 
+/// ConfiguredProvidersLabelListArg is a type that can be used as an argument in starlark api for
+/// a list of configured provider labels
+#[derive(StarlarkTypeRepr, UnpackValue)]
+pub(crate) enum ConfiguredProvidersLabelListArg<'v> {
+    List(UnpackList<ConfiguredProvidersLabelArg<'v>>),
+    TargetSet(&'v StarlarkTargetSet<ConfiguredTargetNode>),
+}
+
+/// ConfiguredProvidersExprArg is a type that can be used as an argument in starlark api for
+/// a configured provider label expression (single or list)
+#[derive(StarlarkTypeRepr, UnpackValue)]
+pub(crate) enum ConfiguredProvidersExprArg<'v> {
+    One(ConfiguredProvidersLabelArg<'v>),
+    List(ConfiguredProvidersLabelListArg<'v>),
+}
+
 /// AnyProvidersLabelArg is a type that can be used as an argument in stalark api for
 /// a configured provider label or an unconfigured provider label
 #[derive(StarlarkTypeRepr, UnpackValue)]
@@ -113,29 +129,29 @@ impl<'v> ConfiguredProvidersLabelArg<'v> {
     }
 }
 
-impl<'v> AnyProvidersExprArg<'v> {
-    pub(crate) fn contains_unconfigured(&self) -> bool {
+impl<'v> ConfiguredProvidersExprArg<'v> {
+    pub(crate) fn unpack(&self) -> ProvidersExpr<ConfiguredProvidersLabel> {
         match self {
-            AnyProvidersExprArg::One(arg) => arg.is_unconfigured(),
-            AnyProvidersExprArg::List(arg) => arg.contains_unconfigured(),
-        }
-    }
-}
-
-impl<'v> AnyProvidersLabelArg<'v> {
-    fn is_unconfigured(&self) -> bool {
-        matches!(self, AnyProvidersLabelArg::Unconfigured(_))
-    }
-}
-
-impl<'v> AnyProvidersLabelListArg<'v> {
-    fn contains_unconfigured(&self) -> bool {
-        match self {
-            AnyProvidersLabelListArg::List(args) => {
-                args.items.iter().any(|arg| arg.is_unconfigured())
+            ConfiguredProvidersExprArg::One(arg) => {
+                ProvidersExpr::Literal(arg.configured_providers_label())
             }
-            AnyProvidersLabelListArg::StarlarkTargetSet(_) => true,
-            _ => false,
+            ConfiguredProvidersExprArg::List(ConfiguredProvidersLabelListArg::List(list)) => {
+                ProvidersExpr::Iterable(
+                    list.items
+                        .iter()
+                        .map(|arg| arg.configured_providers_label())
+                        .collect(),
+                )
+            }
+            ConfiguredProvidersExprArg::List(ConfiguredProvidersLabelListArg::TargetSet(
+                target_set,
+            )) => ProvidersExpr::Iterable(
+                target_set
+                    .0
+                    .iter()
+                    .map(|node| ConfiguredProvidersLabel::default_for(node.label().dupe()))
+                    .collect(),
+            ),
         }
     }
 }

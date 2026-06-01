@@ -17,8 +17,6 @@ enum ResolveAliasError {
     StatFormatNotSupported,
 }
 
-use std::collections::HashMap;
-use std::collections::HashSet;
 use std::fmt::Write;
 
 use buck2_cli_proto::TargetsRequest;
@@ -29,6 +27,8 @@ use buck2_core::pattern::pattern_type::TargetPatternExtra;
 use buck2_core::target::label::label::TargetLabel;
 use buck2_error::BuckErrorContext;
 use buck2_error::internal_error;
+use buck2_hash::StdBuckHashMap;
+use buck2_hash::StdBuckHashSet;
 use buck2_node::nodes::attributes::PACKAGE;
 use buck2_node::nodes::frontend::TargetGraphCalculation;
 use dice::DiceTransaction;
@@ -125,16 +125,14 @@ pub(crate) async fn targets_resolve_aliases(
     let packages = parsed_target_patterns
         .iter()
         .map(|(package, _name)| package.dupe())
-        .collect::<HashSet<_>>();
+        .collect::<StdBuckHashSet<_>>();
 
-    let packages: HashMap<_, _> = dice
+    let packages: StdBuckHashMap<_, _> = dice
         .compute_join(packages, |ctx: &mut _, package| {
             async move {
                 (
                     package.dupe(),
-                    ctx.get_interpreter_results(package.dupe())
-                        .await
-                        .map_err(buck2_error::Error::from),
+                    ctx.get_interpreter_results(package.dupe()).await,
                 )
             }
             .boxed()
@@ -175,7 +173,13 @@ pub(crate) async fn targets_resolve_aliases(
         // validate it exists.
         let node = packages
             .get(package)
-            .with_buck_error_context(|| format!("Package does not exist: `{package}`"))
+            .ok_or_else(|| {
+                buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Input,
+                    "Package does not exist: `{}`",
+                    package
+                )
+            })
             .and_then(|package_data| {
                 package_data
                     .as_ref()
@@ -194,7 +198,7 @@ pub(crate) async fn targets_resolve_aliases(
             formatter.separator(&mut buffer);
         }
         needs_separator = true;
-        formatter.emit(&alias, node.label(), &mut buffer);
+        formatter.emit(alias, node.label(), &mut buffer);
     }
 
     formatter.end(&mut buffer);

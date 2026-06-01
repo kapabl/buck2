@@ -15,6 +15,7 @@ use crate::response::TActionResult2;
 #[derive(Default)]
 pub struct ActionResultRequest {
     pub digest: TDigest,
+    pub platform: Option<TPlatform>,
     pub _dot_dot: (),
 }
 
@@ -88,6 +89,36 @@ pub struct ExecuteRequest {
     pub skip_cache_lookup: bool,
     pub execution_policy: Option<TExecutionPolicy>,
     pub host_runtime_requirements: THostRuntimeRequirements,
+    pub gang: Option<GangSpecification>,
+    pub _dot_dot: (),
+}
+
+#[derive(Clone)]
+pub struct GangSpecification {
+    pub workers_spec: GangWorkersSpec,
+    pub _dot_dot: (),
+}
+
+#[derive(Clone)]
+pub enum GangWorkersSpec {
+    EnumeratedSpec(EnumeratedGangSpec),
+}
+
+impl GangWorkersSpec {
+    pub fn enumerated_spec(spec: EnumeratedGangSpec) -> Self {
+        GangWorkersSpec::EnumeratedSpec(spec)
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct EnumeratedGangSpec {
+    pub workers: Vec<GangMember>,
+    pub _dot_dot: (),
+}
+
+#[derive(Clone, Default)]
+pub struct GangMember {
+    pub host_runtime_requirements: THostRuntimeRequirements,
     pub _dot_dot: (),
 }
 
@@ -128,5 +159,6 @@ pub struct THostRuntimeRequirements {
 pub struct WriteActionResultRequest {
     pub action_digest: TDigest,
     pub action_result: TActionResult2,
+    pub platform: Option<TPlatform>,
     pub _dot_dot: (),
 }

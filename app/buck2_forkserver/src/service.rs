@@ -22,6 +22,7 @@ use std::sync::Arc;
 use buck2_common::convert::ProstDurationExt;
 use buck2_core::logging::LogConfigurationReloadHandle;
 use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_execute_local::DefaultKillProcess;
 use buck2_execute_local::GatherOutputStatus;
 use buck2_execute_local::StdRedirectPaths;
@@ -34,6 +35,7 @@ use buck2_forkserver_proto::RequestEvent;
 use buck2_forkserver_proto::SetLogFilterRequest;
 use buck2_forkserver_proto::SetLogFilterResponse;
 use buck2_forkserver_proto::forkserver_server::Forkserver;
+use buck2_fs::error::IoResultExt;
 use buck2_fs::fs_util;
 use buck2_fs::paths::abs_norm_path::AbsNormPath;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
@@ -48,8 +50,8 @@ use futures::FutureExt;
 use futures::pin_mut;
 use futures::stream::Stream;
 use futures::stream::StreamExt;
-use rand::distributions::Alphanumeric;
-use rand::distributions::DistString;
+use rand::distr::Alphanumeric;
+use rand::distr::SampleString;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -74,6 +76,8 @@ struct ValidatedCommand {
     std_redirects: Option<StdRedirectPaths>,
     graceful_shutdown_timeout_s: Option<u32>,
     command_cgroup: Option<CgroupPathBuf>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    network_access: Option<buck2_data::NetworkAccess>,
 }
 
 impl ValidatedCommand {
@@ -88,10 +92,15 @@ impl ValidatedCommand {
             std_redirects,
             graceful_shutdown_timeout_s,
             command_cgroup,
+            network_access,
         } = cmd_request;
 
         let exe = OsStr::from_bytes(&exe);
-        let cwd = OsStr::from_bytes(&cwd.as_ref().buck_error_context("Missing cwd")?.path);
+        let cwd = OsStr::from_bytes(
+            &cwd.as_ref()
+                .ok_or_else(|| internal_error!("Missing cwd"))?
+                .path,
+        );
         let cwd = AbsPath::new(Path::new(cwd)).buck_error_context("Invalid cwd")?;
 
         let timeout = timeout
@@ -122,6 +131,10 @@ impl ValidatedCommand {
             std_redirects,
             graceful_shutdown_timeout_s,
             command_cgroup,
+            network_access: network_access
+                .map(buck2_data::NetworkAccess::try_from)
+                .transpose()
+                .map_err(|v| internal_error!("Invalid network_access value: {}", v))?,
         })
     }
 }
@@ -153,7 +166,7 @@ impl UnixForkserverService {
             .await?
             .and_then(|m| m.data)
             .and_then(|m| m.into_command_request())
-            .buck_error_context("RequestEvent was not a CommandRequest!")?;
+            .ok_or_else(|| internal_error!("RequestEvent was not a CommandRequest!"))?;
         Ok(cmd_request)
     }
 
@@ -167,7 +180,7 @@ impl UnixForkserverService {
             match directive
                 .data
                 .as_ref()
-                .buck_error_context("EnvDirective is missing data")?
+                .ok_or_else(|| internal_error!("EnvDirective is missing data"))?
             {
                 Data::Clear(..) => {
                     cmd.env_clear();
@@ -204,6 +217,31 @@ impl UnixForkserverService {
         cmd.args(validated_cmd.argv.iter().map(|a| OsStr::from_bytes(a)));
 
         Self::configure_environment(&mut cmd, &validated_cmd.env)?;
+
+        #[cfg(target_os = "linux")]
+        if validated_cmd
+            .network_access
+            .is_some_and(is_restricted_network_access)
+        {
+            #[cfg(fbcode_build)]
+            {
+                cmd.env("INSIDE_NETWORK_ISOLATION", "1");
+                cmd.env("DOTSLASH_OFFLINE", "1");
+            }
+
+            use std::os::unix::process::CommandExt;
+            // Safety: unshare() is async-signal-safe.
+            // It only makes a single syscall with no memory allocation.
+            unsafe {
+                cmd.pre_exec(|| {
+                    nix::sched::unshare(
+                        nix::sched::CloneFlags::CLONE_NEWUSER
+                            | nix::sched::CloneFlags::CLONE_NEWNET,
+                    )
+                    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
+                });
+            }
+        }
 
         // cmd: ready-to-spawn process command
         // miniperf_output: path to miniperf output file (if monitoring)
@@ -259,6 +297,17 @@ impl UnixForkserverService {
 
         let stream = encode_event_stream(stream);
         Ok(Box::pin(stream) as _)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_restricted_network_access(network_access: buck2_data::NetworkAccess) -> bool {
+    match network_access {
+        buck2_data::NetworkAccess::All => false,
+        buck2_data::NetworkAccess::None
+        | buck2_data::NetworkAccess::Loopback
+        | buck2_data::NetworkAccess::Strict
+        | buck2_data::NetworkAccess::Private => true,
     }
 }
 
@@ -375,8 +424,8 @@ impl MiniperfContainer {
         let miniperf = forkserver_state_dir.join(ForwardRelativePath::unchecked_new("miniperf"));
         let output_dir = forkserver_state_dir.join(ForwardRelativePath::unchecked_new("out"));
 
-        fs_util::remove_all(&miniperf)?;
-        fs_util::remove_all(&output_dir)?;
+        fs_util::remove_all(&miniperf).categorize_internal()?;
+        fs_util::remove_all(&output_dir).categorize_internal()?;
         fs_util::create_dir_all(&output_dir)?;
 
         let mut opts = OpenOptions::new();
@@ -403,7 +452,7 @@ impl MiniperfContainer {
     }
 
     fn allocate_output_path(&self) -> AbsNormPathBuf {
-        let name = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
+        let name = Alphanumeric.sample_string(&mut rand::rng(), 16);
         self.output_dir
             .join(ForwardRelativePath::unchecked_new(&name))
     }

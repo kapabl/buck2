@@ -28,10 +28,12 @@ use allocative::Allocative;
 use dupe::Dupe;
 use starlark_derive::NoSerialize;
 use starlark_derive::ProvidesStaticType;
+use starlark_derive::StarlarkPagable;
 use starlark_derive::starlark_value;
 
 use crate as starlark;
 use crate::private::Private;
+use crate::static_starlark_value;
 use crate::typing::ParamSpec;
 use crate::typing::Ty;
 use crate::typing::TyBasic;
@@ -49,10 +51,6 @@ use crate::values::Trace;
 use crate::values::Tracer;
 use crate::values::UnpackValue;
 use crate::values::Value;
-use crate::values::layout::avalue::AValueBasic;
-use crate::values::layout::avalue::AValueImpl;
-use crate::values::layout::avalue::alloc_static;
-use crate::values::layout::heap::repr::AValueRepr;
 use crate::values::list::UnpackList;
 use crate::values::type_repr::StarlarkTypeRepr;
 use crate::values::typing::TypeCompiled;
@@ -64,7 +62,8 @@ use crate::values::typing::callable::param::StarlarkCallableParamSpec;
     derive_more::Display,
     Allocative,
     ProvidesStaticType,
-    NoSerialize
+    NoSerialize,
+    StarlarkPagable
 )]
 #[display("{}", Self::TYPE)]
 pub(crate) struct TypingCallable;
@@ -79,7 +78,7 @@ impl<'v> StarlarkValue<'v> for TypingCallable {
         &self,
         param_types: Value<'v>,
         ret: Value<'v>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
         _private: Private,
     ) -> crate::Result<Value<'v>> {
         let param_types = UnpackList::<Value>::unpack_value_err(param_types)?;
@@ -96,12 +95,11 @@ impl<'v> StarlarkValue<'v> for TypingCallable {
     }
 }
 
+static_starlark_value!(CALLABLE: TypingCallable = TypingCallable);
+
 impl AllocFrozenValue for TypingCallable {
     fn alloc_frozen_value(self, _heap: &FrozenHeap) -> FrozenValue {
-        static CALLABLE: AValueRepr<AValueImpl<'static, AValueBasic<TypingCallable>>> =
-            alloc_static(TypingCallable);
-
-        FrozenValue::new_repr(&CALLABLE)
+        CALLABLE.to_frozen_value()
     }
 }
 
@@ -110,10 +108,12 @@ impl AllocFrozenValue for TypingCallable {
     Debug,
     ProvidesStaticType,
     NoSerialize,
-    derive_more::Display
+    derive_more::Display,
+    StarlarkPagable
 )]
 #[display("{}", callable)]
 pub(crate) struct TypingCallableAt2 {
+    #[starlark_pagable(pagable)]
     callable: TyCallable,
 }
 
@@ -207,7 +207,7 @@ impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> UnpackValue<'v>
 impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> AllocValue<'v>
     for StarlarkCallable<'v, P, R>
 {
-    fn alloc_value(self, _heap: &'v Heap) -> Value<'v> {
+    fn alloc_value(self, _heap: Heap<'v>) -> Value<'v> {
         self.0
     }
 }
@@ -215,6 +215,7 @@ impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> AllocValue<'v>
 /// Marker for a callable value.
 #[derive(Allocative)]
 #[allocative(bound = "")]
+#[derive(StarlarkPagable)]
 pub struct FrozenStarlarkCallable<
     P: StarlarkCallableParamSpec = StarlarkCallableParamAny,
     R: StarlarkTypeRepr = FrozenValue,
@@ -360,7 +361,7 @@ unsafe impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> Trace<'v>
 impl<'v, P: StarlarkCallableParamSpec, R: StarlarkTypeRepr> AllocValue<'v>
     for StarlarkCallableChecked<'v, P, R>
 {
-    fn alloc_value(self, _heap: &'v Heap) -> Value<'v> {
+    fn alloc_value(self, _heap: Heap<'v>) -> Value<'v> {
         self.0
     }
 }

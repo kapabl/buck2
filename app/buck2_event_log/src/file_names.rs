@@ -9,7 +9,7 @@
  */
 
 use buck2_common::invocation_paths::InvocationPaths;
-use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_events::BuckEvent;
 use buck2_fs::fs_util;
 use buck2_fs::paths::abs_norm_path::AbsNormPath;
@@ -71,7 +71,7 @@ pub fn get_local_logs(logdir: &AbsNormPath) -> buck2_error::Result<Vec<EventLogP
         .collect())
 }
 
-fn sort_logs(dir: fs_util::ReadDir) -> Vec<AbsNormPathBuf> {
+fn sort_logs(dir: buck2_fs::fs_util::ReadDir) -> Vec<AbsNormPathBuf> {
     let mut logfiles = dir
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().ok().is_some_and(|ft| ft.is_file()))
@@ -105,7 +105,8 @@ pub fn do_find_log_by_trace_id(
     log_dir: &AbsNormPath,
     trace_id: &TraceId,
 ) -> buck2_error::Result<EventLogPathBuf> {
-    find_log_by_trace_id(log_dir, trace_id)?.buck_error_context("Error finding log by trace id")
+    find_log_by_trace_id(log_dir, trace_id)?
+        .ok_or_else(|| internal_error!("Error finding log by trace id"))
 }
 
 pub fn retrieve_nth_recent_log(
@@ -137,7 +138,7 @@ mod tests {
     use std::time::Duration;
     use std::time::SystemTime;
 
-    use buck2_fs::fs_util;
+    use buck2_fs::fs_util::uncategorized as fs_util;
     use buck2_fs::paths::abs_norm_path::AbsNormPath;
     use buck2_fs::paths::abs_path::AbsPath;
 
@@ -179,7 +180,7 @@ mod tests {
         }
 
         // Call the function to keep 3 logs (should delete 3 oldest, leave 2 newest)
-        remove_old_logs(&logdir_norm, 3).await;
+        remove_old_logs(logdir_norm, 3).await;
 
         // Check that the 3 oldest logs are removed (indices 0,1,2 - earliest created)
         for path in &log_paths[0..3] {

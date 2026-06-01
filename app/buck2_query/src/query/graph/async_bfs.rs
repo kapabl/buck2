@@ -10,7 +10,6 @@
 
 use std::future;
 
-use buck2_error::BuckErrorContext;
 use buck2_error::internal_error;
 use futures::StreamExt;
 use futures::future::Either;
@@ -39,7 +38,7 @@ impl<N: LabeledNode + 'static> BfsVisited<N> {
         let node = self
             .visited
             .remove(last)
-            .with_internal_error(|| format!("missing node {last}"))?;
+            .ok_or_else(|| internal_error!("missing node {last}"))?;
         if node.node.is_some() {
             return Err(internal_error!("duplicate node {}", last));
         }
@@ -48,10 +47,10 @@ impl<N: LabeledNode + 'static> BfsVisited<N> {
             let node = self
                 .visited
                 .remove(&key)
-                .with_internal_error(|| format!("missing node {key}"))?;
+                .ok_or_else(|| internal_error!("missing node {key}"))?;
             item(
                 node.node
-                    .with_internal_error(|| format!("missing node {key}"))?,
+                    .ok_or_else(|| internal_error!("missing node {key}"))?,
             );
             parent_key = node.parent;
         }
@@ -145,7 +144,7 @@ pub(crate) async fn async_bfs_find_path<'a, N: LabeledNode + 'static>(
                 let prev = visited
                     .visited
                     .get_mut(&key)
-                    .with_internal_error(|| format!("missing node {key}"))?
+                    .ok_or_else(|| internal_error!("missing node {key}"))?
                     .node
                     .replace(node);
                 if prev.is_some() {
@@ -169,10 +168,9 @@ pub(crate) async fn async_bfs_find_path<'a, N: LabeledNode + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::collections::HashSet;
-
     use async_trait::async_trait;
+    use buck2_hash::StdBuckHashMap;
+    use buck2_hash::StdBuckHashSet;
     use buck2_query::query::traversal::ChildVisitor;
     use dupe::Dupe;
     use gazebo::prelude::VecExt;
@@ -201,8 +199,8 @@ mod tests {
 
     #[derive(Default)]
     struct TestGraph {
-        successors: HashMap<u32, Vec<u32>>,
-        errors: HashSet<u32>,
+        successors: StdBuckHashMap<u32, Vec<u32>>,
+        errors: StdBuckHashSet<u32>,
     }
 
     impl TestGraph {

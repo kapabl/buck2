@@ -20,7 +20,9 @@ use buck2_util::arc_str::ArcStr;
 use derive_more::Display;
 use dupe::Dupe;
 use gazebo::prelude::SliceExt;
+use pagable::Pagable;
 use static_assertions::assert_eq_size;
+use strong_hash::StrongHash;
 
 use crate::attrs::attr_type::query::QueryMacroBase;
 use crate::attrs::coerced_path::CoercedPath;
@@ -28,7 +30,27 @@ use crate::attrs::configuration_context::AttrConfigurationContext;
 use crate::attrs::configured_traversal::ConfiguredAttrTraversal;
 use crate::attrs::traversal::CoercedAttrTraversal;
 
-#[derive(Debug, Eq, PartialEq, Hash, Clone, Copy, Dupe, Allocative)]
+#[derive(Debug, buck2_error::Error)]
+#[buck2(input)]
+enum StringMacroTraversalError {
+    #[error("Expected a package when traversing string macro: `{0}`.")]
+    NoPackageForSource(String),
+}
+
+/// The kind of dependency for a macro like `$(location ...)` or `$(exe ...)`.
+#[derive(
+    Debug, Eq, PartialEq, Hash, Clone, Copy, Dupe, Allocative, Pagable, StrongHash
+)]
+pub enum MacroDepKind {
+    /// Regular target dependency (configured with target configuration).
+    Regular,
+    /// Execution dependency (configured with exec configuration).
+    Exec,
+    /// Toolchain dependency (configured with toolchain configuration).
+    Toolchain,
+}
+
+#[derive(Debug, Eq, PartialEq, Hash, Clone, Copy, Dupe, Allocative, Pagable)]
 pub struct ArgAttrType {
     pub anon_target_compatible: bool,
 }
@@ -37,7 +59,7 @@ pub struct ArgAttrType {
 /// forms). The parsed arg string is held as a sequence of parts (each part either a literal string or a macro). When
 /// being added to a command line, these parts will be concattenated together and added as a single arg.
 /// Each variant takes in a boolean which determines if the resolved form should be compatible with anon targets.
-#[derive(Debug, Eq, PartialEq, Hash, Clone, Allocative, strong_hash::StrongHash)]
+#[derive(Debug, Eq, PartialEq, Hash, Clone, Allocative, Pagable, StrongHash)]
 pub enum StringWithMacros<P: ProvidersLabelMaybeConfigured> {
     /// Semantically, StringWithMacros::StringPart(s) is equivalent to
     /// StringWithMacros::ManyParts(vec![StringWithMacrosPart::String(s)]). We special-case this
@@ -119,7 +141,7 @@ impl StringWithMacros<ProvidersLabel> {
     pub(crate) fn traverse<'a>(
         &'a self,
         traversal: &mut dyn CoercedAttrTraversal<'a>,
-        pkg: PackageLabel,
+        pkg: Option<PackageLabel>,
     ) -> buck2_error::Result<()> {
         match self {
             Self::StringPart(..) => {}
@@ -139,7 +161,7 @@ impl StringWithMacros<ProvidersLabel> {
     }
 }
 
-#[derive(Debug, Eq, PartialEq, Hash, Clone, Allocative, strong_hash::StrongHash)]
+#[derive(Debug, Eq, PartialEq, Hash, Clone, Allocative, Pagable, StrongHash)]
 pub enum StringWithMacrosPart<P: ProvidersLabelMaybeConfigured> {
     String(ArcStr),
     Macro(/* write_to_file */ bool, MacroBase<P>),
@@ -148,17 +170,17 @@ pub enum StringWithMacrosPart<P: ProvidersLabelMaybeConfigured> {
 assert_eq_size!(MacroBase<ProvidersLabel>, [usize; 3]);
 assert_eq_size!(StringWithMacrosPart<ProvidersLabel>, [usize; 4]);
 
-#[derive(Debug, Eq, PartialEq, Hash, Clone, Allocative, strong_hash::StrongHash)]
+#[derive(Debug, Eq, PartialEq, Hash, Clone, Allocative, Pagable, StrongHash)]
 pub struct UnrecognizedMacro {
     pub macro_type: Box<str>,
     pub args: Box<[String]>,
 }
 
-#[derive(Debug, Eq, PartialEq, Hash, Clone, Allocative, strong_hash::StrongHash)]
+#[derive(Debug, Eq, PartialEq, Hash, Clone, Allocative, Pagable, StrongHash)]
 pub enum MacroBase<P: ProvidersLabelMaybeConfigured> {
     Location {
         label: P,
-        exec_dep: bool,
+        dep_kind: MacroDepKind,
     },
     /// Represents both $(exe) and $(exe_target) usages.
     Exe {
@@ -191,11 +213,15 @@ impl MacroBase<ConfiguredProvidersLabel> {
             MacroBase::UserKeyedPlaceholder(box (_, l, _)) => traversal.dep(l),
             MacroBase::Location {
                 label,
-                exec_dep: true,
+                dep_kind: MacroDepKind::Exec,
             } => traversal.exec_dep(label),
             MacroBase::Location {
                 label,
-                exec_dep: false,
+                dep_kind: MacroDepKind::Toolchain,
+            } => traversal.toolchain_dep(label),
+            MacroBase::Location {
+                label,
+                dep_kind: MacroDepKind::Regular,
             } => traversal.dep(label),
             MacroBase::Exe {
                 label,
@@ -223,13 +249,13 @@ impl MacroBase<ProvidersLabel> {
         ctx: &dyn AttrConfigurationContext,
     ) -> buck2_error::Result<ConfiguredMacro> {
         Ok(match self {
-            UnconfiguredMacro::Location { label, exec_dep } => ConfiguredMacro::Location {
-                label: if *exec_dep {
-                    ctx.configure_exec_target(label)?
-                } else {
-                    ctx.configure_target(label)
+            UnconfiguredMacro::Location { label, dep_kind } => ConfiguredMacro::Location {
+                label: match dep_kind {
+                    MacroDepKind::Exec => ctx.configure_exec_target(label)?,
+                    MacroDepKind::Toolchain => ctx.configure_toolchain_target(label),
+                    MacroDepKind::Regular => ctx.configure_target(label),
                 },
-                exec_dep: *exec_dep,
+                dep_kind: *dep_kind,
             },
             UnconfiguredMacro::Exe { label, exec_dep } => ConfiguredMacro::Exe {
                 label: if *exec_dep {
@@ -262,17 +288,21 @@ impl MacroBase<ProvidersLabel> {
     pub fn traverse<'a>(
         &'a self,
         traversal: &mut dyn CoercedAttrTraversal<'a>,
-        pkg: PackageLabel,
+        pkg: Option<PackageLabel>,
     ) -> buck2_error::Result<()> {
         match self {
             MacroBase::UserKeyedPlaceholder(box (_, l, _)) => traversal.dep(l),
             MacroBase::Location {
                 label,
-                exec_dep: true,
+                dep_kind: MacroDepKind::Exec,
             } => traversal.exec_dep(label),
             MacroBase::Location {
                 label,
-                exec_dep: false,
+                dep_kind: MacroDepKind::Toolchain,
+            } => traversal.toolchain_dep(label),
+            MacroBase::Location {
+                label,
+                dep_kind: MacroDepKind::Regular,
             } => traversal.dep(label),
             MacroBase::Exe {
                 label,
@@ -284,6 +314,9 @@ impl MacroBase<ProvidersLabel> {
             } => traversal.dep(label),
             MacroBase::Query(query) => query.traverse(traversal),
             MacroBase::Source(path) => {
+                let pkg = pkg.ok_or_else(|| {
+                    StringMacroTraversalError::NoPackageForSource(path.path().to_string())
+                })?;
                 for x in path.inputs() {
                     traversal.input(SourcePathRef::new(pkg.dupe(), x))?;
                 }
@@ -305,14 +338,7 @@ pub type ConfiguredStringWithMacrosPart = StringWithMacrosPart<ConfiguredProvide
 pub type UnconfiguredStringWithMacros = StringWithMacros<ProvidersLabel>;
 
 #[derive(
-    Debug,
-    Eq,
-    PartialEq,
-    Hash,
-    Clone,
-    Allocative,
-    Display,
-    strong_hash::StrongHash
+    Debug, Eq, PartialEq, Hash, Clone, Allocative, Display, StrongHash, Pagable
 )]
 #[display("{}", string_with_macros)]
 pub struct ConfiguredStringWithMacros {
@@ -326,14 +352,14 @@ impl<P: ProvidersLabelMaybeConfigured> Display for MacroBase<P> {
         // TODO: this should re-escape values in the args that need to be escaped to have returned that arg (it's not possible
         // to tell where there were unnecessary escapes and it's not worth tracking that).
         match self {
-            MacroBase::Location { label, exec_dep } => {
+            MacroBase::Location { label, dep_kind } => {
                 write!(
                     f,
                     "{} {}",
-                    if *exec_dep {
-                        "location_exec"
-                    } else {
-                        "location"
+                    match dep_kind {
+                        MacroDepKind::Exec => "location_exec",
+                        MacroDepKind::Toolchain => "location_toolchain",
+                        MacroDepKind::Regular => "location",
                     },
                     label
                 )
@@ -412,7 +438,7 @@ impl<P: ProvidersLabelMaybeConfigured> Display for StringWithMacros<P> {
 }
 
 /// Represents the type of a query placeholder (e.g. query_outputs, query_targets, query_targets_and_outputs).
-#[derive(Debug, Eq, PartialEq, Hash, Clone, Allocative, strong_hash::StrongHash)]
+#[derive(Debug, Eq, PartialEq, Hash, Clone, Allocative, Pagable, StrongHash)]
 pub enum QueryExpansion {
     Output,
     Target,

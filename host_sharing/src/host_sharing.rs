@@ -10,11 +10,13 @@
 
 use std::fmt;
 use std::iter;
+use std::sync::Arc;
 
 use allocative::Allocative;
 use anyhow::Context;
 use futures_intrusive::sync::SharedSemaphore;
 use futures_intrusive::sync::SharedSemaphoreReleaser;
+use pagable::Pagable;
 use starlark_map::sorted_vec::SortedVec;
 
 use crate::NamedSemaphores;
@@ -30,7 +32,7 @@ const SINGLE_RUN: usize = 1;
 /// on Sandcastle machines with 56 cores so we want to move away from the core-analogy and instead use
 /// the term "permits" to describe the limited resources available on each machine.
 /// More long term we want improve this to also take into account memory usage, cpu usage etc.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Allocative, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Allocative, Hash, Pagable)]
 pub enum WeightClass {
     /// Tests can require any number of permits and this can be used to mimic resource utilization like
     /// memory or cpu. For now, we map the Testpilot behaviour as Normal->Permits(1) and Heavy->Permits(4).
@@ -48,7 +50,7 @@ impl fmt::Display for WeightClass {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Allocative, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Allocative, Hash, Pagable)]
 pub struct WeightPercentage {
     value: u8, // Between 0 and 100
 }
@@ -82,7 +84,7 @@ impl WeightPercentage {
 /// to check for other instances of the same binary.
 /// Some commands required the full host to run, others just dont care.
 /// This enum encapsulates all the different scenarios.
-#[derive(Debug, Clone, PartialEq, Eq, Allocative, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Allocative, Hash, Pagable)]
 pub enum HostSharingRequirements {
     /// Needs exclusive access to the host. No other processes should run.
     ExclusiveAccess,
@@ -127,7 +129,7 @@ pub struct HostSharingGuard {
 pub struct HostSharingBroker {
     permits: SharedSemaphore,
     num_machine_permits: usize,
-    named_semaphores: NamedSemaphores,
+    named_semaphores: Arc<NamedSemaphores>,
 }
 
 pub struct RequestedPermits {
@@ -163,7 +165,11 @@ impl HostSharingBroker {
         }
     }
 
-    pub fn new(host_sharing_strategy: HostSharingStrategy, num_machine_permits: usize) -> Self {
+    pub fn new_with_named_semaphores(
+        host_sharing_strategy: HostSharingStrategy,
+        num_machine_permits: usize,
+        named_semaphores: Arc<NamedSemaphores>,
+    ) -> Self {
         let permits = match host_sharing_strategy {
             HostSharingStrategy::Fifo => SharedSemaphore::new(true, num_machine_permits),
             HostSharingStrategy::SmallerTasksFirst => {
@@ -174,8 +180,16 @@ impl HostSharingBroker {
         Self {
             permits,
             num_machine_permits,
-            named_semaphores: NamedSemaphores::new(),
+            named_semaphores,
         }
+    }
+
+    pub fn new(host_sharing_strategy: HostSharingStrategy, num_machine_permits: usize) -> Self {
+        Self::new_with_named_semaphores(
+            host_sharing_strategy,
+            num_machine_permits,
+            Arc::new(NamedSemaphores::new()),
+        )
     }
 
     pub fn num_machine_permits(&self) -> usize {

@@ -36,9 +36,9 @@ pub struct AnalysisQueryResult {
 /// The context for attribute resolution. Provides access to the providers from
 /// dependents.
 pub trait AttrResolutionContext<'v> {
-    fn starlark_module(&self) -> &'v Module;
+    fn starlark_module(&self) -> &Module<'v>;
 
-    fn heap(&self) -> &'v Heap {
+    fn heap(&self) -> Heap<'v> {
         self.starlark_module().heap()
     }
 

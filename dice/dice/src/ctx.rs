@@ -13,16 +13,17 @@ use std::sync::Arc;
 
 use allocative::Allocative;
 use dice_error::DiceResult;
-use futures::FutureExt;
+use dice_futures::cancellation::CancellationContext;
 use futures::future::BoxFuture;
 
 use crate::LinearRecomputeDiceComputations;
+use crate::OpaqueValue;
 use crate::ProjectionKey;
 use crate::api::computations::DiceComputations;
+use crate::api::computations::DiceComputationsData;
 use crate::api::data::DiceData;
 use crate::api::invalidation_tracking::DiceKeyTrackedInvalidationPaths;
 use crate::api::key::Key;
-use crate::api::opaque::OpaqueValue;
 use crate::api::user_data::UserComputationData;
 use crate::api::user_data::UserCycleDetectorGuard;
 use crate::impls::ctx::LinearRecomputeModern;
@@ -60,9 +61,7 @@ impl DiceComputationsImpl<'_> {
     where
         K: Key,
     {
-        self.0
-            .compute_opaque(key)
-            .map(|r| r.map(|x| OpaqueValue::new(x)))
+        self.0.compute_opaque(key)
     }
 
     pub fn projection<K: Key, P: ProjectionKey<DeriveFromKey = K>>(
@@ -70,15 +69,14 @@ impl DiceComputationsImpl<'_> {
         derive_from: &OpaqueValue<K>,
         projection_key: &P,
     ) -> DiceResult<P::Value> {
-        self.0
-            .projection(&derive_from.implementation, projection_key)
+        self.0.projection(derive_from, projection_key)
     }
 
     pub fn opaque_into_value<K: Key>(
         &mut self,
         derive_from: OpaqueValue<K>,
     ) -> DiceResult<K::Value> {
-        Ok(self.0.opaque_into_value(derive_from.implementation))
+        Ok(self.0.opaque_into_value(derive_from))
     }
 
     /// Computes all the given tasks in parallel, returning an unordered Stream
@@ -137,6 +135,25 @@ impl DiceComputationsImpl<'_> {
         self.0.with_linear_recompute(func)
     }
 
+    /// Spawn a computation on a new tokio task.
+    ///
+    /// See [`DiceComputations::spawned`](crate::api::computations::DiceComputations::spawned) for details.
+    pub fn spawned<'a, T, Compute>(
+        &'a mut self,
+        closure: Compute,
+    ) -> impl Future<Output = T> + use<'a, Compute, T>
+    where
+        T: Send + 'static,
+        Compute: (for<'x> FnOnce(
+                &'x mut DiceComputations<'_>,
+                &'x CancellationContext,
+            ) -> BoxFuture<'x, T>)
+            + Send
+            + 'static,
+    {
+        self.0.spawned(closure)
+    }
+
     /// Data that is static per the entire lifetime of Dice. These data are initialized at the
     /// time that Dice is initialized via the constructor.
     pub(crate) fn global_data(&self) -> &DiceData {
@@ -165,6 +182,10 @@ impl DiceComputationsImpl<'_> {
 
     pub fn get_invalidation_paths(&mut self) -> DiceKeyTrackedInvalidationPaths {
         self.0.get_invalidation_paths()
+    }
+
+    pub(crate) fn data(&self) -> DiceComputationsData {
+        self.0.data()
     }
 }
 

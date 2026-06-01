@@ -116,7 +116,7 @@ impl<'v> GlobalValue<'v> {
 
 struct GlobalTypesBuilder<'a, 'v> {
     approximations: &'a mut Vec<Approximation>,
-    heap: &'v Heap,
+    heap: Heap<'v>,
     values: UnorderedMap<ModuleSlotId, GlobalValue<'v>>,
     errors: Vec<TypingError>,
     module_scope_data: &'a ModuleScopeData<'a>,
@@ -591,28 +591,34 @@ impl<'a, 'v> GlobalTypesBuilder<'a, 'v> {
             }
             TypeExprUnpackP::Path(path) => self.path_ty(path),
             TypeExprUnpackP::Index(a, i) => {
+                let i = self.from_type_expr_impl(i)?;
                 match self.expr_ident(a)?.value {
                     Some(a) => {
-                        if !a.ptr_eq(Constants::get().fn_list.0.to_value()) {
-                            self.approximations.push(Approximation::new("Not list", x));
-                            return Ok(Ty::any());
-                        }
-                        let i = self.from_type_expr_impl(i)?;
-                        let i = TypeCompiled::from_ty(&i, self.heap);
-                        match a.get_ref().at(i.to_inner(), self.heap) {
-                            Ok(t) => match TypeCompiled::new(t, self.heap) {
-                                Ok(ty) => Ok(ty.as_ty().clone()),
-                                Err(_) => {
-                                    // TODO(nga): proper error, not approximation.
-                                    self.approximations
-                                        .push(Approximation::new("TypeCompiled::new failed", x));
+                        // Built-in generic types (list, set) are special-cased because they
+                        // are functions, not types, so they lack eval_type(). Their
+                        // parameterization is handled directly via Ty constructors.
+                        if a.ptr_eq(Constants::get().fn_list.0.to_value()) {
+                            Ok(Ty::list(i))
+                        } else {
+                            let i_compiled = TypeCompiled::from_ty(&i, self.heap);
+                            match a.get_ref().at(i_compiled.to_inner(), self.heap) {
+                                Ok(t) => match TypeCompiled::new(t, self.heap) {
+                                    Ok(ty) => Ok(ty.as_ty().clone()),
+                                    Err(_) => {
+                                        self.approximations.push(Approximation::new(
+                                            "TypeCompiled::new failed",
+                                            x,
+                                        ));
+                                        Ok(Ty::any())
+                                    }
+                                },
+                                Err(e) => {
+                                    self.approximations.push(Approximation::new(
+                                        "Type parameterization failed",
+                                        e,
+                                    ));
                                     Ok(Ty::any())
                                 }
-                            },
-                            Err(e) => {
-                                self.approximations
-                                    .push(Approximation::new("Getitem failed", e));
-                                Ok(Ty::any())
                             }
                         }
                     }
@@ -770,19 +776,20 @@ pub(crate) fn fill_types_for_lint_typechecker(
     module_scope_data: &ModuleScopeData,
     approximations: &mut Vec<Approximation>,
 ) -> Result<(Vec<TypingError>, ModuleVarTypes), InternalError> {
-    let heap = Heap::new();
-    let mut builder = GlobalTypesBuilder {
-        heap: &heap,
-        ctx,
-        values: UnorderedMap::new(),
-        errors: Vec::new(),
-        module_scope_data,
-        approximations,
-    };
-    for stmt in module.iter_mut() {
-        builder.top_level_stmt(stmt)?;
-    }
-    let GlobalTypesBuilder { errors, values, .. } = builder;
-    let types = values.map_values(|v| v.ty);
-    Ok((errors, ModuleVarTypes { types }))
+    Heap::temp(|heap| {
+        let mut builder = GlobalTypesBuilder {
+            heap,
+            ctx,
+            values: UnorderedMap::new(),
+            errors: Vec::new(),
+            module_scope_data,
+            approximations,
+        };
+        for stmt in module.iter_mut() {
+            builder.top_level_stmt(stmt)?;
+        }
+        let GlobalTypesBuilder { errors, values, .. } = builder;
+        let types = values.map_values(|v| v.ty);
+        Ok((errors, ModuleVarTypes { types }))
+    })
 }

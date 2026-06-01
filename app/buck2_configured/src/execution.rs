@@ -14,16 +14,19 @@ use allocative::Allocative;
 use async_trait::async_trait;
 use buck2_build_api::actions::execute::dice_data::HasFallbackExecutorConfig;
 use buck2_build_api::analysis::calculation::RuleAnalysisCalculation;
+use buck2_build_api::interpreter::rule_defs::provider::builtin::constraint_value_info::FrozenConstraintValueInfo;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::execution_platform_registration_info::FrozenExecutionPlatformRegistrationInfo;
 use buck2_common::dice::cells::HasCellResolver;
 use buck2_common::legacy_configs::dice::HasLegacyConfigs;
 use buck2_core::configuration::compatibility::MaybeCompatible;
+use buck2_core::configuration::compatibility::ResultMaybeCompatible;
 use buck2_core::configuration::data::ConfigurationData;
 use buck2_core::configuration::pair::ConfigurationNoExec;
 use buck2_core::execution_types::execution::ExecutionPlatform;
 use buck2_core::execution_types::execution::ExecutionPlatformError;
 use buck2_core::execution_types::execution::ExecutionPlatformIncompatibleReason;
 use buck2_core::execution_types::execution::ExecutionPlatformResolution;
+use buck2_core::execution_types::execution::ExecutionPlatformResolutionPartial;
 use buck2_core::execution_types::execution_platforms::ExecutionPlatformFallback;
 use buck2_core::execution_types::execution_platforms::ExecutionPlatforms;
 use buck2_core::execution_types::execution_platforms::ExecutionPlatformsData;
@@ -31,6 +34,7 @@ use buck2_core::provider::label::ProvidersLabel;
 use buck2_core::target::label::label::TargetLabel;
 use buck2_core::target::target_configured_target_label::TargetConfiguredTargetLabel;
 use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use dice_futures::cancellation::CancellationContext;
 use buck2_node::attrs::configuration_context::AttrConfigurationContext;
 use buck2_node::attrs::configuration_context::AttrConfigurationContextImpl;
@@ -51,8 +55,12 @@ use derive_more::Display;
 use futures::future::FutureExt;
 use dice::DiceComputations;
 use dice::Key;
+use dice::OkPagableValueSerialize;
+use dice::ValueSerialize;
 use dupe::Dupe;
 use itertools::Itertools;
+use pagable::Pagable;
+use pagable::pagable_typetag;
 use starlark_map::ordered_map::OrderedMap;
 
 use crate::configuration::get_matched_cfg_keys;
@@ -61,6 +69,8 @@ use crate::configuration::get_matched_cfg_keys_for_node;
 use crate::nodes::gather_deps;
 use crate::nodes::GatheredDeps;
 use crate::nodes::LookingUpConfiguredNodeContext;
+use buck2_node::cfg_constructor::CFG_CONSTRUCTOR_CALCULATION_IMPL;
+use buck2_core::configuration::pair::Configuration;
 
 #[derive(Debug, buck2_error::Error)]
 #[buck2(input)]
@@ -73,6 +83,8 @@ enum ExecutionPlatformComputationError {
         "Expected `{0}` to provide a `ExecutionPlatformRegistrationInfo` as it's configured as the `build.execution_platforms` value."
     )]
     MissingExecutionPlatformRegistrationInfo(TargetLabel),
+    #[error("Expected `{0}` (exec_marker_constraint) to provide a `ConstraintValueInfo` provider.")]
+    MissingConstraintValueInfo(ProvidersLabel),
 }
 
 async fn legacy_execution_platform(
@@ -132,12 +144,15 @@ impl ExecutionPlatformConstraints {
         let exec_compatible_with: Arc<[_]> = if let Some(a) =
             node.known_attr_or_none(EXEC_COMPATIBLE_WITH_ATTRIBUTE.id, AttrInspectOptions::All)
         {
-            let configured_attr = a.configure(cfg_ctx).with_buck_error_context(|| {
-                format!(
-                    "Error configuring attribute `{}` to resolve execution platform",
-                    EXEC_COMPATIBLE_WITH_ATTRIBUTE.name
-                )
-            })?;
+            let configured_attr = a
+                .configure(cfg_ctx)
+                .with_buck_error_context(|| {
+                    format!(
+                        "Error configuring attribute `{}` to resolve execution platform",
+                        EXEC_COMPATIBLE_WITH_ATTRIBUTE.name
+                    )
+                })
+                .require_compatible()?;
             ConfiguredTargetNode::attr_as_target_compatible_with(configured_attr.value)
                 .map(|label| {
                     label.with_buck_error_context(|| {
@@ -176,7 +191,7 @@ impl ExecutionPlatformConstraints {
         self,
         ctx: &mut DiceComputations<'_>,
         cell: CellNameForConfigurationResolution,
-    ) -> buck2_error::Result<ExecutionPlatformResolution> {
+    ) -> buck2_error::Result<ExecutionPlatformResolutionPartial> {
         ctx.compute(&ExecutionPlatformResolutionKey {
             target_node_cell: cell,
             exec_compatible_with: self.exec_compatible_with,
@@ -187,12 +202,13 @@ impl ExecutionPlatformConstraints {
     }
 }
 
-#[derive(Clone, Display, Debug, Dupe, Eq, Hash, PartialEq, Allocative)]
+#[derive(Clone, Display, Debug, Dupe, Eq, Hash, PartialEq, Allocative, Pagable)]
 #[display(
         "ToolchainExecutionPlatformCompatibilityKey({}, {})",
         target,
         exec_platform.id()
     )]
+#[pagable_typetag(dice::DiceKeyDyn)]
 pub(crate) struct ToolchainExecutionPlatformCompatibilityKey {
     target: TargetConfiguredTargetLabel,
     exec_platform: ExecutionPlatform,
@@ -222,19 +238,22 @@ impl ToolchainExecutionPlatformCompatibilityKey {
         // But we pass `resolved_transitions` here to prevent breakages in the future
         // if something here changes.
         let resolved_transitions = OrderedMap::new();
+        let unspecified_resolution = ExecutionPlatformResolution::unspecified();
         let cfg_ctx = AttrConfigurationContextImpl::new(
+            self.target.inner().dupe(),
             &matched_cfg_keys,
-            ConfigurationNoExec::unbound_exec(),
+            &unspecified_resolution,
             &resolved_transitions,
             &platform_cfgs,
+            Some(self.target.unconfigured().dupe()),
         );
         let (gathered_deps, errors_and_incompats) =
-            gather_deps(&self.target, node.as_ref(), &cfg_ctx, ctx).await?;
-        if let Some(ret) = errors_and_incompats.finalize() {
-            // Statically assert that we hit one of the `?`s
-            enum Void {}
-            let _: Void = ret?.require_compatible()?;
-        }
+            gather_deps(&self.target, node.as_ref(), &cfg_ctx, ctx)
+                .await
+                .require_compatible()?;
+
+        errors_and_incompats.finalize().require_compatible()?;
+
         let constraints =
             ExecutionPlatformConstraints::new(node.as_ref(), &gathered_deps, &cfg_ctx)?;
 
@@ -270,6 +289,10 @@ impl Key for ToolchainExecutionPlatformCompatibilityKey {
             _ => false,
         }
     }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        OkPagableValueSerialize::<Self::Value>::new()
+    }
 }
 
 async fn check_toolchain_execution_platform_compatibility(
@@ -288,7 +311,7 @@ pub(crate) async fn get_execution_platform_toolchain_dep(
     ctx: &mut DiceComputations<'_>,
     target_label: &TargetConfiguredTargetLabel,
     target_node: TargetNodeRef<'_>,
-) -> buck2_error::Result<MaybeCompatible<ExecutionPlatformResolution>> {
+) -> buck2_error::Result<MaybeCompatible<ExecutionPlatformResolutionPartial>> {
     assert!(target_node.is_toolchain_rule());
     let target_cfg = target_label.cfg();
     let target_cell = target_node.label().pkg().cell_name();
@@ -308,17 +331,26 @@ pub(crate) async fn get_execution_platform_toolchain_dep(
     } else {
         let platform_cfgs = compute_platform_cfgs(ctx, target_node).await?;
         let resolved_transitions = OrderedMap::new();
+        let unspecified_resolution = ExecutionPlatformResolution::unspecified();
         let cfg_ctx = AttrConfigurationContextImpl::new(
+            target_label.inner().dupe(),
             &matched_cfg_keys,
-            ConfigurationNoExec::unbound_exec(),
+            &unspecified_resolution,
             &resolved_transitions,
             &platform_cfgs,
+            Some(target_label.unconfigured().dupe()),
         );
         let (gathered_deps, errors_and_incompats) =
-            gather_deps(target_label, target_node, &cfg_ctx, ctx).await?;
-        if let Some(ret) = errors_and_incompats.finalize() {
-            return ret.map_err(Into::into);
-        }
+            gather_deps(target_label, target_node, &cfg_ctx, ctx)
+                .await
+                .require_compatible()?;
+        match errors_and_incompats.finalize() {
+            ResultMaybeCompatible::Compatible(_) => {}
+            ResultMaybeCompatible::Incompatible(reason) => {
+                return Ok(MaybeCompatible::Incompatible(reason));
+            }
+            ResultMaybeCompatible::Err(e) => return Err(e),
+        };
         Ok(MaybeCompatible::Compatible(
             resolve_execution_platform(
                 ctx,
@@ -338,7 +370,7 @@ pub(crate) async fn resolve_execution_platform(
     matched_cfg_keys: &MatchedConfigurationSettingKeysWithCfg,
     gathered_deps: &GatheredDeps,
     cfg_ctx: &(dyn AttrConfigurationContext + Sync),
-) -> buck2_error::Result<ExecutionPlatformResolution> {
+) -> buck2_error::Result<ExecutionPlatformResolutionPartial> {
     // If no execution platforms are configured, we fall back to the legacy execution
     // platform behavior. We currently only support legacy execution platforms. That behavior is that there is a
     // single executor config (the fallback config) and the execution platform is in the same
@@ -346,7 +378,7 @@ pub(crate) async fn resolve_execution_platform(
     // The non-none case will be handled when we invoke the resolve_execution_platform() on ctx below, the none
     // case can't be handled there because we don't pass the full configuration into it.
     if ctx.get_execution_platforms().await?.is_none() {
-        return Ok(ExecutionPlatformResolution::new(
+        return Ok(ExecutionPlatformResolutionPartial::new(
             Some(legacy_execution_platform(ctx, matched_cfg_keys.cfg()).await),
             Vec::new(),
         ));
@@ -397,15 +429,101 @@ async fn compute_execution_platforms(
             )
         })?;
 
+    // Resolve the exec_marker_constraint if set
+    let marker_constraint = if let Some(marker_str) = result.exec_marker_constraint() {
+        let marker_label =
+            ProvidersLabel::parse(marker_str, cells.root_cell(), &cells, &cell_alias_resolver)?;
+        let marker_providers = ctx.get_configuration_analysis_result(&marker_label).await?;
+        let constraint_value_info = marker_providers
+            .provider_collection()
+            .builtin_provider::<FrozenConstraintValueInfo>()
+            .ok_or_else(|| {
+                buck2_error::Error::from(
+                    ExecutionPlatformComputationError::MissingConstraintValueInfo(
+                        marker_label.dupe(),
+                    ),
+                )
+            })?;
+
+        Some(constraint_value_info.to_constraint_key_value())
+    } else {
+        None
+    };
+
     let mut platforms = Vec::new();
     for platform in result.platforms()? {
-        platforms.push(platform.to_execution_platform()?);
+        platforms.push(platform.to_execution_platform_with_marker(marker_constraint.as_ref())?);
     }
     Ok(Some(Arc::new(ExecutionPlatformsData::new(
         execution_platforms_target,
         platforms,
         result.fallback()?,
     ))))
+}
+
+/// Configure an exec_dep with modifiers applied from the execution platform.
+/// This function is used in two places:
+/// 1. During execution platform selection (check_execution_platform) - to check target_compatible_with
+/// 2. During dependency graph construction (nodes.rs) - to create the final configured nodes
+pub(crate) async fn configure_exec_dep_with_modifiers(
+    ctx: &mut DiceComputations<'_>,
+    exec_dep: &TargetLabel,
+    execution_platform_cfg: &ConfigurationData,
+) -> ResultMaybeCompatible<ConfiguredTargetNode> {
+    let (node, super_package) = ctx.get_target_node_with_super_package(exec_dep).await?;
+
+    if !execution_platform_cfg.is_bound() {
+        // No valid execution platform was resolved (e.g., all candidates were incompatible
+        // and fallback is UseUnspecifiedExec). We cannot apply modifiers without a bound
+        // configuration, so configure the exec_dep directly. This will likely fail later
+        // when resolving configuration settings.
+        let cfg_pair = Configuration::new(execution_platform_cfg.dupe(), None);
+        return ctx
+            .get_internal_configured_target_node(&exec_dep.configure_pair(cfg_pair))
+            .await;
+    }
+
+    // Extract constraints from the execution platform to use as high-priority modifiers.
+    //
+    // Execution platform constraints have the highest priority and cannot be
+    // overridden by package-level or target-level modifiers on the exec dep.
+    //
+    // We pass these as cli_modifiers to eval_cfg_constructor because cli_modifiers
+    // have the highest priority in modifier resolution. This is an implementation
+    // detail - these are NOT actual user-provided CLI modifier.
+    let exec_platform_constraints = Arc::new(
+        execution_platform_cfg
+            .data()?
+            .constraints
+            .values()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>(),
+    );
+
+    // Evaluate cfg_constructor to apply modifiers (package-level + target-level + exec platform)
+    let cfg_config = CFG_CONSTRUCTOR_CALCULATION_IMPL
+        .get()?
+        .eval_cfg_constructor(
+            ctx,
+            node.as_ref(),
+            &super_package,
+            execution_platform_cfg.dupe(),
+            &exec_platform_constraints, // passed as cli_modifiers parameter for highest priority
+            node.rule_type(),
+            // is configuring exec deps
+            true,
+        )
+        .await
+        .with_buck_error_context(|| {
+            format!("Resolving modifiers for exec dep target `{}`", exec_dep)
+        })?;
+
+    // Create configuration pair with modifiers applied
+    let cfg_pair = Configuration::new(cfg_config, None);
+
+    // Configure exec_dep with modifiers applied
+    ctx.get_internal_configured_target_node(&exec_dep.configure_pair(cfg_pair))
+        .await
 }
 
 /// Check if a particular execution platform is compatible with the constraints or not.
@@ -444,19 +562,15 @@ async fn check_execution_platform(
     let dep_results = ctx
         .compute_join(exec_deps.iter(), |ctx, dep| {
             Box::pin(async move {
-                let cfg_pair = exec_platform.cfg_pair_no_exec().dupe();
                 let cfg = exec_platform.cfg().dupe();
-                let result = ctx
-                    .get_internal_configured_target_node(&dep.configure_pair_no_exec(cfg_pair))
-                    .await;
-                match result {
-                    Ok(MaybeCompatible::Compatible(_)) => Ok(None),
-                    Ok(MaybeCompatible::Incompatible(reason)) => Ok(Some(reason)),
-                    Err(e) => Err(e.context(format!(
-                        "Error checking compatibility of `{}` with `{}`",
-                        dep, cfg
-                    ))),
-                }
+                configure_exec_dep_with_modifiers(ctx, dep, &cfg)
+                    .await
+                    .map_err(|e| {
+                        e.context(format!(
+                            "Error checking compatibility of `{}` with `{}`",
+                            dep, cfg
+                        ))
+                    })
             })
         })
         .await;
@@ -464,15 +578,16 @@ async fn check_execution_platform(
     let mut errs = Vec::new();
     for result in dep_results {
         match result {
-            Ok(None) => (),
-            Ok(Some(reason)) => {
+            ResultMaybeCompatible::Compatible(..) => (),
+
+            ResultMaybeCompatible::Incompatible(reason) => {
                 return Ok(Err(
                     ExecutionPlatformIncompatibleReason::ExecutionDependencyIncompatible(
                         reason.dupe(),
                     ),
                 ));
             }
-            Err(e) => errs.push(e),
+            ResultMaybeCompatible::Err(e) => errs.push(e),
         };
     }
 
@@ -496,7 +611,7 @@ async fn check_execution_platform(
         }
     }
     if let Some(e) = errs.pop() {
-        return Err(e.into());
+        return Err(e);
     }
 
     Ok(Ok(()))
@@ -507,7 +622,7 @@ async fn get_execution_platforms_enabled(
 ) -> buck2_error::Result<ExecutionPlatforms> {
     ctx.get_execution_platforms()
         .await?
-        .buck_error_context("Execution platforms are not enabled")
+        .ok_or_else(|| internal_error!("Execution platforms are not enabled"))
 }
 
 async fn resolve_execution_platform_from_constraints(
@@ -516,7 +631,7 @@ async fn resolve_execution_platform_from_constraints(
     exec_compatible_with: &[ConfigurationSettingKey],
     exec_deps: &[TargetLabel],
     toolchain_deps: &[TargetConfiguredTargetLabel],
-) -> buck2_error::Result<ExecutionPlatformResolution> {
+) -> buck2_error::Result<ExecutionPlatformResolutionPartial> {
     let mut skipped = Vec::new();
     let execution_platforms = get_execution_platforms_enabled(ctx).await?;
     for exec_platform in execution_platforms.candidates() {
@@ -531,7 +646,7 @@ async fn resolve_execution_platform_from_constraints(
         .await?
         {
             Ok(()) => {
-                return Ok(ExecutionPlatformResolution::new(
+                return Ok(ExecutionPlatformResolutionPartial::new(
                     Some(exec_platform.dupe()),
                     skipped,
                 ));
@@ -544,19 +659,19 @@ async fn resolve_execution_platform_from_constraints(
 
     match execution_platforms.fallback() {
         ExecutionPlatformFallback::UseUnspecifiedExec => {
-            Ok(ExecutionPlatformResolution::new(None, skipped))
+            Ok(ExecutionPlatformResolutionPartial::new(None, skipped))
         }
         ExecutionPlatformFallback::Error => {
-            Err(ExecutionPlatformError::NoCompatiblePlatform(Arc::new(skipped).into()).into())
+            Err(ExecutionPlatformError::NoCompatiblePlatform(Arc::new(skipped)).into())
         }
-        ExecutionPlatformFallback::Platform(platform) => Ok(ExecutionPlatformResolution::new(
-            Some(platform.dupe()),
-            skipped,
-        )),
+        ExecutionPlatformFallback::Platform(platform) => Ok(
+            ExecutionPlatformResolutionPartial::new(Some(platform.dupe()), skipped),
+        ),
     }
 }
 
-#[derive(Clone, Dupe, Debug, Eq, Hash, PartialEq, Allocative)]
+#[derive(Clone, Dupe, Debug, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[pagable_typetag(dice::DiceKeyDyn)]
 pub(crate) struct ExecutionPlatformResolutionKey {
     /// Determining a compatible execution platform requires checking the target and toolchain's
     /// exec_compatible_with. This in turn requires a ResolvedConfiguration, which resolves the
@@ -602,7 +717,7 @@ impl Display for ExecutionPlatformResolutionKey {
 
 #[async_trait]
 impl Key for ExecutionPlatformResolutionKey {
-    type Value = buck2_error::Result<ExecutionPlatformResolution>;
+    type Value = buck2_error::Result<ExecutionPlatformResolutionPartial>;
 
     async fn compute(
         &self,
@@ -625,10 +740,15 @@ impl Key for ExecutionPlatformResolutionKey {
             _ => false,
         }
     }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        OkPagableValueSerialize::<Self::Value>::new()
+    }
 }
 
-#[derive(Clone, Dupe, Display, Debug, Eq, Hash, PartialEq, Allocative)]
+#[derive(Clone, Dupe, Display, Debug, Eq, Hash, PartialEq, Allocative, Pagable)]
 #[display("ExecutionPlatforms")]
+#[pagable_typetag(dice::DiceKeyDyn)]
 pub struct ExecutionPlatformsKey;
 
 #[async_trait]
@@ -645,6 +765,10 @@ impl Key for ExecutionPlatformsKey {
     fn equality(_: &Self::Value, _: &Self::Value) -> bool {
         // TODO(cjhopman) should these be comparable for caching
         false
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        OkPagableValueSerialize::<Self::Value>::new()
     }
 }
 
@@ -666,7 +790,7 @@ impl GetExecutionPlatformsImpl for GetExecutionPlatformsInstance {
         toolchain_deps: Arc<[TargetConfiguredTargetLabel]>,
         exec_compatible_with: Arc<[ConfigurationSettingKey]>,
         cell: CellNameForConfigurationResolution,
-    ) -> buck2_error::Result<ExecutionPlatformResolution> {
+    ) -> buck2_error::Result<ExecutionPlatformResolutionPartial> {
         ExecutionPlatformConstraints::new_constraints(
             exec_deps,
             toolchain_deps,

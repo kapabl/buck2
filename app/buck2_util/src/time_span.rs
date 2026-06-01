@@ -44,7 +44,17 @@ impl TimeSpan {
         if end >= start {
             Ok(Self { start, end })
         } else {
-            Err(TimeSpanError::InvalidTimeOrder { start, end }.into())
+            Err(TimeSpanError::InvalidTimeOrder { start, end })
+        }
+    }
+
+    /// Creates a new `TimeSpan` for the given start and end instants.
+    ///
+    /// If `end` is before `start`, the resulting time span will be equivalent to `TimeSpan::from_start_and_duration(start, Duration::ZERO)`.
+    pub fn new_saturating(start: Instant, end: Instant) -> Self {
+        Self {
+            start,
+            end: start.max(end),
         }
     }
 

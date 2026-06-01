@@ -22,6 +22,7 @@ use std::hash::Hasher;
 
 use allocative::Allocative;
 use starlark_derive::ProvidesStaticType;
+use starlark_derive::StarlarkPagable;
 use starlark_derive::starlark_value;
 use starlark_map::StarlarkHashValue;
 use starlark_map::StarlarkHasher;
@@ -29,20 +30,18 @@ use starlark_map::StarlarkHasher;
 use crate as starlark;
 use crate::__derive_refs::serde::Serialize;
 use crate::private::Private;
+use crate::static_starlark_value;
 use crate::typing::Ty;
+use crate::values::AllocStaticSimple;
 use crate::values::StarlarkValue;
 use crate::values::Value;
 use crate::values::ValueError;
-use crate::values::layout::avalue::AValueBasic;
-use crate::values::layout::avalue::AValueImpl;
-use crate::values::layout::avalue::alloc_static;
-use crate::values::layout::heap::repr::AValueRepr;
 
 /// The result of calling `type()` on booleans.
 pub const BOOL_TYPE: &str = "bool";
 
 /// `bool` value.
-#[derive(ProvidesStaticType, Debug, Serialize, Allocative)]
+#[derive(ProvidesStaticType, Debug, Serialize, Allocative, StarlarkPagable)]
 #[serde(transparent)]
 pub struct StarlarkBool(pub(crate) bool);
 
@@ -56,10 +55,15 @@ impl Display for StarlarkBool {
     }
 }
 
-pub(crate) static VALUE_FALSE_TRUE: [AValueRepr<AValueImpl<AValueBasic<StarlarkBool>>>; 2] = [
-    alloc_static(StarlarkBool(false)),
-    alloc_static(StarlarkBool(true)),
-];
+// Define individual boolean values with registration (multiple values of same type)
+static_starlark_value!(StarlarkBool {
+    pub(crate) VALUE_FALSE = StarlarkBool(false);
+    pub(crate) VALUE_TRUE = StarlarkBool(true);
+});
+
+// Array of references for efficient boolean lookup by index
+pub(crate) static VALUE_FALSE_TRUE: [&AllocStaticSimple<StarlarkBool>; 2] =
+    [&VALUE_FALSE, &VALUE_TRUE];
 
 /// Define the bool type
 #[starlark_value(type = BOOL_TYPE)]

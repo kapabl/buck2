@@ -10,6 +10,7 @@
 
 #[cfg(windows)]
 pub(crate) fn check_user_allowed() -> buck2_error::Result<()> {
+    use core::ffi::c_void;
     use std::io;
     use std::mem;
     use std::mem::MaybeUninit;
@@ -18,16 +19,15 @@ pub(crate) fn check_user_allowed() -> buck2_error::Result<()> {
     use buck2_core::ci::is_ci;
     use buck2_error::BuckErrorContext;
     use buck2_wrapper_common::win::winapi_handle::WinapiHandle;
-    use winapi::ctypes::c_void;
-    use winapi::shared::minwindef::DWORD;
-    use winapi::um::processthreadsapi::GetCurrentProcess;
-    use winapi::um::processthreadsapi::OpenProcessToken;
-    use winapi::um::securitybaseapi::GetTokenInformation;
-    use winapi::um::winnt::TOKEN_ELEVATION;
-    use winapi::um::winnt::TOKEN_QUERY;
-    use winapi::um::winnt::TokenElevation;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Security::GetTokenInformation;
+    use windows_sys::Win32::Security::TOKEN_ELEVATION;
+    use windows_sys::Win32::Security::TOKEN_QUERY;
+    use windows_sys::Win32::Security::TokenElevation;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use windows_sys::Win32::System::Threading::OpenProcessToken;
 
-    let mut handle = ptr::null_mut();
+    let mut handle: HANDLE = ptr::null_mut();
     let token_ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut handle) };
     if token_ok == 0 {
         return Err(io::Error::last_os_error()).buck_error_context("OpenProcessToken failed");
@@ -45,7 +45,7 @@ pub(crate) fn check_user_allowed() -> buck2_error::Result<()> {
             handle.handle(),
             TokenElevation,
             elevation.as_ptr() as *mut c_void,
-            size as DWORD,
+            size as u32,
             &mut ret_size,
         )
     };
@@ -72,7 +72,8 @@ pub(crate) fn check_user_allowed() -> buck2_error::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
     use buck2_core::soft_error;
-    use buck2_error::BuckErrorContext;
+    use buck2_error::internal_error;
+    use buck2_fs::error::IoResultExt;
     use buck2_fs::fs_util;
     use buck2_fs::paths::abs_path::AbsPath;
 
@@ -82,11 +83,11 @@ pub(crate) fn check_user_allowed() -> buck2_error::Result<()> {
     struct RootError;
 
     if nix::unistd::geteuid().is_root() {
-        let home_dir = dirs::home_dir().buck_error_context("home dir not found")?;
+        let home_dir = dirs::home_dir().ok_or_else(|| internal_error!("home dir not found"))?;
         if let Ok(home_dir) = AbsPath::new(&home_dir) {
-            let home_dir_metadata = fs_util::metadata(home_dir)?;
+            let home_dir_metadata = fs_util::metadata(home_dir).categorize_internal()?;
             if home_dir_metadata.uid() != 0 {
-                soft_error!("root_not_allowed", RootError.into())?;
+                soft_error!("root_not_allowed", RootError.into(), error_on_oss: true)?;
             }
         }
     }

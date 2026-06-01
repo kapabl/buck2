@@ -12,6 +12,8 @@ use std::fmt::Debug;
 
 use allocative::Allocative;
 use buck2_build_api_derive::internal_provider;
+use buck2_core::configuration::constraints::ConstraintKey;
+use buck2_core::configuration::constraints::ConstraintValue;
 use buck2_core::configuration::data::ConfigurationData;
 use buck2_core::execution_types::execution::ExecutionPlatform;
 use buck2_core::target::label::label::TargetLabel;
@@ -21,6 +23,7 @@ use starlark::any::ProvidesStaticType;
 use starlark::coerce::Coerce;
 use starlark::environment::GlobalsBuilder;
 use starlark::values::Freeze;
+use starlark::values::StarlarkPagable;
 use starlark::values::Trace;
 use starlark::values::ValueLifetimeless;
 use starlark::values::ValueLike;
@@ -45,7 +48,16 @@ enum ExecutionPlatformProviderErrors {
 
 /// Provider that signals that a target represents an execution platform.
 #[internal_provider(info_creator)]
-#[derive(Clone, Debug, Trace, Coerce, Freeze, ProvidesStaticType, Allocative)]
+#[derive(
+    Clone,
+    Debug,
+    Trace,
+    Coerce,
+    Freeze,
+    ProvidesStaticType,
+    Allocative,
+    StarlarkPagable
+)]
 #[repr(C)]
 pub struct ExecutionPlatformInfoGen<V: ValueLifetimeless> {
     /// label of the defining rule, used in informative messages
@@ -58,8 +70,16 @@ pub struct ExecutionPlatformInfoGen<V: ValueLifetimeless> {
 
 impl<'v, V: ValueLike<'v>> ExecutionPlatformInfoGen<V> {
     pub fn to_execution_platform(&self) -> buck2_error::Result<ExecutionPlatform> {
+        self.to_execution_platform_with_marker(None)
+    }
+
+    /// Convert to an ExecutionPlatform, optionally adding a marker constraint to the configuration.
+    pub fn to_execution_platform_with_marker(
+        &self,
+        marker_constraint: Option<&(ConstraintKey, ConstraintValue)>,
+    ) -> buck2_error::Result<ExecutionPlatform> {
         let target = self.label.cast::<&StarlarkTargetLabel>().unpack()?.label();
-        let cfg = ConfigurationInfo::from_value(self.configuration.get().to_value())
+        let mut cfg = ConfigurationInfo::from_value(self.configuration.get().to_value())
             .ok_or_else(|| {
                 ExecutionPlatformProviderErrors::ExpectedConfigurationInfo(
                     self.configuration.to_value().get().to_repr(),
@@ -67,7 +87,17 @@ impl<'v, V: ValueLike<'v>> ExecutionPlatformInfoGen<V> {
                 )
             })?
             .to_configuration_data()?;
-        let cfg = ConfigurationData::from_platform(TargetLabel::to_string(target), cfg)?;
+
+        // Add the marker constraint if provided
+        if let Some((key, value)) = marker_constraint {
+            cfg.constraints.insert(key.clone(), value.clone());
+        }
+
+        let cfg = ConfigurationData::from_platform(
+            TargetLabel::to_string(target),
+            cfg,
+            marker_constraint.is_some(),
+        )?;
         let executor_config =
             StarlarkCommandExecutorConfig::from_value(self.executor_config.get().to_value())
                 .ok_or_else(|| {

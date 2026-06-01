@@ -12,11 +12,10 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from pathlib import Path
 
 from buck2.tests.e2e_util.api.buck import Buck
-from buck2.tests.e2e_util.buck_workspace import buck_test, env
+from buck2.tests.e2e_util.buck_workspace import buck_test
 from buck2.tests.e2e_util.helper.utils import filter_events
 
 
@@ -28,11 +27,11 @@ def test_dummy() -> None:
 def _use_some_memory_args(buck: Buck) -> list[str]:
     return [
         "-c",
-        f"use_some_memory.path={os.environ["USE_SOME_MEMORY_BIN"]}",
+        f"use_some_memory.path={os.environ['USE_SOME_MEMORY_BIN']}",
     ]
 
 
-@buck_test(skip_for_os=["darwin", "windows"])
+@buck_test(skip_for_os=["darwin", "windows"], disable_daemon_cgroup=False)
 async def test_memory_pressure_telemetry(
     buck: Buck,
 ) -> None:
@@ -50,7 +49,7 @@ async def test_memory_pressure_telemetry(
     )
 
     resource_control_events = await filter_events(
-        buck, "Event", "data", "Instant", "data", "ResourceControlEvents"
+        buck, "Event", "data", "Instant", "data", "ResourceControlEvent"
     )
 
     # We can't reliably predict how many events will be fired and how high the pressure % will reach,
@@ -58,12 +57,12 @@ async def test_memory_pressure_telemetry(
     assert len(resource_control_events) > 0
     last_event = resource_control_events[-1]
     pressure = last_event["allprocs_memory_pressure"]
-    assert (
-        pressure <= 100
-    ), f"Expected % memory_pressure to be at most 100, got {pressure}"
+    assert pressure <= 100, (
+        f"Expected % memory_pressure to be at most 100, got {pressure}"
+    )
 
 
-@buck_test(skip_for_os=["darwin", "windows"])
+@buck_test(skip_for_os=["darwin", "windows"], disable_daemon_cgroup=False)
 async def test_resource_control_events_created(
     buck: Buck,
 ) -> None:
@@ -71,9 +70,8 @@ async def test_resource_control_events_created(
         f.write("[buck2_resource_control]\n")
         f.write("status = required\n")
         f.write("enable_action_cgroup_pool_v2 = true\n")
-        f.write(f"memory_high_action_cgroup_pool = {200 * 1024 * 1024}\n")  # 200 MiB
+        f.write(f"memory_high_actions = {200 * 1024 * 1024}\n")  # 200 MiB
         f.write("enable_suspension = true\n")
-        f.write("memory_pressure_threshold_percent = 1\n")
 
     await buck.build(
         "prelude//:freeze_unfreeze_target",
@@ -92,7 +90,7 @@ async def test_resource_control_events_created(
         "data",
         "Instant",
         "data",
-        "ResourceControlEvents",
+        "ResourceControlEvent",
     )
 
     # 10 means scheduled event
@@ -114,51 +112,7 @@ def get_daemon_cgroup_path(pid: int) -> Path:
     raise Exception(f"Could not find cgroup v2 entry for PID {pid}")
 
 
-async def get_daemon_pid(buck: Buck) -> int:
-    result = await buck.status()
-    stdout = result.stdout
-    status = json.loads(stdout)
-    pid = status["process_info"]["pid"]
-    return pid
-
-
-@buck_test(skip_for_os=["darwin", "windows"])
-async def test_percentage_of_ancestor_memory_limit(buck: Buck) -> None:
-    with open(buck.cwd / ".buckconfig.local", "w") as f:
-        f.write("[buck2_resource_control]\n")
-        f.write("memory_high = 50%\n")
-
-    # start buck2 daemon
-    await buck.server()
-
-    pid = await get_daemon_pid(buck)
-    daemon_cgroup_path = get_daemon_cgroup_path(pid)
-    # the parent of the cgroup that contains daemon, forkserver and workers cgroups
-    parent_cgroup_path = daemon_cgroup_path.parent.parent.parent
-
-    try:
-        parent_cgroup_memory_high = 200 * 1024 * 1024 * 1024  # 10 GB
-        with open(parent_cgroup_path / "memory.high", "w") as f:
-            f.write(str(parent_cgroup_memory_high))
-
-        # restart buck2 daemon to make the parent memory.high value effective
-        await buck.kill()
-        await buck.server()
-
-        pid = await get_daemon_pid(buck)
-        daemon_cgroup_path = get_daemon_cgroup_path(pid)
-        # the cgroup that contains daemon, forkserver and workers cgroups
-        slice_cgroup_path = daemon_cgroup_path.parent
-        with open(slice_cgroup_path / "memory.high", "r") as f:
-            slice_memory_high = int(f.read().strip())
-        assert slice_memory_high == (parent_cgroup_memory_high * 0.5)
-    finally:
-        # reset the parent memory.high value to max
-        with open(parent_cgroup_path / "memory.high", "w") as f:
-            f.write("max")
-
-
-@buck_test(skip_for_os=["darwin", "windows"])
+@buck_test(skip_for_os=["darwin", "windows"], disable_daemon_cgroup=False)
 async def test_daemon_id_in_cgroup_path(buck: Buck) -> None:
     await buck.server()
 

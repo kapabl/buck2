@@ -14,6 +14,7 @@ use std::sync::Arc;
 use allocative::Allocative;
 use buck2_core::buck2_env;
 use buck2_core::cells::cell_path::CellPath;
+use buck2_fs::error::IoResultExt;
 use buck2_fs::fs_util;
 use buck2_fs::paths::RelativePath;
 use buck2_fs::paths::RelativePathBuf;
@@ -24,6 +25,7 @@ use compact_str::CompactString;
 use derive_more::Display;
 use dupe::Dupe;
 use gazebo::variants::VariantName;
+use pagable::Pagable;
 
 use crate::cas_digest::CasDigest;
 use crate::cas_digest::CasDigestConfig;
@@ -34,7 +36,7 @@ use crate::external_symlink::ExternalSymlink;
 /// std::fs::FileType is an opaque type that isn't constructible. This is
 /// basically the equivalent.
 #[derive(
-    Copy, Clone, Dupe, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Allocative
+    Copy, Clone, Dupe, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Allocative, Pagable
 )]
 pub enum FileType {
     Directory,
@@ -73,7 +75,9 @@ impl FileType {
     }
 }
 
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Allocative)]
+#[derive(
+    Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Allocative, Pagable
+)]
 pub struct SimpleDirEntry {
     // Put the `file_name` first so we sort by it (which is what people expect)
     pub file_name: FileNameBuf,
@@ -89,7 +93,9 @@ pub struct RawDirEntry {
     pub file_type: FileType,
 }
 
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Dupe, Allocative)]
+#[derive(
+    Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Dupe, Allocative, Pagable
+)]
 pub struct ReadDirOutput {
     /// Sorted.
     pub included: Arc<[SimpleDirEntry]>,
@@ -102,7 +108,7 @@ impl ReadDirOutput {
     }
 }
 
-#[derive(Allocative)]
+#[derive(Allocative, Debug, Pagable)]
 pub struct FileDigestKind {
     _private: (),
 }
@@ -156,8 +162,6 @@ impl FileDigest {
     /// Read the file from the xattr, or skip if it's not available.
     #[cfg(unix)]
     fn from_file_attr(file: &AbsPath, config: FileDigestConfig) -> Option<Self> {
-        use buck2_fs::fs_util;
-
         use crate::cas_digest::RawDigest;
 
         enum Digest {
@@ -212,14 +216,14 @@ impl FileDigest {
     /// Get the digest from disk. You should usually prefer `from_file`
     /// which also uses faster methods of getting the SHA1 if it can.
     fn from_file_disk(file: &AbsPath, config: FileDigestConfig) -> buck2_error::Result<Self> {
-        let f = fs_util::open_file(file)?;
+        let f = fs_util::open_file(file).categorize_internal()?;
         FileDigest::from_reader(f, config.as_cas_digest_config())
     }
 }
 
 /// Stores the relevant metadata for a file.
 // New fields should be added as needed, and unused fields removed.
-#[derive(Debug, Dupe, Hash, PartialEq, Eq, Clone, Display, Allocative)]
+#[derive(Debug, Dupe, Hash, PartialEq, Eq, Clone, Display, Allocative, Pagable)]
 #[display("File(digest={}, is_executable={})", digest, is_executable)]
 pub struct FileMetadata {
     pub digest: TrackedFileDigest,
@@ -249,7 +253,7 @@ pub enum PathMetadata {
     Directory,
 }
 
-#[derive(Debug, PartialEq, Dupe, Eq, Clone, Allocative, VariantName)]
+#[derive(Debug, PartialEq, Dupe, Eq, Clone, Allocative, VariantName, Pagable)]
 pub enum RawPathMetadata<T = Arc<CellPath>> {
     Symlink { at: T, to: RawSymlink<T> },
     File(FileMetadata),
@@ -257,7 +261,7 @@ pub enum RawPathMetadata<T = Arc<CellPath>> {
 }
 
 /// Represents a relative symlink, and stores the symlink's target path.
-#[derive(Debug, Display, Hash, Eq, PartialEq, Clone, Allocative)]
+#[derive(Debug, Display, Hash, Eq, PartialEq, Clone, Allocative, Pagable)]
 pub struct Symlink(RelativePathBuf);
 
 impl Symlink {
@@ -285,7 +289,17 @@ impl Symlink {
     }
 }
 
-#[derive(Debug, Dupe, Hash, PartialEq, Eq, Clone, Allocative, VariantName)]
+#[derive(
+    Debug,
+    Dupe,
+    Hash,
+    PartialEq,
+    Eq,
+    Clone,
+    Allocative,
+    VariantName,
+    Pagable
+)]
 pub enum RawSymlink<T> {
     Relative(T, Arc<Symlink>),
     External(Arc<ExternalSymlink>),

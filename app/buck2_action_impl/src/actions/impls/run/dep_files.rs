@@ -9,8 +9,6 @@
  */
 
 use std::borrow::Cow;
-use std::collections::HashMap;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use allocative::Allocative;
@@ -28,6 +26,7 @@ use buck2_build_api::actions::impls::expanded_command_line::ExpandedCommandLineD
 use buck2_build_api::artifact_groups::ArtifactGroup;
 use buck2_build_api::interpreter::rule_defs::artifact_tagging::ArtifactTag;
 use buck2_build_api::interpreter::rule_defs::cmd_args::CommandLineArtifactVisitor;
+use buck2_build_signals::env::WaitingData;
 use buck2_common::cas_digest::CasDigestConfig;
 use buck2_common::cas_digest::CasDigestData;
 use buck2_common::file_ops::metadata::FileDigest;
@@ -45,6 +44,7 @@ use buck2_directory::directory::entry::DirectoryEntry;
 use buck2_directory::directory::find::find;
 use buck2_directory::directory::fingerprinted_directory::FingerprintedDirectory;
 use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_events::dispatch::span_async_simple;
 use buck2_execute::artifact::artifact_dyn::ArtifactDyn;
 use buck2_execute::artifact_value::ArtifactValue;
@@ -72,14 +72,18 @@ use buck2_file_watcher::dep_files::FLUSH_DEP_FILES;
 use buck2_file_watcher::dep_files::FLUSH_NON_LOCAL_DEP_FILES;
 use buck2_fs::fs_util;
 use buck2_fs::paths::file_name::FileName;
+use buck2_fs::paths::file_name::FileNameBuf;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePathNormalizer;
-use dashmap::DashMap;
+use buck2_hash::BuckDashMap;
+use buck2_hash::StdBuckHashMap;
+use buck2_hash::StdBuckHashSet;
 use derive_more::Display;
 use dupe::Dupe;
 use futures::StreamExt;
 use once_cell::sync::Lazy;
+use pagable::Pagable;
 use parking_lot::MappedMutexGuard;
 use parking_lot::Mutex;
 use parking_lot::MutexGuard;
@@ -89,7 +93,7 @@ use tracing::instrument;
 use crate::actions::impls::run::RunActionKey;
 
 #[allocative::root]
-static DEP_FILES: Lazy<DashMap<RunActionKey, Arc<DepFileState>>> = Lazy::new(DashMap::new);
+static DEP_FILES: Lazy<BuckDashMap<RunActionKey, Arc<DepFileState>>> = Lazy::new(BuckDashMap::new);
 
 /// When this is set, we retain directories after fingerprinting, so that we can output them later
 /// for debugging via `buck2 audit dep-files`.
@@ -256,7 +260,7 @@ impl DepFileState {
 
 /// The set of dep files declared by a RunAction, matching tags to their labels. We enforce at
 /// creation time that tags and labels are both unique.
-#[derive(Debug, Allocative)]
+#[derive(Debug, Allocative, Pagable)]
 pub(crate) struct RunActionDepFiles {
     pub(crate) labels: OrderedMap<ArtifactTag, Arc<str>>,
 }
@@ -332,10 +336,9 @@ impl CommonDigests {
         digester.update(self.fingerprint(digest_config).raw_digest().as_bytes());
 
         // Take the digest of the mergebase to get the closest hit.
-        match mergebase {
-            Some(m) => digester.update(m.as_bytes()),
-            None => (),
-        };
+        if let Some(m) = mergebase {
+            digester.update(m.as_bytes());
+        }
         let inner_remote_dep_file_key = digester.finalize().to_string();
 
         let mut blobs = ActionDigestAndBlobsBuilder::new(digest_config);
@@ -499,6 +502,7 @@ impl DepFileBundle {
                     execution_kind: ActionExecutionKind::LocalActionCache,
                     timing: Default::default(),
                     input_files_bytes: None,
+                    waiting_data: WaitingData::new(),
                 },
             )
         });
@@ -536,6 +540,7 @@ impl DepFileBundle {
                     execution_kind: ActionExecutionKind::LocalDepFile,
                     timing: Default::default(),
                     input_files_bytes: None,
+                    waiting_data: WaitingData::new(),
                 },
             )
         });
@@ -553,21 +558,18 @@ impl DepFileBundle {
         // Everything in the common digest structure is included in the remote dep file key,
         // so they should be the same but it's good to double check.
         let common = &self.common_digests;
-        if common.commandline_cli_digest.as_bytes().to_vec() != found.commandline_cli_digest {
+        if common.commandline_cli_digest.as_bytes() != found.commandline_cli_digest.as_slice() {
             tracing::debug!("Remote dep files miss: command cli digests are different");
             return Ok(false);
         }
-        if common.output_paths_digest.raw_digest().as_bytes().to_vec() != found.output_paths_digest
+        if common.output_paths_digest.raw_digest().as_bytes()
+            != found.output_paths_digest.as_slice()
         {
             tracing::debug!("Remote dep files miss: output paths digest are different");
             return Ok(false);
         }
-        if common
-            .untagged_inputs_digest
-            .raw_digest()
-            .as_bytes()
-            .to_vec()
-            != found.untagged_inputs_digest
+        if common.untagged_inputs_digest.raw_digest().as_bytes()
+            != found.untagged_inputs_digest.as_slice()
         {
             tracing::debug!("Remote dep files miss: untagged inputs digest are different");
             return Ok(false);
@@ -635,7 +637,7 @@ impl DepFileBundle {
             .iter()
             .zip(found.dep_file_inputs.iter())
             .filter(|((_, f1), found)| {
-                f1.fingerprint().raw_digest().as_bytes().to_vec() != found.filtered_fingerprint
+                f1.fingerprint().raw_digest().as_bytes() != found.filtered_fingerprint.as_slice()
             })
             .count();
 
@@ -1033,7 +1035,7 @@ async fn eagerly_compute_fingerprints(
 ) -> buck2_error::Result<StoredFingerprints> {
     let dep_files = read_dep_files(false, declared_dep_files, result, artifact_fs, materializer)
         .await?
-        .buck_error_context("Dep file not found")?;
+        .ok_or_else(|| internal_error!("Dep file not found"))?;
 
     let fingerprints = compute_fingerprints(
         shared_declared_inputs.clone().unshare(),
@@ -1088,8 +1090,9 @@ pub(crate) async fn populate_dep_files(
                 }),
             },
             None => {
-                let shared_declared_inputs = shared_declared_inputs
-                    .internal_error("Must have inputs when dep-files are present!")?;
+                let shared_declared_inputs = shared_declared_inputs.ok_or_else(|| {
+                    internal_error!("Must have inputs when dep-files are present!")
+                })?;
                 let input_signatures = if should_compute_fingerprints {
                     let fingerprints = eagerly_compute_fingerprints(
                         ctx.digest_config(),
@@ -1187,22 +1190,8 @@ impl PartitionedInputs<Vec<ArtifactGroup>> {
             builder.finalize()
         }
 
-        fn untagged_reduce(
-            ctx: &dyn ActionExecutionCtx,
-            inputs: &[ArtifactGroup],
-        ) -> buck2_error::Result<ActionDirectoryBuilder> {
-            let mut builder = LazyActionDirectoryBuilder::empty();
-
-            for input in inputs {
-                let input = ctx.artifact_values(input);
-                input.add_to_directory(&mut builder, ctx.fs())?;
-            }
-
-            builder.finalize()
-        }
-
         Ok(PartitionedInputs {
-            untagged: untagged_reduce(ctx, &self.untagged)?,
+            untagged: reduce(ctx, &self.untagged)?,
             tagged: self
                 .tagged
                 .iter()
@@ -1353,7 +1342,10 @@ impl DeclaredDepFiles {
 
         for declared_dep_file in self.tagged.values() {
             let dep_file = &declared_dep_file.output;
-            let content_hash = if declared_dep_file.output.has_content_based_path() {
+            let content_hash = if declared_dep_file
+                .output
+                .path_resolution_requires_artifact_value()
+            {
                 Some(
                     result
                         .get_from_artifact_path(&declared_dep_file.output.get_path())
@@ -1365,9 +1357,7 @@ impl DeclaredDepFiles {
             };
             let path = dep_file
                 .resolve_path(fs, content_hash.as_ref())
-                .map_err(|e| MaterializeDepFilesError::MaterializationFailed {
-                    source: e.into(),
-                })?;
+                .map_err(|e| MaterializeDepFilesError::MaterializationFailed { source: e })?;
             paths.push(path);
         }
 
@@ -1379,7 +1369,7 @@ impl DeclaredDepFiles {
         let mut stream = materializer
             .materialize_many(paths)
             .await
-            .map_err(|e| MaterializeDepFilesError::MaterializationFailed { source: e.into() })?;
+            .map_err(|e| MaterializeDepFilesError::MaterializationFailed { source: e })?;
 
         while let Some(dep_file) = stream.next().await {
             match dep_file {
@@ -1409,10 +1399,14 @@ impl DeclaredDepFiles {
         fs: &ArtifactFs,
         result: &ActionOutputs,
     ) -> buck2_error::Result<Option<ConcreteDepFiles>> {
-        let mut contents = HashMap::with_capacity(self.tagged.len());
+        let mut contents =
+            StdBuckHashMap::with_capacity_and_hasher(self.tagged.len(), Default::default());
 
         for declared_dep_file in self.tagged.values() {
-            let content_hash = if declared_dep_file.output.has_content_based_path() {
+            let content_hash = if declared_dep_file
+                .output
+                .path_resolution_requires_artifact_value()
+            {
                 Some(
                     result
                         .get_from_artifact_path(&declared_dep_file.output.get_path())
@@ -1440,7 +1434,6 @@ impl DeclaredDepFiles {
                                 "Dep file is missing at {}",
                                 dep_file_path
                             )
-                            .into()
                         )?;
                         return Ok(None);
                     }
@@ -1467,8 +1460,8 @@ impl DeclaredDepFiles {
         match other {
             None => self.tagged.is_empty(),
             Some(other) => {
-                let this = self.tagged.values().collect::<HashSet<_>>();
-                let other = other.tagged.values().collect::<HashSet<_>>();
+                let this = self.tagged.values().collect::<StdBuckHashSet<_>>();
+                let other = other.tagged.values().collect::<StdBuckHashSet<_>>();
                 this == other
             }
         }
@@ -1492,7 +1485,7 @@ enum MaterializeDepFilesError {
 /// content of the corresponding dep file.
 #[derive(Clone)]
 pub(crate) struct ConcreteDepFiles {
-    contents: HashMap<Arc<str>, String>,
+    contents: StdBuckHashMap<Arc<str>, String>,
 }
 
 impl ConcreteDepFiles {
@@ -1518,7 +1511,7 @@ impl ConcreteDepFiles {
                 .buck_error_context("Invalid line encountered in dep file")?;
 
             if let Err(e) = Self::add_path_to_selector(path, &mut selector, fs, builder) {
-                soft_error!("failed_to_add_dep_file_path_to_selector", e)?;
+                soft_error!("failed_to_add_dep_file_path_to_selector", e, error_on_oss: true)?;
                 return Ok(None);
             }
         }
@@ -1550,7 +1543,7 @@ impl ConcreteDepFiles {
 
         let mut before_content_hash_parts = vec![];
         let mut path_iter = path.as_ref().iter();
-        // Paths always begin with "buck-out/<ISOLATION_DIR>/gen/<CELL>", so
+        // Paths always begin with "buck-out/<ISOLATION_DIR>/<gen or art, etc.>/<CELL>", so
         // we can skip the first 4 segments.
         for _ in 0..4 {
             if let Some(segment) = path_iter.next() {
@@ -1583,10 +1576,9 @@ impl ConcreteDepFiles {
                 for after_segment in after.iter() {
                     if is_hash(after_segment.as_str()) {
                         return Err(buck2_error::internal_error!(
-                                "Path {} cannot be normalized for dep-files because it has two path segments that look like a content-based hash!",
-                                path,
-                            )
-                            .into());
+                            "Path {} cannot be normalized for dep-files because it has two path segments that look like a content-based hash!",
+                            path,
+                        ));
                     }
                 }
                 if let Some(dir_in_builder) = dir_in_builder {
@@ -1610,8 +1602,7 @@ impl ConcreteDepFiles {
                                 "Found content-based hash {} in path {} that was a leaf in the input directory!",
                                 segment,
                                 path,
-                            )
-                            .into());
+                            ));
                         }
                     }
                 }
@@ -1699,13 +1690,11 @@ fn is_hash(s: &str) -> bool {
     true
 }
 
-fn rename_hash_dirs(name: &str) -> Option<String> {
-    if is_hash(name) {
-        Some(
-            ContentBasedPathHash::DepFilesPlaceholder
-                .as_str()
-                .to_owned(),
-        )
+fn rename_hash_dirs(name: &FileName) -> Option<FileNameBuf> {
+    if is_hash(name.as_str()) {
+        Some(FileNameBuf::unchecked_new(
+            ContentBasedPathHash::DepFilesPlaceholder.as_str(),
+        ))
     } else {
         None
     }

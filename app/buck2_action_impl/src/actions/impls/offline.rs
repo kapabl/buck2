@@ -17,6 +17,7 @@ use buck2_execute::artifact_value::ArtifactValue;
 use buck2_execute::directory::INTERNER;
 use buck2_execute::entry::build_entry_from_disk;
 use buck2_execute::materialize::materializer::CopiedArtifact;
+use buck2_hash::BuckIndexMap;
 use dupe::Dupe;
 
 /// Declares a copy materialization to copy the output BuildArtifact to the
@@ -33,51 +34,70 @@ pub(crate) async fn declare_copy_to_offline_output_cache(
     let offline_cache_path = ctx
         .fs()
         .resolve_offline_output_cache_path(output.get_path())?;
-    declare_copy_materialization(ctx, build_path, offline_cache_path.clone(), value).await?;
+    declare_copy_materialization(ctx, build_path, offline_cache_path.clone(), value, None).await?;
 
     Ok(offline_cache_path)
 }
 
-/// Declares a copy materialization to copy the offline-cached BuildArtifact
-/// output to the build output; effectively the inverse of `declare_copy_to_offline_output_cache`.
-/// Used only during offline builds to ensure buck does not make any network
-/// requests.
+/// Declares copy materializations to copy offline-cached BuildArtifact outputs
+/// to the build output directory. Used only during offline builds to ensure buck
+/// does not make any network requests.
+///
+/// Returns ActionOutputs with all requested outputs on success.
+/// Returns error if ANY output is missing from offline cache.
 pub(crate) async fn declare_copy_from_offline_cache(
     ctx: &mut dyn ActionExecutionCtx,
-    output: &BuildArtifact,
+    outputs: &[&BuildArtifact],
 ) -> buck2_error::Result<ActionOutputs> {
-    let offline_cache_path = ctx
-        .fs()
-        .resolve_offline_output_cache_path(output.get_path())?;
+    let mut restored_outputs = BuckIndexMap::default();
 
-    let (value, _hashing_time) = build_entry_from_disk(
-        ctx.fs().fs().resolve(&offline_cache_path),
-        FileDigestConfig::build(ctx.digest_config().cas_digest_config()),
-        ctx.blocking_executor(),
-        ctx.fs().fs().root(),
-    )
-    .await?;
+    // Restore all outputs - any cache miss = total failure
+    for output in outputs {
+        let offline_cache_path = ctx
+            .fs()
+            .resolve_offline_output_cache_path(output.get_path())?;
 
-    let entry = value
-        .ok_or_else(|| {
-            buck2_error::buck2_error!(
-                buck2_error::ErrorTag::Tier0,
-                "Missing offline cache entry: `{}`",
-                offline_cache_path
-            )
-        })?
-        .map_dir(|dir| {
-            dir.fingerprint(ctx.digest_config().as_directory_serializer())
-                .shared(&*INTERNER)
-        });
-    let value = ArtifactValue::new(entry, None);
+        let (value, _hashing_time) = build_entry_from_disk(
+            ctx.fs().fs().resolve(&offline_cache_path),
+            FileDigestConfig::build(ctx.digest_config().cas_digest_config()),
+            ctx.blocking_executor(),
+            ctx.fs().fs().root(),
+        )
+        .await?;
 
-    let build_path = ctx
-        .fs()
-        .resolve_build(output.get_path(), Some(&value.content_based_path_hash()))?;
-    declare_copy_materialization(ctx, offline_cache_path, build_path, value.dupe()).await?;
+        let entry = value
+            .ok_or_else(|| {
+                buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Tier0,
+                    "Missing offline cache entry: `{}`",
+                    offline_cache_path
+                )
+            })?
+            .map_dir(|dir| {
+                dir.fingerprint(ctx.digest_config().as_directory_serializer())
+                    .shared(&*INTERNER)
+            });
+        let value = ArtifactValue::new(entry, None);
 
-    Ok(ActionOutputs::from_single(output.get_path().dupe(), value))
+        let build_path = ctx
+            .fs()
+            .resolve_build(output.get_path(), Some(&value.content_based_path_hash()))?;
+        let configuration_path = ctx
+            .materializer()
+            .maybe_eager_configuration_path(ctx.fs(), output.get_path())?;
+        declare_copy_materialization(
+            ctx,
+            offline_cache_path,
+            build_path,
+            value.dupe(),
+            configuration_path,
+        )
+        .await?;
+
+        restored_outputs.insert(output.get_path().dupe(), value);
+    }
+
+    Ok(ActionOutputs::new(restored_outputs))
 }
 
 /// Declares a generic copy materialization from src to dest.
@@ -86,6 +106,7 @@ async fn declare_copy_materialization(
     src: ProjectRelativePathBuf,
     dest: ProjectRelativePathBuf,
     value: ArtifactValue,
+    configuration_path: Option<ProjectRelativePathBuf>,
 ) -> buck2_error::Result<()> {
     let immutable_entry = value.entry().dupe().map_dir(|d| d.as_immutable());
     ctx.materializer()
@@ -93,6 +114,7 @@ async fn declare_copy_materialization(
             dest.clone(),
             value,
             vec![CopiedArtifact::new(src, dest, immutable_entry, None)],
+            configuration_path,
         )
         .await
 }

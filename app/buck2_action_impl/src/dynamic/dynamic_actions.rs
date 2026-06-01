@@ -14,7 +14,6 @@ use allocative::Allocative;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
-use starlark::environment::MethodsStatic;
 use starlark::starlark_module;
 use starlark::values::AllocValue;
 use starlark::values::FrozenValueTyped;
@@ -47,18 +46,19 @@ pub(crate) struct StarlarkDynamicActions<'v> {
     pub(crate) data: RefCell<Option<StarlarkDynamicActionsData<'v>>>,
 }
 
+starlark::methods_static!(DYNAMIC_ACTIONS_METHODS = dynamic_actions_methods);
+
 // TODO(nero): the type name is not aligan with the registered type `DynamicActions`, fix it.
 #[starlark_value(type = "DynamicAction")]
 impl<'v> StarlarkValue<'v> for StarlarkDynamicActions<'v> {
     // Used to add type documentation to the generated documentation
     fn get_methods() -> Option<&'static Methods> {
-        static RES: MethodsStatic = MethodsStatic::new();
-        RES.methods(dynamic_actions_methods)
+        Some(DYNAMIC_ACTIONS_METHODS.methods())
     }
 }
 
 impl<'v> AllocValue<'v> for StarlarkDynamicActions<'v> {
-    fn alloc_value(self, heap: &'v Heap) -> Value<'v> {
+    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
         // No need to freeze: we unpack contents of this struct
         // in `ctx.actions.dynamic_output` call.
         heap.alloc_complex_no_freeze(self)

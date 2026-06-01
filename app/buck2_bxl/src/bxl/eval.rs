@@ -176,10 +176,10 @@ struct BxlInnerEvaluator {
 }
 
 impl BxlInnerEvaluator {
-    fn do_eval<'a>(
+    fn do_eval(
         self,
         provider: StarlarkEvaluatorProvider,
-        dice: &'a mut DiceComputations,
+        dice: &mut DiceComputations,
     ) -> Result<(BxlResult, Option<Arc<StarlarkProfileDataAndStats>>)> {
         let BxlInnerEvaluator {
             data,
@@ -189,8 +189,7 @@ impl BxlInnerEvaluator {
             dispatcher,
         } = self;
 
-        BuckStarlarkModule::with_profiling(|env_provider| {
-            let env = env_provider.make();
+        BuckStarlarkModule::with_profiling(|env| {
             let key = data.key().dupe();
 
             let bxl_dice = BxlDiceComputations::new(dice, liveness.dupe());
@@ -364,7 +363,7 @@ fn eval_bxl<'v>(
             .console_message("Re-run the script with `-v5` to show the full stacktrace".to_owned());
     }
 
-    Err(e.into())
+    Err(e)
 }
 
 pub(crate) fn get_bxl_callable(

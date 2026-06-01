@@ -7,10 +7,10 @@ repository = { workspace = true }
 version = "0.1.0"
 
 [dependencies]
-anyhow = { workspace = true }
 async-recursion = { workspace = true }
 async-trait = { workspace = true }
 bincode = { workspace = true }
+buck2_hash = { workspace = true }
 buck2_re_configuration = { workspace = true }
 chrono = { workspace = true }
 constant_time_eq = { workspace = true }
@@ -35,6 +35,7 @@ tar = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
+tower-lsp-server = { workspace = true }
 tracing = { workspace = true }
 
 allocative = { workspace = true }
@@ -81,13 +82,10 @@ dice_futures = { workspace = true }
 buck2_forkserver = { workspace = true }
 psutil = { workspace = true }
 
-[target.'cfg(windows)'.dependencies]
-winapi = { workspace = true }
-
 [dev-dependencies]
 assert_matches = { workspace = true }
 buck2_util = { workspace = true }
 indoc = { workspace = true }
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fbcode_build)"] }
+[lints]
+workspace = true

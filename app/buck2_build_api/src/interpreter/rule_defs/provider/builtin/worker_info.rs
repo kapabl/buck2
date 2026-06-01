@@ -18,6 +18,7 @@ use allocative::Allocative;
 use buck2_build_api_derive::internal_provider;
 use buck2_error::BuckErrorContext;
 use buck2_error::buck2_error;
+use buck2_error::internal_error;
 use either::Either;
 use itertools::Itertools;
 use starlark::any::ProvidesStaticType;
@@ -26,6 +27,7 @@ use starlark::environment::GlobalsBuilder;
 use starlark::eval::Evaluator;
 use starlark::values::Freeze;
 use starlark::values::FreezeError;
+use starlark::values::StarlarkPagable;
 use starlark::values::Trace;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
@@ -48,7 +50,16 @@ use crate::interpreter::rule_defs::cmd_args::value_as::ValueAsCommandLineLike;
 
 /// Provider that signals that a rule is a worker tool
 #[internal_provider(worker_info_creator)]
-#[derive(Clone, Debug, Trace, Coerce, Freeze, ProvidesStaticType, Allocative)]
+#[derive(
+    Clone,
+    Debug,
+    Trace,
+    Coerce,
+    Freeze,
+    ProvidesStaticType,
+    Allocative,
+    StarlarkPagable
+)]
 #[freeze(validator = validate_worker_info, bounds = "V: ValueLike<'freeze>")]
 #[repr(C)]
 pub struct WorkerInfoGen<V: ValueLifetimeless> {
@@ -123,9 +134,9 @@ fn iter_env<'v>(
     let env = env.iter().collect::<Vec<_>>();
 
     Either::Right(env.into_iter().map(|(key, value)| {
-        let key = key.unpack_str().with_buck_error_context(|| {
-            format!("Invalid key in `env`: Expected a str, got: `{key}`")
-        })?;
+        let key = key
+            .unpack_str()
+            .ok_or_else(|| internal_error!("Invalid key in `env`: Expected a str, got: `{key}`"))?;
 
         let arglike = ValueAsCommandLineLike::unpack_value_err(value)
             .with_buck_error_context(|| format!("Invalid value in `env` for key `{key}`"))?
@@ -144,7 +155,6 @@ impl<'v, V: ValueLike<'v>> WorkerInfoGen<V> {
 
     pub fn env(&self) -> Vec<(&'v str, &'v dyn CommandLineArgLike<'v>)> {
         iter_env(self.env.get().to_value())
-            .into_iter()
             .map(|e| e.expect("validated at construction"))
             .collect_vec()
     }

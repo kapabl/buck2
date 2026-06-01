@@ -8,7 +8,6 @@
  * above-listed licenses.
  */
 
-use std::collections::HashMap;
 use std::collections::hash_map;
 use std::process::Command;
 use std::process::ExitStatus;
@@ -20,7 +19,6 @@ use std::sync::OnceLock;
 use buck2_build_api::actions::artifact::get_artifact_fs::GetArtifactFs;
 use buck2_common::dice::data::HasIoProvider;
 use buck2_common::file_ops::delegate::FileOpsDelegate;
-use buck2_common::file_ops::dice::ReadFileProxy;
 use buck2_common::file_ops::metadata::FileDigestConfig;
 use buck2_common::file_ops::metadata::RawDirEntry;
 use buck2_common::file_ops::metadata::RawPathMetadata;
@@ -50,12 +48,17 @@ use buck2_execute::materialize::materializer::Materializer;
 use buck2_fs::fs_util;
 use buck2_fs::paths::abs_norm_path::AbsNormPath;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
+use buck2_hash::StdBuckHashMap;
 use buck2_util::process::background_command;
 use cmp_any::PartialEqAny;
 use dice::CancellationContext;
 use dice::DiceComputations;
 use dice::Key;
+use dice::OkPagableValueSerialize;
+use dice::ValueSerialize;
 use dupe::Dupe;
+use pagable::Pagable;
+use pagable::pagable_typetag;
 use tokio::sync::Semaphore;
 
 #[derive(buck2_error::Error, Debug)]
@@ -118,14 +121,9 @@ impl IoRequest for GitFetchIoRequest {
         })?;
 
         run_git(&path, |c| {
-            c.arg("remote")
-                .arg("add")
-                .arg("origin")
-                .arg(self.setup.git_origin.as_ref());
-        })?;
-
-        run_git(&path, |c| {
-            c.arg("fetch").arg("origin").arg(self.setup.commit.as_ref());
+            c.arg("fetch")
+                .arg(self.setup.git_origin.as_ref())
+                .arg(self.setup.commit.as_ref());
         })?;
 
         run_git(&path, |c| {
@@ -194,7 +192,7 @@ async fn download_impl(
         .declare_existing(vec![DeclareArtifactPayload {
             path: path.to_owned(),
             artifact: ArtifactValue::new(entry, None),
-            persist_full_directory_structure: false,
+            configuration_path: None,
         }])
         .await?;
 
@@ -215,7 +213,8 @@ async fn download_and_materialize(
 
     // A map of commit hashes to semaphores that are actually condvars which protect access to the
     // directory associated with that commit
-    static DIRECTORY_LICENSES: OnceLock<Mutex<HashMap<Arc<str>, Arc<Semaphore>>>> = OnceLock::new();
+    static DIRECTORY_LICENSES: OnceLock<Mutex<StdBuckHashMap<Arc<str>, Arc<Semaphore>>>> =
+        OnceLock::new();
 
     // We have to write this in a slightly funny way to convince the compiler that there's no
     // `map_guard` being held across an await point
@@ -272,7 +271,7 @@ async fn download_and_materialize(
     res
 }
 
-#[derive(allocative::Allocative)]
+#[derive(allocative::Allocative, Pagable)]
 pub(crate) struct GitFileOpsDelegate {
     buck_out_resolver: BuckOutPathResolver,
     cell: CellName,
@@ -293,21 +292,18 @@ impl GitFileOpsDelegate {
     }
 }
 
+#[pagable_typetag]
 #[async_trait::async_trait]
 impl FileOpsDelegate for GitFileOpsDelegate {
     async fn read_file_if_exists(
         &self,
         _ctx: &mut DiceComputations<'_>,
         path: &'async_trait CellRelativePath,
-    ) -> buck2_error::Result<ReadFileProxy> {
-        Ok(ReadFileProxy::new_with_captures(
-            (self.resolve(path), self.io.dupe()),
-            |(project_path, io)| async move {
-                (&io as &dyn IoProvider)
-                    .read_file_if_exists(project_path)
-                    .await
-            },
-        ))
+    ) -> buck2_error::Result<Option<String>> {
+        let project_path = self.resolve(path);
+        (&self.io as &dyn IoProvider)
+            .read_file_if_exists(project_path)
+            .await
     }
 
     async fn read_dir(
@@ -371,9 +367,11 @@ pub(crate) async fn get_file_ops_delegate(
         PartialEq,
         Eq,
         Hash,
-        allocative::Allocative
+        allocative::Allocative,
+        Pagable
     )]
     #[display("({}, {})", _0, _1)]
+    #[pagable_typetag(dice::DiceKeyDyn)]
     struct GitFileOpsDelegateKey(CellName, GitCellSetup);
 
     #[async_trait::async_trait]
@@ -401,6 +399,10 @@ pub(crate) async fn get_file_ops_delegate(
 
         fn equality(_x: &Self::Value, _y: &Self::Value) -> bool {
             false
+        }
+
+        fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+            OkPagableValueSerialize::<Self::Value>::new()
         }
     }
 

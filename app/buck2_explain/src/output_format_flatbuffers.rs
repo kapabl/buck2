@@ -99,7 +99,7 @@ mod tests {
     fn test_targets() {
         let data: TargetSet<ConfiguredTargetNode> = gen_data(vec![(
             "srcs",
-            Attribute::new(None, "", AttrType::list(AttrType::source(false))),
+            Attribute::new_const(None, "", AttrType::list(AttrType::source(false))),
             CoercedAttr::List(ListLiteral(ArcSlice::new([
                 CoercedAttr::SourceFile(CoercedPath::File(
                     PackageRelativePath::new("foo/bar").unwrap().to_arc(),
@@ -126,7 +126,7 @@ mod tests {
                 .contains("cell//pkg:baz (<testing>#")
         );
         assert_eq!(target.type_(), Some("foo_lib"));
-        assert_eq!(target.deps().unwrap().is_empty(), true);
+        assert!(target.deps().unwrap().is_empty());
 
         let target2 = build.targets().unwrap().get(1);
         assert!(
@@ -155,7 +155,7 @@ mod tests {
                 ConfigurationData::testing_new(),
                 CommandExecutorConfig::testing_local(),
             );
-            ExecutionPlatformResolution::new(Some(platform), Vec::new())
+            ExecutionPlatformResolution::new_for_testing(Some(platform), Vec::new())
         };
 
         let target = ConfiguredTargetNode::testing_new(

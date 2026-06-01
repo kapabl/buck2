@@ -93,6 +93,11 @@ if not running_on_windows() and not running_on_mac():
     )
 
     build_report_test(
+        "test_action_fail_infra",
+        ["//fail_action:fail_infra"],
+    )
+
+    build_report_test(
         "test_action_fail_one_with_error_handler",
         ["//fail_action:fail_one_with_error_handler"],
     )
@@ -117,7 +122,7 @@ if not running_on_windows() and not running_on_mac():
         )
 
         golden(
-            output=sanitize_error_stderr(result.stderr, buck.cwd),
+            output=sanitize_error_stderr(result.stderr, buck),
             rel_path="fixtures/test_stderr_with_empty_error_diagnostics.golden.txt",
         )
 
@@ -128,7 +133,7 @@ if not running_on_windows() and not running_on_mac():
         )
 
         golden(
-            output=sanitize_error_stderr(result.stderr, buck.cwd),
+            output=sanitize_error_stderr(result.stderr, buck),
             rel_path="fixtures/test_stderr_with_error_diagnostics.golden.txt",
         )
 
@@ -137,7 +142,7 @@ if not running_on_windows() and not running_on_mac():
         result = await expect_failure(buck.build("//fail_action:fail_script"))
 
         golden(
-            output=sanitize_error_stderr(result.stderr, buck.cwd),
+            output=sanitize_error_stderr(result.stderr, buck),
             rel_path="fixtures/test_stderr_with_no_error_diagnostics.golden.txt",
         )
 
@@ -146,7 +151,7 @@ if not running_on_windows() and not running_on_mac():
         result = await expect_failure(buck.build("//fail_action:error_handler_failed"))
 
         golden(
-            output=sanitize_error_stderr(result.stderr, buck.cwd),
+            output=sanitize_error_stderr(result.stderr, buck),
             rel_path="fixtures/test_stderr_could_not_produce_error_diagnostics.golden.txt",
         )
 
@@ -339,3 +344,64 @@ async def test_missing_report_on_wrong_package(buck: Buck, tmp_path: Path) -> No
     )
     if report.exists():
         raise AssertionError("Expected no report to be written")
+
+
+# TODO fix on windows and mac
+if not running_on_windows() and not running_on_mac():
+
+    @buck_test()
+    async def test_exclude_action_error_diagnostics(buck: Buck, tmp_path: Path) -> None:
+        # Test that --build-report-options=exclude-action-error-diagnostics removes
+        # error_diagnostics from the build report.
+        report = tmp_path / "build-report.json"
+        await expect_failure(
+            buck.build(
+                "--build-report",
+                str(report),
+                "--build-report-options",
+                "fill-out-failures,exclude-action-error-diagnostics",
+                "//fail_action:fail_one_with_error_handler",
+            )
+        )
+        with open(report) as f:
+            report_data = json.loads(f.read())
+
+        sanitize_build_report(report_data)
+
+        golden(
+            output=sanitize_hashes(
+                sanitize_python(
+                    json.dumps(report_data, indent=2, sort_keys=True), buck.cwd
+                )
+            ),
+            rel_path="fixtures/test_exclude_action_error_diagnostics.golden.json",
+        )
+
+    @buck_test()
+    async def test_truncate_error_content(buck: Buck, tmp_path: Path) -> None:
+        # Test that --build-report-options=truncate-error-content truncates
+        # error message content in the build report when errors exceed 20KB.
+        # Uses a target that produces a 25KB+ error message.
+        report = tmp_path / "build-report.json"
+        await expect_failure(
+            buck.build(
+                "--build-report",
+                str(report),
+                "--build-report-options",
+                "fill-out-failures,truncate-error-content",
+                "//fail_action:fail_large_error",
+            )
+        )
+        with open(report) as f:
+            report_data = json.loads(f.read())
+
+        sanitize_build_report(report_data)
+
+        golden(
+            output=sanitize_hashes(
+                sanitize_python(
+                    json.dumps(report_data, indent=2, sort_keys=True), buck.cwd
+                )
+            ),
+            rel_path="fixtures/test_truncate_error_content.golden.json",
+        )

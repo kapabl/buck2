@@ -12,7 +12,6 @@ import json
 from pathlib import Path
 
 from buck2.tests.e2e_util.api.buck import Buck
-
 from buck2.tests.e2e_util.asserts import expect_failure
 from buck2.tests.e2e_util.buck_workspace import buck_test
 
@@ -24,8 +23,8 @@ async def test_bxl_actions(buck: Buck) -> None:
     )
 
     # FIXME(JakobDegen): The first assert doesn't test anything the second doesn't cover
-    assert "<source artifact_test/TARGETS.fixture>" in result.stdout
-    assert "[<source artifact_test/TARGETS.fixture>]" in result.stdout
+    assert "<source artifact artifact_test/TARGETS.fixture>" in result.stdout
+    assert "[<source artifact artifact_test/TARGETS.fixture>]" in result.stdout
 
 
 @buck_test()

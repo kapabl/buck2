@@ -8,6 +8,7 @@ version = "0.1.0"
 
 [dependencies]
 allocative = { workspace = true }
+anyhow = { workspace = true }
 async-compression = { workspace = true }
 async-trait = { workspace = true }
 blake3 = { workspace = true }
@@ -32,7 +33,6 @@ libc = { workspace = true }
 memmap2 = { workspace = true }
 object = { workspace = true }
 once_cell = { workspace = true }
-pin-project = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 rand = { workspace = true }
@@ -41,6 +41,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 shlex = { workspace = true }
 strum = { workspace = true }
+superconsole = { version = "0.2.0", path = "../../superconsole" }
 sysinfo = { workspace = true }
 take_mut = { workspace = true }
 termwiz = { workspace = true }
@@ -50,7 +51,7 @@ tokio-util = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
 
-superconsole = { version = "0.2.0", path = "../../superconsole" }
+games = { path = "../../games" }
 
 # Please do not add dependency on `buck2_build_api`.
 buck2_build_info = { workspace = true }
@@ -63,17 +64,17 @@ buck2_event_log = { workspace = true }
 buck2_event_observer = { workspace = true }
 buck2_events = { workspace = true }
 buck2_fs = { workspace = true }
+buck2_hash = { workspace = true }
 buck2_health_check = { workspace = true }
 buck2_resource_control = { workspace = true }
 buck2_util = { workspace = true }
 buck2_wrapper_common = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true }
 termios = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-winapi = { workspace = true }
+windows-sys = { workspace = true }
 
 [dev-dependencies]
 assert_matches = { workspace = true }
@@ -83,5 +84,5 @@ maplit = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fbcode_build)"] }
+[lints]
+workspace = true

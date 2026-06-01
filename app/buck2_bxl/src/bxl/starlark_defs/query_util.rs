@@ -11,6 +11,7 @@
 use buck2_error::starlark_error::from_starlark_with_options;
 use buck2_query::query::syntax::simple::eval::values::QueryEvaluationResult;
 use buck2_query::query::syntax::simple::eval::values::QueryEvaluationValue;
+use starlark::typing::HasTyVTable;
 use starlark::values::Heap;
 use starlark::values::Value;
 use starlark::values::dict::Dict;
@@ -21,8 +22,11 @@ use crate::bxl::starlark_defs::targetset::StarlarkTargetSet;
 
 pub(crate) fn parse_query_evaluation_result<'v, T: NodeLike>(
     result: QueryEvaluationResult<T>,
-    heap: &'v Heap,
-) -> buck2_error::Result<Value<'v>> {
+    heap: Heap<'v>,
+) -> buck2_error::Result<Value<'v>>
+where
+    StarlarkTargetSet<T>: HasTyVTable,
+{
     Ok(match result {
         QueryEvaluationResult::Single(result) => match result {
             QueryEvaluationValue::TargetSet(targets) => {

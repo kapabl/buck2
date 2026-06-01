@@ -14,7 +14,7 @@ use buck2_build_api::audit_output::AuditOutputResult;
 use buck2_build_api::audit_output::audit_output;
 use buck2_core::cells::CellResolver;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
-use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_interpreter::types::target_label::StarlarkTargetLabel;
 use derivative::Derivative;
 use derive_more::Display;
@@ -23,7 +23,6 @@ use futures::FutureExt;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
-use starlark::environment::MethodsStatic;
 use starlark::eval::Evaluator;
 use starlark::starlark_module;
 use starlark::values::AllocValue;
@@ -64,16 +63,17 @@ pub(crate) struct StarlarkAuditCtx<'v> {
     cell_resolver: CellResolver,
 }
 
+starlark::methods_static!(AUDIT_METHODS = audit_methods);
+
 #[starlark_value(type = "bxl.AuditContext", StarlarkTypeRepr, UnpackValue)]
 impl<'v> StarlarkValue<'v> for StarlarkAuditCtx<'v> {
     fn get_methods() -> Option<&'static Methods> {
-        static RES: MethodsStatic = MethodsStatic::new();
-        RES.methods(audit_methods)
+        Some(AUDIT_METHODS.methods())
     }
 }
 
 impl<'v> AllocValue<'v> for StarlarkAuditCtx<'v> {
-    fn alloc_value(self, heap: &'v Heap) -> Value<'v> {
+    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
         heap.alloc_complex_no_freeze(self)
     }
 }
@@ -110,7 +110,7 @@ fn audit_methods(builder: &mut MethodsBuilder) {
     /// ```python
     /// def _impl_audit_output(ctx):
     ///     target_platform = "foo"
-    ///     result = ctx.audit().output("buck-out/v2/gen/fbcode/some_cfg_hash/path/to/__target__/artifact", target_platform)
+    ///     result = ctx.audit().output("buck-out/v2/art/fbcode/some_cfg_hash/path/to/__target__/artifact", target_platform)
     ///     ctx.output.print(result)
     /// ```
     fn output<'v>(
@@ -127,7 +127,7 @@ fn audit_methods(builder: &mut MethodsBuilder) {
         let heap = eval.heap();
         let global_cfg_options = this
             .ctx
-            .resolve_global_cfg_options(target_platform, vec![].into())?;
+            .resolve_global_cfg_options(target_platform, vec![])?;
 
         Ok(this.ctx.via_dice(eval, |ctx| {
             ctx.via(|ctx| {
@@ -146,7 +146,9 @@ fn audit_methods(builder: &mut MethodsBuilder) {
                             AuditOutputResult::Match(action) => heap.alloc(StarlarkAction(
                                 action
                                     .action()
-                                    .buck_error_context("audit_output did not return an action")?
+                                    .ok_or_else(|| {
+                                        internal_error!("audit_output did not return an action")
+                                    })?
                                     .dupe(),
                             )),
                             AuditOutputResult::MaybeRelevantForConfigurationHashPath(label) => {

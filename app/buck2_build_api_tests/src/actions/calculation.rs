@@ -59,6 +59,7 @@ use buck2_core::cells::cell_root_path::CellRootPathBuf;
 use buck2_core::cells::name::CellName;
 use buck2_core::cells::paths::CellRelativePathBuf;
 use buck2_core::configuration::compatibility::MaybeCompatible;
+use buck2_core::configuration::compatibility::ResultMaybeCompatible;
 use buck2_core::configuration::data::ConfigurationData;
 use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
 use buck2_core::deferred::key::DeferredHolderKey;
@@ -96,6 +97,7 @@ use buck2_execute::materialize::nodisk::NoDiskMaterializer;
 use buck2_execute::re::manager::UnconfiguredRemoteExecutionClient;
 use buck2_file_watcher::mergebase::SetMergebase;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePathBuf;
+use buck2_hash::buck_indexset;
 use buck2_http::HttpClientBuilder;
 use buck2_node::nodes::configured::ConfiguredTargetNode;
 use buck2_util::time_span::TimeSpan;
@@ -103,7 +105,6 @@ use dice::DiceTransaction;
 use dice::UserComputationData;
 use dice::testing::DiceBuilder;
 use dupe::Dupe;
-use indexmap::indexset;
 use maplit::btreemap;
 use sorted_vector_map::sorted_vector_map;
 
@@ -169,14 +170,12 @@ fn mock_analysis_for_action_resolution(
 
     dice_builder.mock_and_return(
         configured_node_key,
-        Ok(MaybeCompatible::Compatible(
-            ConfiguredTargetNode::testing_new(
-                configured_target_label,
-                "foo_lib",
-                ExecutionPlatformResolution::new(None, Vec::new()),
-                vec![],
-                None,
-            ),
+        ResultMaybeCompatible::Compatible(ConfiguredTargetNode::testing_new(
+            configured_target_label,
+            "foo_lib",
+            ExecutionPlatformResolution::new_for_testing(None, Vec::new()),
+            vec![],
+            None,
         )),
     )
 }
@@ -266,8 +265,8 @@ async fn test_get_action_for_artifact() -> buck2_error::Result<()> {
     let registered_action = registered_action(
         build_artifact.dupe(),
         Box::new(SimpleAction::new(
-            indexset![],
-            indexset![build_artifact.dupe()],
+            buck_indexset![],
+            buck_indexset![build_artifact.dupe()],
             vec![],
             CategoryRef::new("fake_action").unwrap().to_owned(),
             None,
@@ -303,8 +302,8 @@ async fn test_build_action() -> buck2_error::Result<()> {
     let registered_action = registered_action(
         build_artifact.dupe(),
         Box::new(SimpleAction::new(
-            indexset![],
-            indexset![build_artifact.dupe()],
+            buck_indexset![],
+            buck_indexset![build_artifact.dupe()],
             vec!["foo".to_owned(), "cmd".to_owned()],
             CategoryRef::new("fake_action").unwrap().to_owned(),
             None,
@@ -337,7 +336,6 @@ async fn test_build_action() -> buck2_error::Result<()> {
             outputs: vec![CommandExecutionOutput::BuildArtifact {
                 path: build_artifact.get_path().dupe(),
                 output_type: OutputType::File,
-                supports_incremental_remote: false,
             }],
             env: sorted_vector_map![]
         }
@@ -354,8 +352,8 @@ async fn test_build_artifact() -> buck2_error::Result<()> {
     let registered_action = registered_action(
         build_artifact.dupe(),
         Box::new(SimpleAction::new(
-            indexset![],
-            indexset![build_artifact.dupe()],
+            buck_indexset![],
+            buck_indexset![build_artifact.dupe()],
             vec!["bar".to_owned(), "cmd".to_owned()],
             CategoryRef::new("fake_action").unwrap().to_owned(),
             None,
@@ -387,7 +385,6 @@ async fn test_build_artifact() -> buck2_error::Result<()> {
             outputs: vec![CommandExecutionOutput::BuildArtifact {
                 path: build_artifact.get_path().dupe(),
                 output_type: OutputType::File,
-                supports_incremental_remote: false,
             }],
             env: sorted_vector_map![]
         }
@@ -403,8 +400,8 @@ async fn test_ensure_artifact_build_artifact() -> buck2_error::Result<()> {
     let registered_action = registered_action(
         build_artifact.dupe(),
         Box::new(SimpleAction::new(
-            indexset![],
-            indexset![build_artifact.dupe()],
+            buck_indexset![],
+            buck_indexset![build_artifact.dupe()],
             vec!["ensure".to_owned(), "cmd".to_owned()],
             CategoryRef::new("fake_action").unwrap().to_owned(),
             None,
@@ -437,7 +434,6 @@ async fn test_ensure_artifact_build_artifact() -> buck2_error::Result<()> {
             outputs: vec![CommandExecutionOutput::BuildArtifact {
                 path: build_artifact.get_path().dupe(),
                 output_type: OutputType::File,
-                supports_incremental_remote: false,
             }],
             env: sorted_vector_map![]
         }

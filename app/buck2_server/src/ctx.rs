@@ -9,8 +9,6 @@
  */
 
 use std::collections::BTreeSet;
-use std::collections::HashMap;
-use std::collections::HashSet;
 use std::io::BufWriter;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -34,6 +32,8 @@ use buck2_build_api::keep_going::HasKeepGoing;
 use buck2_build_api::materialize::HasMaterializationQueueTracker;
 use buck2_build_api::spawner::BuckSpawner;
 use buck2_build_signals::env::CriticalPathBackendName;
+use buck2_build_signals::env::EarlyCommandTimingBuilder;
+use buck2_build_signals::env::FILE_WATCHER_WAIT;
 use buck2_build_signals::env::HasCriticalPathBackend;
 use buck2_certs::validate::CertState;
 use buck2_cli_proto::ClientContext;
@@ -83,12 +83,15 @@ use buck2_execute::re::output_trees_download_config::OutputTreesDownloadConfig;
 use buck2_execute_impl::executors::worker::WorkerPool;
 use buck2_execute_impl::low_pass_filter::LowPassFilter;
 use buck2_file_watcher::mergebase::SetMergebase;
+use buck2_fs::error::IoResultExt;
 use buck2_fs::fs_util;
 use buck2_fs::paths::abs_norm_path::AbsNormPath;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_fs::paths::file_name::FileName;
 use buck2_fs::paths::file_name::FileNameBuf;
 use buck2_fs::working_dir::AbsWorkingDir;
+use buck2_hash::StdBuckHashMap;
+use buck2_hash::StdBuckHashSet;
 use buck2_interpreter::dice::starlark_debug::SetStarlarkDebugger;
 use buck2_interpreter::extra::InterpreterHostArchitecture;
 use buck2_interpreter::extra::InterpreterHostPlatform;
@@ -232,6 +235,9 @@ pub struct ServerCommandContext<'a> {
     /// Sanitized argument vector from the CLI from the client side.
     pub(crate) sanitized_argv: Vec<String>,
 
+    /// Agent context key=value pairs from --agent-context.
+    pub(crate) agent_context: Vec<buck2_data::AgentContextEntry>,
+
     cancellations: &'a CancellationContext,
 
     preemptible: PreemptibleWhen,
@@ -352,6 +358,7 @@ impl<'a> ServerCommandContext<'a> {
             daemon_uuid_from_client: client_context.daemon_uuid.clone(),
             command_name: client_context.command_name.clone(),
             sanitized_argv: client_context.sanitized_argv.clone(),
+            agent_context: client_context.agent_context.clone(),
             debugger_handle,
             cancellations,
             preemptible: client_context.preemptible(),
@@ -399,7 +406,6 @@ impl<'a> ServerCommandContext<'a> {
             default_allow_cache_upload: false,
             action_paths_interner: None,
             deduplicate_get_digests_ttl_calls: false,
-            re_outputs_required: false,
         };
 
         let concurrency = self
@@ -464,8 +470,11 @@ impl<'a> ServerCommandContext<'a> {
     }
 
     // Called at the end of the command to perform any necessary final actions or cleanup.
-    pub(crate) fn finalize(self) -> buck2_error::Result<()> {
-        self.starlark_profiling_manager.finalize()?;
+    pub(crate) async fn finalize(mut self) -> buck2_error::Result<()> {
+        self.starlark_profiling_manager
+            .finalize(&self.base_context.events)
+            .await?;
+        self.heartbeat_guard_handle.take().unwrap().finalize().await;
         Ok(())
     }
 }
@@ -508,7 +517,7 @@ impl ServerCommandContext<'_> {
                 Ok(BuckConfigBasedCells {
                     cell_resolver: new_configs.cell_resolver,
                     root_config: new_configs.root_config,
-                    config_paths: HashSet::new(),
+                    config_paths: StdBuckHashSet::default(),
                     external_data: (*dice_ctx.get_injected_external_buckconfig_data().await?)
                         .clone(),
                 })
@@ -525,13 +534,18 @@ impl ServerCommandContext<'_> {
         }
     }
 
-    fn report_traced_config_paths(&self, paths: &HashSet<ConfigPath>) -> buck2_error::Result<()> {
+    fn report_traced_config_paths(
+        &self,
+        paths: &StdBuckHashSet<ConfigPath>,
+    ) -> buck2_error::Result<()> {
         if let Some(tracing_provider) = TracingIoProvider::from_io(&*self.base_context.daemon.io) {
             for config_path in paths {
                 match config_path {
                     ConfigPath::Global(p) => {
                         // FIXME(JakobDegen): This is wrong, since we might fail to add symlinks that we depend on.
-                        let p = fs_util::canonicalize(p)?;
+                        let p = fs_util::canonicalize(p)
+                            // input path could be from --config-file
+                            .categorize_input()?;
                         tracing_provider.add_external_path(p)
                     }
                     ConfigPath::Project(p) => tracing_provider.add_project_path(p.clone()),
@@ -575,13 +589,23 @@ impl DiceUpdater for DiceCommandUpdater<'_, '_> {
     async fn update(
         &self,
         mut ctx: DiceTransactionUpdater,
-    ) -> buck2_error::Result<(
-        DiceTransactionUpdater,
-        UserComputationData,
-        buck2_util::time_span::TimeSpan,
-    )> {
+        early_timings: &mut EarlyCommandTimingBuilder,
+    ) -> buck2_error::Result<(DiceTransactionUpdater, UserComputationData)> {
         let existing_state = &mut ctx.existing_state().await.clone();
         let cells_and_configs = self.cmd_ctx.load_new_configs(existing_state).await?;
+
+        // Validate agent context against buckconfig schema if entries were provided.
+        if !self.cmd_ctx.agent_context.is_empty() {
+            let schema = crate::agent_context_validation::AgentContextSchema::from_config(
+                &cells_and_configs.root_config,
+            );
+            crate::agent_context_validation::validate_agent_context(
+                &schema,
+                self.cmd_ctx.client_id_from_client_metadata.as_deref(),
+                &self.cmd_ctx.agent_context,
+            )?;
+        }
+
         let cell_resolver = cells_and_configs.cell_resolver;
 
         let configuror = BuildInterpreterConfiguror::new(
@@ -609,6 +633,26 @@ impl DiceUpdater for DiceCommandUpdater<'_, '_> {
         let profiler_instrumentation_override =
             &self.cmd_ctx.starlark_profiling_manager.configuration;
 
+        // Read `buck2.starlark_parser` from the root cell's buckconfig.
+        // Defaults to LALRPOP. Recognized values: `lalrpop`, `recursive_descent`, `rd`.
+        // Parsed explicitly so we can map the parser-kind error into a
+        // buck2_error without adding a `From` impl that would couple buck2_error
+        // to starlark_syntax.
+        let parser_kind = match cells_and_configs.root_config.get(BuckconfigKeyRef {
+            section: "buck2",
+            property: "starlark_parser",
+        }) {
+            Some(s) => s.parse::<starlark::syntax::ParserKind>().map_err(|e| {
+                buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Input,
+                    "buck2.starlark_parser: {}",
+                    e
+                )
+            })?,
+            None => starlark::syntax::ParserKind::default(),
+        };
+        let use_rd_parser = matches!(parser_kind, starlark::syntax::ParserKind::Rd);
+
         setup_interpreter(
             &mut ctx,
             cell_resolver,
@@ -617,9 +661,10 @@ impl DiceUpdater for DiceCommandUpdater<'_, '_> {
             profiler_instrumentation_override.clone(),
             self.cmd_ctx.disable_starlark_types,
             self.cmd_ctx.unstable_typecheck,
+            use_rd_parser,
         )?;
 
-        let start = buck2_util::time_span::TimeSpan::start_now();
+        early_timings.start_span(FILE_WATCHER_WAIT.to_owned());
         let (ctx, mergebase) = self
             .cmd_ctx
             .base_context
@@ -627,12 +672,12 @@ impl DiceUpdater for DiceCommandUpdater<'_, '_> {
             .file_watcher
             .sync(ctx)
             .await?;
-        let wait_time_span = start.end_now();
+        early_timings.end_known_span();
 
         let mut user_data = self.make_user_computation_data(&cells_and_configs.root_config)?;
         user_data.set_mergebase(mergebase);
 
-        Ok((ctx, user_data, wait_time_span))
+        Ok((ctx, user_data))
     }
 }
 
@@ -712,8 +757,15 @@ impl DiceCommandUpdater<'_, '_> {
             re_fallback_on_estimated_queue_time_exceeds,
         };
 
-        let host_sharing_broker =
-            HostSharingBroker::new(HostSharingStrategy::SmallerTasksFirst, concurrency);
+        let host_sharing_broker = HostSharingBroker::new_with_named_semaphores(
+            HostSharingStrategy::SmallerTasksFirst,
+            concurrency,
+            self.cmd_ctx
+                .base_context
+                .daemon
+                .named_semaphores_for_run_actions
+                .dupe(),
+        );
 
         // We use the job count for the low pass filter too. The low pass filter prevents sending
         // RE-eligile tasks to local if their concurrency is higher than our threshold. While it
@@ -725,7 +777,7 @@ impl DiceCommandUpdater<'_, '_> {
         let mut data = DiceData::new();
         data.set(self.cmd_ctx.events().dupe());
         data.set(HasResourceControl(
-            self.cmd_ctx.base_context.daemon.cgroup_tree.is_some(),
+            self.cmd_ctx.base_context.daemon.memory_tracker.is_some(),
         ));
 
         let cycle_detector = if root_config
@@ -772,13 +824,6 @@ impl DiceCommandUpdater<'_, '_> {
             })?
             .unwrap_or(false);
 
-        run_action_knobs.re_outputs_required |= root_config
-            .parse::<bool>(BuckconfigKeyRef {
-                section: "buck2",
-                property: "re_outputs_required",
-            })?
-            .unwrap_or(false);
-
         let output_trees_download_semaphore_size = root_config.parse::<u32>(BuckconfigKeyRef {
             section: "buck2",
             property: "output_trees_download_semaphore_size",
@@ -796,7 +841,7 @@ impl DiceCommandUpdater<'_, '_> {
             fingerprint_re_output_trees_eagerly,
         );
 
-        _ = buck2_core::faster_directories::VALUE.store(
+        buck2_core::faster_directories::VALUE.store(
             root_config
                 .parse::<bool>(BuckconfigKeyRef {
                     section: "buck2",
@@ -806,9 +851,19 @@ impl DiceCommandUpdater<'_, '_> {
             std::sync::atomic::Ordering::Relaxed,
         );
 
+        let dice = self
+            .cmd_ctx
+            .base_context
+            .daemon
+            .dice_manager
+            .unsafe_dice()
+            .dupe();
         let mut data = UserComputationData {
             data,
-            tracker: Arc::new(BuckDiceTracker::new(self.cmd_ctx.events().dupe())?),
+            tracker: Arc::new(BuckDiceTracker::new(
+                self.cmd_ctx.events().dupe(),
+                Box::new(move || dice.core_state_queue_depth() as u64),
+            )?),
             cycle_detector,
             activation_tracker: Some(self.build_signals.activation_tracker.dupe()),
             ..Default::default()
@@ -909,14 +964,14 @@ impl DiceCommandUpdater<'_, '_> {
     }
 }
 
-struct ConfigMetadataHolder(HashMap<String, String>);
+struct ConfigMetadataHolder(StdBuckHashMap<String, String>);
 
 fn collect_config_metadata_into(config: &LegacyBuckConfig, data: &mut UserComputationData) {
     // Facebook only: metadata collection for Scribe writes
     facebook_only();
 
     fn add_config(
-        map: &mut HashMap<String, String>,
+        map: &mut StdBuckHashMap<String, String>,
         cfg: &LegacyBuckConfig,
         key: BuckconfigKeyRef<'static>,
         field_name: &'static str,
@@ -938,11 +993,11 @@ fn collect_config_metadata_into(config: &LegacyBuckConfig, data: &mut UserComput
         sample_json.get("normals")?.as_object().cloned()
     }
 
-    let mut metadata = HashMap::new();
+    let mut metadata = StdBuckHashMap::default();
 
     add_config(
         &mut metadata,
-        &config,
+        config,
         BuckconfigKeyRef {
             section: "log",
             property: "repository",
@@ -968,7 +1023,7 @@ fn collect_config_metadata_into(config: &LegacyBuckConfig, data: &mut UserComput
     // metadata. Depending on what sort of things we're missing by dropping int default columns, we might want
     // to consider adding support to the protocol for integer metadata.
 
-    if let Some(normals_obj) = extract_scuba_defaults(&config) {
+    if let Some(normals_obj) = extract_scuba_defaults(config) {
         for (key, value) in normals_obj.iter() {
             if let Some(value) = value.as_str() {
                 metadata.insert(key.clone(), value.to_owned());
@@ -976,15 +1031,41 @@ fn collect_config_metadata_into(config: &LegacyBuckConfig, data: &mut UserComput
         }
     }
 
+    // TODO(pbergen): Remove this when we desupport client.id in config.
     add_config(
         &mut metadata,
-        &config,
+        config,
         BuckconfigKeyRef {
             section: "client",
             property: "id",
         },
         "client",
     );
+
+    // Soft error if client.id is set in buckconfig (deprecated, will become hard error)
+    if let Some(client_id) = config.get(BuckconfigKeyRef {
+        section: "client",
+        property: "id",
+    }) {
+        use buck2_core::soft_error;
+
+        soft_error!(
+            "client_id_in_buckconfig",
+            buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "Setting `client.id` via config (`-c|--config client.id={}`) is deprecated \
+                 because it invalidates the DICE graph which causes performance loss. \
+                 Please migrate to `--client-metadata=id={}` instead. \
+                 This will become a hard error in a future Buck2 release. \
+                 For more information, see: https://internalfb.com/intern/staticdocs/buck2/docs/rule_authors/client_metadata/",
+                client_id,
+                client_id
+            ),
+            quiet: false,
+            deprecation: true,
+            error_on_oss: true,
+        ).ok();
+    }
 
     if let Ok(schedule_type) = SandcastleScheduleType::new() {
         if let Some(schedule_type_str) = schedule_type.as_str() {
@@ -1085,12 +1166,11 @@ impl ServerCommandContextTrait for ServerCommandContext<'_> {
             data: Some(data),
             cli_args: self.sanitized_argv.clone(),
             tags: self.base_context.daemon.tags.clone(),
-            ..Default::default()
         })
     }
 
     /// Gathers metadata to attach to events for when a command starts and stops.
-    async fn request_metadata(&self) -> buck2_error::Result<HashMap<String, String>> {
+    async fn request_metadata(&self) -> buck2_error::Result<StdBuckHashMap<String, String>> {
         // Facebook only: metadata collection for Scribe writes
         facebook_only();
 
@@ -1140,7 +1220,7 @@ impl ServerCommandContextTrait for ServerCommandContext<'_> {
     async fn config_metadata(
         &self,
         ctx: &mut DiceComputations<'_>,
-    ) -> buck2_error::Result<HashMap<String, String>> {
+    ) -> buck2_error::Result<StdBuckHashMap<String, String>> {
         ctx.per_transaction_data()
             .data
             .get::<ConfigMetadataHolder>()

@@ -14,13 +14,19 @@ use buck2_artifact::actions::key::ActionKey;
 use buck2_build_api::actions::artifact::get_artifact_fs::GetArtifactFs;
 use buck2_build_api::actions::calculation::ActionCalculation;
 use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_execute::materialize::materializer::HasMaterializer;
 use buck2_fs::async_fs_util;
+use buck2_fs::error::IoResultExt;
 use derive_more::Display;
 use dice::CancellationContext;
 use dice::DiceComputations;
 use dice::Key;
+use dice::OkPagableValueSerialize;
+use dice::ValueSerialize;
 use dupe::Dupe;
+use pagable::Pagable;
+use pagable::pagable_typetag;
 
 use crate::cached_validation_result::CachedValidationResult;
 use crate::validator_api::parse_validation_result;
@@ -37,8 +43,9 @@ enum ParseValidationResultError {
 /// 1) Building the validation result artifact.
 /// 2) Materializing it.
 /// 3) Reading and parsing it to produce result which could be cached in DICE.
-#[derive(Clone, Display, Dupe, Debug, Eq, PartialEq, Hash, Allocative)]
+#[derive(Clone, Display, Dupe, Debug, Eq, PartialEq, Hash, Allocative, Pagable)]
 #[repr(transparent)]
+#[pagable_typetag(dice::DiceKeyDyn)]
 pub(crate) struct SingleValidationKey(pub ActionKey);
 
 #[async_trait]
@@ -60,7 +67,7 @@ impl Key for SingleValidationKey {
             let (gen_path, artifact_value) = build_result
                 .iter()
                 .next()
-                .internal_error("Just checked single element")?;
+                .ok_or_else(|| internal_error!("Just checked single element"))?;
             (gen_path.dupe(), artifact_value)
         };
 
@@ -85,6 +92,7 @@ impl Key for SingleValidationKey {
 
         let content = async_fs_util::read_to_string(&validation_result_path)
             .await
+            .categorize_internal()
             .buck_error_context("Reading validation result")?;
 
         match parse_validation_result(&content) {
@@ -93,7 +101,7 @@ impl Key for SingleValidationKey {
                 self.0.owner().dupe(),
                 validation_result_path,
             )),
-            Err(e) => Err(buck2_error::Error::from(e)),
+            Err(e) => Err(e),
         }
     }
 
@@ -106,5 +114,9 @@ impl Key for SingleValidationKey {
 
     fn validity(x: &Self::Value) -> bool {
         x.is_ok()
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        OkPagableValueSerialize::<Self::Value>::new()
     }
 }

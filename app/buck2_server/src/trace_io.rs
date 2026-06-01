@@ -49,11 +49,10 @@ pub(crate) async fn trace_io_command(
                 relative_symlinks: Vec::new(),
                 external_symlinks: Vec::new(),
             }),
-        }
-        .map_err(Into::into);
+        };
 
         let end_event = command_end(&result, buck2_data::TraceIoCommandEnd {});
-        (result.map_err(Into::into), end_event)
+        (result, end_event)
     })
     .await
 }
@@ -97,15 +96,24 @@ async fn build_response_with_trace(
         }
     }
 
+    let mut trace: Vec<String> = entries.into_iter().map(|path| path.to_string()).collect();
+    trace.sort_unstable();
+
+    let mut external_entries: Vec<String> = provider
+        .trace()
+        .external_entries()
+        .into_iter()
+        .map(|path| path.to_string())
+        .collect();
+    external_entries.sort_unstable();
+
+    relative_symlinks.sort_unstable_by(|a, b| a.link.cmp(&b.link));
+    external_symlinks.sort_unstable_by(|a, b| a.link.cmp(&b.link));
+
     Ok(buck2_cli_proto::TraceIoResponse {
         enabled: true,
-        trace: entries.into_iter().map(|path| path.to_string()).collect(),
-        external_entries: provider
-            .trace()
-            .external_entries()
-            .into_iter()
-            .map(|path| path.to_string())
-            .collect(),
+        trace,
+        external_entries,
         relative_symlinks,
         external_symlinks,
     })

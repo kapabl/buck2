@@ -9,12 +9,13 @@
  */
 
 use std::cell::RefCell;
-use std::cell::RefMut;
 use std::io::Write;
 use std::iter;
 use std::ops::Deref;
-use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::MappedMutexGuard;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
 
 use allocative::Allocative;
 use buck2_build_api::artifact_groups::ArtifactGroup;
@@ -31,6 +32,7 @@ use buck2_error::BuckErrorContext;
 use buck2_error::buck2_error;
 use buck2_error::starlark_error::from_starlark_with_options;
 use buck2_execute::path::artifact_path::ArtifactPath;
+use buck2_hash::BuckIndexSet;
 use buck2_server_ctx::bxl::BxlStreamingTracker;
 use buck2_server_ctx::bxl::GetBxlStreamingTracker;
 use derivative::Derivative;
@@ -39,7 +41,6 @@ use dupe::Dupe;
 use either::Either;
 use futures::FutureExt;
 use gazebo::prelude::VecExt;
-use indexmap::IndexSet;
 use itertools::Itertools;
 use serde::Serialize;
 use serde::Serializer;
@@ -48,7 +49,6 @@ use starlark::any::ProvidesStaticType;
 use starlark::collections::SmallSet;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
-use starlark::environment::MethodsStatic;
 use starlark::eval::Evaluator;
 use starlark::starlark_module;
 use starlark::values::AllocValue;
@@ -104,11 +104,14 @@ struct OutputStreamStateInner {
 #[display("{:?}", self)]
 #[derivative(Debug)]
 pub(crate) struct OutputStreamState {
-    /// Wrapped in Rc<RefCell<Option<...>>> to allow
-    /// - Shared ownership (Rc), we also need to hold it in `BxlEvalExtra`
+    /// Wrapped in Arc<Mutex<Option<...>>> to allow
+    /// - Shared ownership (Arc), we also need to hold it in `BxlEvalExtra`
     /// - Runtime borrow checking for innter mutability (RefCell)
     /// - Optional state for take operations (Option)
-    inner: Rc<RefCell<Option<OutputStreamStateInner>>>,
+    ///
+    /// FIXME(JakobDegen): This is completely disgusting, we should not store this here and keep it
+    /// only in the `BxlEvalExtra`. Not super easy to make happen though
+    inner: Arc<Mutex<Option<OutputStreamStateInner>>>,
 }
 
 /// Final result container for output stream processing.
@@ -119,11 +122,11 @@ pub(crate) struct OutputStreamState {
 pub(crate) struct OutputStreamOutcome {
     /// set of artifacts that need to be materialized, flattened from
     /// the original EnsuredArtifactOrGroup entries.
-    pub(crate) ensured_artifacts: IndexSet<ArtifactGroup>,
+    pub(crate) ensured_artifacts: BuckIndexSet<ArtifactGroup>,
     pub(crate) output: Vec<u8>,
     pub(crate) streaming: Vec<u8>,
     pub(crate) error: Vec<u8>,
-    pub(crate) pending_streaming_outputs: Vec<(IndexSet<ArtifactGroup>, Vec<u8>)>,
+    pub(crate) pending_streaming_outputs: Vec<(BuckIndexSet<ArtifactGroup>, Vec<u8>)>,
 }
 
 #[derive(
@@ -137,9 +140,7 @@ pub(crate) struct OutputStreamOutcome {
 #[display("{:?}", self)]
 #[derivative(Debug)]
 pub(crate) struct StarlarkOutputStream {
-    #[trace(unsafe_ignore)]
     state: OutputStreamState,
-
     #[derivative(Debug = "ignore")]
     pub(crate) project_fs: ProjectRoot,
     #[derivative(Debug = "ignore")]
@@ -186,18 +187,18 @@ impl Deref for StarlarkOutputStream {
 impl OutputStreamState {
     pub(crate) fn new() -> Self {
         Self {
-            inner: Rc::new(RefCell::new(Some(OutputStreamStateInner::default()))),
+            inner: Arc::new(Mutex::new(Some(OutputStreamStateInner::default()))),
         }
     }
 
     pub(crate) fn take_state(&self) -> buck2_error::Result<OutputStreamOutcome> {
-        let state = self.inner.borrow_mut().take().unwrap();
+        let state = self.inner.try_lock().unwrap().take().unwrap();
         let artifacts = state
             .artifacts_to_ensure
             .into_iter()
             .map(EnsuredArtifactOrGroup::into_artifact_groups)
             .flatten_ok()
-            .collect::<buck2_error::Result<IndexSet<ArtifactGroup>>>()?;
+            .collect::<buck2_error::Result<BuckIndexSet<ArtifactGroup>>>()?;
         let pending_streaming_outputs = state
             .pending_streaming_outputs
             .into_iter()
@@ -206,10 +207,10 @@ impl OutputStreamState {
                     .into_iter()
                     .map(|ensured_artifact| ensured_artifact.into_artifact_groups())
                     .flatten_ok()
-                    .collect::<buck2_error::Result<IndexSet<ArtifactGroup>>>()?;
+                    .collect::<buck2_error::Result<BuckIndexSet<ArtifactGroup>>>()?;
                 Ok((artifacts, output_str))
             })
-            .collect::<buck2_error::Result<Vec<(IndexSet<ArtifactGroup>, Vec<u8>)>>>()?;
+            .collect::<buck2_error::Result<Vec<(BuckIndexSet<ArtifactGroup>, Vec<u8>)>>>()?;
         Ok(OutputStreamOutcome {
             ensured_artifacts: artifacts,
             output: state.output,
@@ -224,7 +225,8 @@ impl OutputStreamState {
         ensured: EnsuredArtifactOrGroup,
     ) -> buck2_error::Result<()> {
         self.inner
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .as_mut()
             .expect("should not have been taken")
             .artifacts_to_ensure
@@ -232,20 +234,20 @@ impl OutputStreamState {
         Ok(())
     }
 
-    fn output(&self) -> RefMut<'_, impl Write + use<>> {
-        RefMut::map(self.inner.borrow_mut(), |inner| {
+    fn output(&self) -> MappedMutexGuard<'_, impl Write + use<>> {
+        MutexGuard::map(self.inner.try_lock().unwrap(), |inner| {
             &mut inner.as_mut().expect("should not have been taken").output
         })
     }
 
-    pub(crate) fn error(&self) -> RefMut<'_, impl Write + use<>> {
-        RefMut::map(self.inner.borrow_mut(), |inner| {
+    pub(crate) fn error(&self) -> MappedMutexGuard<'_, impl Write + use<>> {
+        MutexGuard::map(self.inner.try_lock().unwrap(), |inner| {
             &mut inner.as_mut().expect("should not have been taken").error
         })
     }
 
-    pub(crate) fn streaming(&self) -> RefMut<'_, impl Write + use<>> {
-        RefMut::map(self.inner.borrow_mut(), |inner| {
+    pub(crate) fn streaming(&self) -> MappedMutexGuard<'_, impl Write + use<>> {
+        MutexGuard::map(self.inner.try_lock().unwrap(), |inner| {
             &mut inner
                 .as_mut()
                 .expect("should not have been taken")
@@ -255,8 +257,8 @@ impl OutputStreamState {
 
     fn pending_streaming_outputs(
         &self,
-    ) -> RefMut<'_, Vec<(SmallSet<EnsuredArtifactOrGroup>, Vec<u8>)>> {
-        RefMut::map(self.inner.borrow_mut(), |inner| {
+    ) -> MappedMutexGuard<'_, Vec<(SmallSet<EnsuredArtifactOrGroup>, Vec<u8>)>> {
+        MutexGuard::map(self.inner.try_lock().unwrap(), |inner| {
             &mut inner
                 .as_mut()
                 .expect("should not have been taken")
@@ -266,7 +268,7 @@ impl OutputStreamState {
 }
 
 struct BufferPrintOutput<'a, T: Write> {
-    output: RefMut<'a, T>,
+    output: MappedMutexGuard<'a, T>,
 }
 
 impl<'a, T: Write> Write for BufferPrintOutput<'a, T> {
@@ -556,16 +558,22 @@ impl StarlarkOutputStream {
     }
 }
 
-#[starlark_value(type = "bxl.OutputStream", StarlarkTypeRepr, UnpackValue)]
+starlark::methods_static!(OUTPUT_STREAM_METHODS = output_stream_methods);
+
+#[starlark_value(
+    type = "bxl.OutputStream",
+    StarlarkTypeRepr,
+    UnpackValue,
+    ty_vtable_no_freeze
+)]
 impl<'v> StarlarkValue<'v> for StarlarkOutputStream {
     fn get_methods() -> Option<&'static Methods> {
-        static RES: MethodsStatic = MethodsStatic::new();
-        RES.methods(output_stream_methods)
+        Some(OUTPUT_STREAM_METHODS.methods())
     }
 }
 
 impl<'v> AllocValue<'v> for StarlarkOutputStream {
-    fn alloc_value(self, heap: &'v Heap) -> Value<'v> {
+    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
         heap.alloc_complex_no_freeze(self)
     }
 }
@@ -687,19 +695,16 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
         let extra = BxlEvalExtra::from_context(eval)?;
         let streaming_writer = BxlStreamingWriter::new(&extra.dice);
 
-        let wait_on = wait_on
-            .into_iter()
-            .map(|wait_on| match wait_on {
-                Either::Left(ensured_artifact) => {
-                    vec![EnsuredArtifactOrGroup::Artifact(ensured_artifact.dupe())]
-                }
-                Either::Right(ensured_group) => ensured_group
-                    .inner()
-                    .iter()
-                    .map(|group| EnsuredArtifactOrGroup::ArtifactGroup(group.dupe()))
-                    .collect(),
-            })
-            .flatten();
+        let wait_on = wait_on.into_iter().flat_map(|wait_on| match wait_on {
+            Either::Left(ensured_artifact) => {
+                vec![EnsuredArtifactOrGroup::Artifact(ensured_artifact.dupe())]
+            }
+            Either::Right(ensured_group) => ensured_group
+                .inner()
+                .iter()
+                .map(|group| EnsuredArtifactOrGroup::ArtifactGroup(group.dupe()))
+                .collect(),
+        });
 
         let streaming_output = StreamingOutput::new(wait_on, this.state.dupe(), streaming_writer);
         this.print(args.into_iter(), sep, eval, streaming_output)?;
@@ -744,19 +749,16 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
     ) -> starlark::Result<NoneType> {
         let extra = BxlEvalExtra::from_context(eval)?;
         let streaming_writer = BxlStreamingWriter::new(&extra.dice);
-        let wait_on = wait_on
-            .into_iter()
-            .map(|wait_on| match wait_on {
-                Either::Left(ensured_artifact) => {
-                    vec![EnsuredArtifactOrGroup::Artifact(ensured_artifact.dupe())]
-                }
-                Either::Right(ensured_group) => ensured_group
-                    .inner()
-                    .iter()
-                    .map(|group| EnsuredArtifactOrGroup::ArtifactGroup(group.dupe()))
-                    .collect(),
-            })
-            .flatten();
+        let wait_on = wait_on.into_iter().flat_map(|wait_on| match wait_on {
+            Either::Left(ensured_artifact) => {
+                vec![EnsuredArtifactOrGroup::Artifact(ensured_artifact.dupe())]
+            }
+            Either::Right(ensured_group) => ensured_group
+                .inner()
+                .iter()
+                .map(|group| EnsuredArtifactOrGroup::ArtifactGroup(group.dupe()))
+                .collect(),
+        });
         let streaming_output = StreamingOutput::new(wait_on, this.state.dupe(), streaming_writer);
 
         this.print_json(value, pretty, eval, streaming_output)?;
@@ -809,7 +811,7 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
         this: &'v StarlarkOutputStream,
         // TODO(nga): must be either positional or named.
         artifacts: EnsureMultipleArtifactsArg<'v>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> starlark::Result<Value<'v>> {
         match artifacts {
             EnsureMultipleArtifactsArg::None(_) => Ok(heap.alloc(Vec::<EnsuredArtifact>::new())),
@@ -879,8 +881,8 @@ fn output_stream_methods(builder: &mut MethodsBuilder) {
     }
 }
 
-pub(crate) fn get_cmd_line_inputs<'v>(
-    cmd_line: &'v dyn CommandLineArgLike,
+pub(crate) fn get_cmd_line_inputs(
+    cmd_line: &dyn CommandLineArgLike,
 ) -> buck2_error::Result<StarlarkCommandLineInputs> {
     let mut visitor = SimpleCommandLineArtifactVisitor::new();
     cmd_line.visit_artifacts(&mut visitor)?;
@@ -915,7 +917,7 @@ fn get_artifacts_from_bxl_build_result(
             .outputs
             .iter()
             .filter_map(|built| {
-                built.as_ref().ok().map(|artifacts| {
+                built.inner.as_ref().ok().map(|artifacts| {
                     artifacts
                         .values
                         .iter()

@@ -12,17 +12,22 @@ use std::sync::Arc;
 
 use allocative::Allocative;
 use buck2_core::build_file_path::BuildFilePath;
+use pagable::Pagable;
 
 use crate::oncall::Oncall;
+use crate::visibility::VisibilityPatternList;
 
 /// Package-specific data for `TargetNode`.
 ///
 /// (Note this has nothing to do with `PACKAGE` files which are not implemented
 /// at the moment of writing.)
-#[derive(Debug, Hash, Allocative, Eq, PartialEq)]
+#[derive(Debug, Hash, Allocative, Eq, PartialEq, Pagable)]
 pub struct Package {
     /// The build file which defined this target, e.g. `fbcode//foo/bar/TARGETS`
     pub buildfile_path: Arc<BuildFilePath>,
     /// The oncall attribute, if set
     pub oncall: Option<Oncall>,
+    /// Cap inherited from `enforce_visibility_intersection()`. `Public` = no cap.
+    /// Stored once per build file; ANDed with `visibility` at `is_visible_to` time.
+    pub visibility_cap: VisibilityPatternList,
 }

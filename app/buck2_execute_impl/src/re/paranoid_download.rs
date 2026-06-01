@@ -25,6 +25,7 @@ use buck2_execute::materialize::materializer::CasDownloadInfo;
 use buck2_execute::materialize::materializer::DeclareArtifactPayload;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::re::manager::ReConnectionManager;
+use buck2_fs::error::IoResultExt;
 use buck2_fs::fs_util;
 use dice_futures::cancellation::CancellationContext;
 use dupe::Dupe;
@@ -86,7 +87,7 @@ impl ParanoidDownloader {
                 |DeclareArtifactPayload {
                      path,
                      artifact: value,
-                     persist_full_directory_structure: _,
+                     configuration_path: _,
                  }| {
                     let path = inner.cache_path.join(path);
                     paths_to_clean.push(path.clone());
@@ -242,7 +243,7 @@ impl IoRequest for MoveOutputsIntoPlace {
 
             tracing::trace!(from = %from, to = %to, "Move path");
 
-            fs_util::rename(&from, &to)?;
+            fs_util::rename(&from, &to).categorize_internal()?;
         }
 
         Ok(())

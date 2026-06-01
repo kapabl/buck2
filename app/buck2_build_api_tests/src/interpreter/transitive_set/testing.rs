@@ -20,8 +20,9 @@ use buck2_build_api::interpreter::rule_defs::transitive_set::TransitiveSet;
 use buck2_build_api::interpreter::rule_defs::transitive_set::TransitiveSetOrdering;
 use buck2_build_api::interpreter::rule_defs::transitive_set::transitive_set_definition::register_transitive_set;
 use buck2_core::deferred::key::DeferredHolderKey;
-use buck2_error::BuckErrorContext as _;
+use buck2_error::internal_error;
 use buck2_interpreter::from_freeze::from_freeze_error;
+use buck2_interpreter::testing::Buck2TestHeapName;
 use indoc::indoc;
 use starlark::environment::GlobalsBuilder;
 use starlark::environment::Module;
@@ -66,36 +67,42 @@ pub(crate) fn tset_factory(builder: &mut GlobalsBuilder) {
 pub(crate) fn new_transitive_set(
     code: &str,
 ) -> buck2_error::Result<OwnedFrozenValueTyped<FrozenTransitiveSet>> {
-    let env = Module::new();
+    Module::with_temp_heap(|env| {
+        let globals = GlobalsBuilder::standard()
+            .with(register_transitive_set)
+            .with(tset_factory)
+            .with(artifactory)
+            .build();
 
-    let globals = GlobalsBuilder::standard()
-        .with(register_transitive_set)
-        .with(tset_factory)
-        .with(artifactory)
-        .build();
+        buck2_interpreter_for_build::attrs::coerce::testing::to_value(&env, &globals, code);
 
-    buck2_interpreter_for_build::attrs::coerce::testing::to_value(&env, &globals, code);
+        let frozen = env
+            .freeze_named(Buck2TestHeapName::frozen_heap_name())
+            .freeze_error_context("Freeze failed")
+            .map_err(from_freeze_error)?;
 
-    let frozen = env
-        .freeze()
-        .freeze_error_context("Freeze failed")
-        .map_err(from_freeze_error)?;
+        let make = frozen.get("make").expect("`make` was not found");
 
-    let make = frozen.get("make").expect("`make` was not found");
+        Module::with_temp_heap(|env2| {
+            let ret = Evaluator::new(&env2).eval_function(
+                env2.heap().access_owned_frozen_value(&make),
+                &[],
+                &[],
+            )?;
 
-    let env2 = Module::new();
-    let ret =
-        Evaluator::new(&env2).eval_function(make.owned_value(&env2.frozen_heap()), &[], &[])?;
+            env2.set_extra_value(ret);
 
-    env2.set_extra_value(ret);
+            let frozen = env2
+                .freeze_named(Buck2TestHeapName::frozen_heap_name())
+                .map_err(from_freeze_error)?;
 
-    let frozen = env2.freeze().map_err(from_freeze_error)?;
-
-    frozen
-        .owned_extra_value()
-        .buck_error_context("Frozen value must be in extra value")?
-        .downcast_starlark()
-        .map_err(buck2_error::Error::from)
+            frozen
+                .owned_extra_value()
+                .ok_or_else(|| internal_error!("Frozen value must be in extra value"))?
+                .downcast_starlark()
+                .map_err(buck2_error::Error::from)
+        })
+    })
 }
 
 #[test]

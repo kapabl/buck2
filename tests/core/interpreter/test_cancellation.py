@@ -12,9 +12,7 @@ import time
 
 import pytest
 from buck2.tests.e2e_util.api.buck import Buck
-
-from buck2.tests.e2e_util.api.buck_result import BuckException, BuildResult, BxlResult
-from buck2.tests.e2e_util.api.process import Process
+from buck2.tests.e2e_util.api.buck_result import BuckException
 from buck2.tests.e2e_util.buck_workspace import buck_test
 
 
@@ -24,8 +22,6 @@ ALL_STAGES = ["load", "package", "analysis", "bxl"]
 @buck_test()
 @pytest.mark.parametrize("stage", ALL_STAGES)
 async def test_cancellation(buck: Buck, stage: str) -> None:
-    return  # TODO(S530607) disabled due to sev
-
     if stage == "bxl":
         preempted_target = "//:root.bxl:loop_test"
         a_method = buck.bxl

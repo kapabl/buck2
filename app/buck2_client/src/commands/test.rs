@@ -34,14 +34,15 @@ use buck2_client_ctx::streaming::StreamingCommand;
 use buck2_client_ctx::subscribers::superconsole::test::TestCounterColumn;
 use buck2_client_ctx::subscribers::superconsole::test::span_from_build_failure_count;
 use buck2_error::BuckErrorContext;
-use buck2_error::ErrorTag;
 use buck2_error::ExitCode;
-use buck2_error::buck2_error;
+use buck2_error::internal_error;
+use buck2_fs::error::IoResultExt;
 use buck2_fs::fs_util;
 use buck2_fs::working_dir::AbsWorkingDir;
 use superconsole::Line;
 use superconsole::Span;
 
+use crate::commands::build::print_buck_ui_and_rating;
 use crate::commands::build::print_build_result;
 
 fn forward_output_to_path(
@@ -50,6 +51,8 @@ fn forward_output_to_path(
     working_dir: &AbsWorkingDir,
 ) -> buck2_error::Result<()> {
     fs_util::write(path_arg.resolve(working_dir), output)
+        // input path from --test-executor-stderr=FILEPATH
+        .categorize_input()
         .buck_error_context("Failed to write test executor output to path")
 }
 
@@ -189,8 +192,127 @@ If include patterns are present, regardless of whether exclude patterns are pres
     #[clap(flatten)]
     timeout_options: CommonTimeoutOptions,
 
+    /// Write the test session ID into this file
+    #[clap(long, value_name = "PATH")]
+    write_test_id: Option<PathArg>,
+
     #[clap(flatten)]
     common_opts: CommonCommandOptions,
+}
+
+#[derive(Debug, buck2_error::Error)]
+#[buck2(tag = TestExecutor)]
+enum ExecutorError {
+    #[buck2(tag = TestRunnerInternal)]
+    #[error("Internal error in test runner")]
+    InternalError,
+    #[buck2(tag = Input)]
+    #[error("Tests completed with cancellations")]
+    CompletedWithCancellations,
+    #[buck2(tag = Input)]
+    #[error("Tests passed with warnings")]
+    PassWithWarnings,
+    #[error(transparent)]
+    Fail(TestStatusError),
+    #[error(transparent)]
+    NeedsBaseRevisionRetry(TestStatusError),
+    #[error(transparent)]
+    NeedsAdditionalVerification(TestStatusError),
+    #[buck2(tag = TestRunnerUnknownExitCode)]
+    #[error("Test Executor Failed with exit code {0}")]
+    UnexpectedExitCode(i32),
+}
+
+#[derive(Debug, buck2_error::Error)]
+#[buck2(tag = TestExecutor)]
+enum TestStatusError {
+    #[error("Test execution completed but the tests failed")]
+    #[buck2(tag = TestFailed)]
+    TestFailed,
+    #[error("Test listing failed")]
+    #[buck2(tag = TestListingFailed)]
+    ListingFailed,
+    #[error("Fatal error encountered during test execution")]
+    #[buck2(tag = TestFatal)]
+    Fatal,
+    #[error("Infra Failure error encountered during test execution")]
+    #[buck2(tag = TestInfraFailure)]
+    InfraFailure,
+    #[error("Test execution completed but some tests timed out")]
+    #[buck2(tag = TestTimeout)]
+    TestTimeout,
+    #[error("Unexpected failure during test execution")]
+    #[buck2(tag = TestStatusUnknown)]
+    Unknown,
+}
+
+impl ExecutorError {
+    fn new(
+        exit_code: i32,
+        test_statuses: &buck2_cli_proto::test_response::TestStatuses,
+    ) -> Option<Self> {
+        let status_error = TestStatusError::new(test_statuses);
+        // exit codes from tpx::outcome::RunVerdict
+        match exit_code {
+            0 => None,
+            1 => Some(Self::InternalError),
+            2 => Some(Self::CompletedWithCancellations),
+            32 => Some(Self::Fail(status_error)),
+            42 => Some(Self::NeedsBaseRevisionRetry(status_error)),
+            43 => Some(Self::NeedsAdditionalVerification(status_error)),
+            64 => Some(Self::PassWithWarnings),
+            _ => Some(Self::UnexpectedExitCode(exit_code)),
+        }
+    }
+}
+
+impl TestStatusError {
+    fn new(test_statuses: &buck2_cli_proto::test_response::TestStatuses) -> Self {
+        if let Some(fatal) = &test_statuses.fatals
+            && fatal.count > 0
+        {
+            Self::Fatal
+        } else if let Some(infra_failure) = &test_statuses.infra_failure
+            && infra_failure.count > 0
+        {
+            Self::InfraFailure
+        } else if let Some(listing_failed) = &test_statuses.listing_failed
+            && listing_failed.count > 0
+        {
+            Self::ListingFailed
+        } else if let Some(failed) = &test_statuses.failed
+            && failed.count > 0
+        {
+            Self::TestFailed
+        } else if let Some(timed_out) = &test_statuses.timed_out
+            && timed_out.count > 0
+        {
+            Self::TestTimeout
+        } else {
+            Self::Unknown
+        }
+    }
+}
+
+fn test_executor_error(
+    executor_exit_code: i32,
+    test_statuses: &buck2_cli_proto::test_response::TestStatuses,
+) -> Option<buck2_error::Error> {
+    if let Some(error) = ExecutorError::new(executor_exit_code, test_statuses) {
+        let exit_code_tag = if let ExecutorError::UnexpectedExitCode(exit_code) = error {
+            Some(exit_code.to_string())
+        } else {
+            None
+        };
+
+        let mut error = buck2_error::Error::from(error);
+        if let Some(tag) = exit_code_tag {
+            error = error.string_tag(&tag);
+        }
+        Some(error)
+    } else {
+        None
+    }
 }
 
 #[async_trait(?Send)]
@@ -245,31 +367,35 @@ impl StreamingCommand for TestCommand {
         let listing_failed = statuses
             .listing_failed
             .as_ref()
-            .buck_error_context("Missing `listing_failed`")?;
+            .ok_or_else(|| internal_error!("Missing `listing_failed`"))?;
         let passed = statuses
             .passed
             .as_ref()
-            .buck_error_context("Missing `passed`")?;
+            .ok_or_else(|| internal_error!("Missing `passed`"))?;
         let failed = statuses
             .failed
             .as_ref()
-            .buck_error_context("Missing `failed`")?;
+            .ok_or_else(|| internal_error!("Missing `failed`"))?;
+        let timeout = statuses
+            .timed_out
+            .as_ref()
+            .ok_or_else(|| internal_error!("Missing `timed_out`"))?;
         let fatals = statuses
             .fatals
             .as_ref()
-            .buck_error_context("Missing `fatals`")?;
+            .ok_or_else(|| internal_error!("Missing `fatals`"))?;
         let skipped = statuses
             .skipped
             .as_ref()
-            .buck_error_context("Missing `skipped`")?;
+            .ok_or_else(|| internal_error!("Missing `skipped`"))?;
         let omitted = statuses
             .omitted
             .as_ref()
-            .buck_error_context("Missing `omitted`")?;
+            .ok_or_else(|| internal_error!("Missing `omitted`"))?;
         let infra_failure = statuses
             .infra_failure
             .as_ref()
-            .buck_error_context("Missing `infra failure`")?;
+            .ok_or_else(|| internal_error!("Missing `infra failure`"))?;
 
         let console = self.common_opts.console_opts.final_console();
         print_build_result(&console, &response.errors)?;
@@ -277,6 +403,8 @@ impl StreamingCommand for TestCommand {
         if statuses.build_errors != 0 {
             console.print_error(&format!("{} BUILDS FAILED", statuses.build_errors))?;
         }
+
+        print_buck_ui_and_rating(&console, ctx, events_ctx.used_superconsole)?;
 
         let mut line = Line::default();
         line.push(Span::new_unstyled_lossy("Tests finished: "));
@@ -287,6 +415,7 @@ impl StreamingCommand for TestCommand {
         let columns = [
             TestCounterColumn::PASS,
             TestCounterColumn::FAIL,
+            TestCounterColumn::TIMEOUT,
             TestCounterColumn::FATAL,
             TestCounterColumn::SKIP,
             TestCounterColumn::OMIT,
@@ -301,11 +430,13 @@ impl StreamingCommand for TestCommand {
 
         print_error_counter(&console, listing_failed, "LISTINGS FAILED", "⚠")?;
         print_error_counter(&console, failed, "TESTS FAILED", "✗")?;
+        print_error_counter(&console, timeout, "TESTS TIMED OUT", "⏱")?;
         print_error_counter(&console, fatals, "TESTS FATALS", "⚠")?;
         print_error_counter(&console, infra_failure, "TESTS Infra Failed", "🛠")?;
 
         if passed.count
             + failed.count
+            + timeout.count
             + fatals.count
             + skipped.count
             + omitted.count
@@ -334,9 +465,18 @@ impl StreamingCommand for TestCommand {
             buck2_client_ctx::println!("{}", build_report)?;
         }
 
-        let exit_result = if let Some(exit_code) = response.exit_code {
+        let exit_result = if !response.errors.is_empty() {
+            // If we had build errors return their exit code.
+            ExitResult::from_command_result_errors(response.errors)
+        } else {
+            let mut errors = response.errors;
+            // Create an error if executor returned non-zero exit code.
+            // Error is for tagging and categorization only, not shown to user.
+            if let Some(error) = test_executor_error(response.executor_exit_code, statuses) {
+                errors.push((&error).into());
+            }
             // If exit code is set in response, it should be used and not derived from command errors.
-            let exit_code = if let Ok(code) = exit_code.try_into() {
+            let exit_code = if let Ok(code) = response.executor_exit_code.try_into() {
                 match code {
                     0 => ExitCode::Success,
                     _ => ExitCode::TestRunner(code),
@@ -345,18 +485,7 @@ impl StreamingCommand for TestCommand {
                 // The exit code isn't an allowable value, so just switch to generic failure
                 ExitCode::UnknownFailure
             };
-            ExitResult::status_with_emitted_errors(exit_code, response.errors)
-        } else if !response.errors.is_empty() {
-            // If we had build errors return their exit code.
-            ExitResult::from_command_result_errors(response.errors)
-        } else {
-            // But if we had no build errors, and Tpx did not provide an exit code, then that's
-            // going to be an error.
-            buck2_error!(
-                ErrorTag::TestExecutor,
-                "Test executor did not provide an exit code"
-            )
-            .into()
+            ExitResult::status_with_emitted_errors(exit_code, errors)
         };
 
         match self.test_executor_stdout {
@@ -385,5 +514,9 @@ impl StreamingCommand for TestCommand {
 
     fn starlark_opts(&self) -> &CommonStarlarkOptions {
         &self.common_opts.starlark_opts
+    }
+
+    fn write_test_id(&self) -> &Option<PathArg> {
+        &self.write_test_id
     }
 }

@@ -41,6 +41,7 @@ use buck2_common::memory;
 use buck2_common::sqlite::sqlite_db::SqliteIdentity;
 use buck2_core::buck2_env;
 use buck2_core::error::reload_hard_error_config;
+use buck2_core::error::reload_show_soft_error_config;
 use buck2_core::error::reset_soft_error_counters;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::logging::LogConfigurationReloadHandle;
@@ -62,7 +63,9 @@ use buck2_interpreter::starlark_profiler::config::StarlarkProfilerConfiguration;
 use buck2_profile::proto_to_profile_mode;
 use buck2_profile::starlark_profiler_configuration_from_request;
 use buck2_resource_control::buck_cgroup_tree::BuckCgroupTree;
+use buck2_resource_control::buck_cgroup_tree::PreppedBuckCgroups;
 use buck2_server_ctx::bxl::BXL_SERVER_COMMANDS;
+use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::late_bindings::AUDIT_SERVER_COMMAND;
 use buck2_server_ctx::late_bindings::OTHER_SERVER_COMMANDS;
 use buck2_server_ctx::late_bindings::QUERY_SERVER_COMMANDS;
@@ -74,6 +77,7 @@ use buck2_server_ctx::streaming_request_handler::StreamingRequestHandler;
 use buck2_server_ctx::test_command::TEST_COMMAND;
 use buck2_server_starlark_debug::run::run_dap_server_command;
 use buck2_test::executor_launcher::get_all_test_executors;
+use buck2_util::system_stats::num_cores;
 use buck2_util::system_stats::system_memory_stats;
 use buck2_util::threads::thread_spawn;
 use dice::DetectCycles;
@@ -92,7 +96,7 @@ use futures::channel::mpsc::UnboundedReceiver;
 use futures::channel::mpsc::UnboundedSender;
 use futures::future::BoxFuture;
 use futures::stream;
-use rand::RngCore;
+use rand::Rng as _;
 use rand::SeedableRng;
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
@@ -102,7 +106,7 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 use tonic::service::Interceptor;
-use tonic::service::interceptor;
+use tonic::service::InterceptorLayer;
 use tonic::transport::Server;
 
 use crate::active_commands::ActiveCommand;
@@ -236,6 +240,7 @@ pub(crate) struct BuckdServerData {
 pub struct BuckdServer(Arc<BuckdServerData>);
 
 impl BuckdServer {
+    #[tracing::instrument(name = "daemon_listener", skip_all)]
     pub async fn run(
         fb: fbinit::FacebookInit,
         log_reload_handle: Arc<dyn LogConfigurationReloadHandle>,
@@ -243,7 +248,7 @@ impl BuckdServer {
         delegate: Box<dyn BuckdServerDelegate>,
         init_ctx: BuckdServerInitPreferences,
         process_info: DaemonProcessInfo,
-        cgroup_tree: Option<BuckCgroupTree>,
+        prepped_cgroups: Option<PreppedBuckCgroups>,
         base_daemon_constraints: buck2_cli_proto::DaemonConstraints,
         listener: Pin<Box<dyn Stream<Item = Result<tokio::net::TcpStream, io::Error>> + Send>>,
         rt: Handle,
@@ -263,15 +268,28 @@ impl BuckdServer {
         fs_util::create_dir_all(paths.buck_out_path())
             .buck_error_context("Error creating buck_out_path")?;
 
-        // TODO(scottcao): make this not optional
         let cwd = {
             let dir = WorkingDirectory::open(paths.buck_out_path())?;
             dir.chdir_and_promise_it_will_not_change()?;
-            Some(dir)
+            dir
+        };
+
+        let cgroup_tree = if let Some(prepped_cgroups) = prepped_cgroups {
+            Some(
+                BuckCgroupTree::set_up(
+                    prepped_cgroups,
+                    &init_ctx.daemon_startup_config.resource_control,
+                )
+                .await?,
+            )
+        } else {
+            None
         };
 
         let cert_state = CertState::new().await;
         certs_validation_background_job(cert_state.dupe()).await;
+
+        let daemon_idle_timeout_s = init_ctx.daemon_startup_config.daemon_idle_timeout_s;
 
         let daemon_state = Arc::new(
             DaemonState::new(
@@ -321,15 +339,27 @@ impl BuckdServer {
             rt,
         }));
 
-        let shutdown = server_shutdown_signal(command_receiver, shutdown_receiver)?;
+        let shutdown =
+            server_shutdown_signal(command_receiver, shutdown_receiver, daemon_idle_timeout_s)?;
         let server = Server::builder()
-            .layer(interceptor(BuckCheckAuthTokenInterceptor { auth_token }))
+            .layer(InterceptorLayer::new(BuckCheckAuthTokenInterceptor {
+                auth_token,
+            }))
             .add_service(
                 DaemonApiServer::new(api_server)
                     .max_encoding_message_size(usize::MAX)
                     .max_decoding_message_size(usize::MAX),
             )
             .serve_with_incoming_shutdown(listener, shutdown);
+
+        tracing::info!("Starting server");
+        if let Some(sleep_secs) = buck2_env!(
+            "BUCK2_TEST_INIT_DATA_SLEEP_SECS",
+            type = u64,
+            applicability = testing
+        )? {
+            tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+        }
 
         server.await?;
 
@@ -425,6 +455,7 @@ impl BuckdServer {
         reset_soft_error_counters();
 
         reload_hard_error_config(&client_ctx.buck2_hard_error)?;
+        reload_show_soft_error_config(&client_ctx.buck2_show_soft_errors);
 
         OneshotCommandOptions::pre_run(&opts, self)?;
 
@@ -459,13 +490,57 @@ impl BuckdServer {
             enable_stable_revision_check: system_warning_config.enable_stable_revision_check,
             enable_health_check_process_isolation: system_warning_config
                 .enable_health_check_process_isolation,
+            daemon_cgroup_path: {
+                #[cfg(unix)]
+                {
+                    data.memory_tracker
+                        .as_ref()
+                        .map(|mt| mt.cgroup_tree.daemon().path().to_string())
+                }
+                #[cfg(not(unix))]
+                {
+                    None
+                }
+            },
+            allprocs_cgroup_path: {
+                #[cfg(unix)]
+                {
+                    data.memory_tracker
+                        .as_ref()
+                        .map(|mt| mt.cgroup_tree.allprocs().path().to_string())
+                }
+                #[cfg(not(unix))]
+                {
+                    None
+                }
+            },
+            daemon_cgroup_slice_path: {
+                #[cfg(unix)]
+                {
+                    std::fs::read_to_string("/proc/self/cgroup")
+                        .ok()
+                        .and_then(|s| {
+                            s.lines()
+                                .find_map(|l| l.strip_prefix("0::"))
+                                .map(|p| format!("/sys/fs/cgroup{}", p))
+                        })
+                }
+                #[cfg(not(unix))]
+                {
+                    None
+                }
+            },
+            num_cores: Some(num_cores() as u64),
         });
 
         // Fire off a snapshot before we start doing anything else. We use the metrics emitted here
         // as a baseline.
-        let snapshot_collector =
-            SnapshotCollector::new(data.dupe(), daemon_state.paths.buck_out_path());
-        dispatch.instant_event(Box::new(snapshot_collector.create_snapshot()));
+        let snapshot_collector = SnapshotCollector::new(
+            data.dupe(),
+            daemon_state.paths.buck_out_path(),
+            self.0.rt.clone(),
+        );
+        dispatch.instant_event(Box::new(snapshot_collector.create_snapshot().await));
         let cert_state = self.0.cert_state.dupe();
 
         let repo_root = daemon_state.paths.project_root().root().to_buf();
@@ -511,11 +586,17 @@ impl BuckdServer {
                             command_start,
                         )?;
 
-                        let res =
-                            func(&context, PartialResultDispatcher::new(dispatch.dupe()), req)
-                                .await;
+                        let res = func(
+                            &context,
+                            PartialResultDispatcher::new(
+                                dispatch.dupe(),
+                                context.cancellation_context().into(),
+                            ),
+                            req,
+                        )
+                        .await;
 
-                        context.finalize()?;
+                        context.finalize().await?;
                         res?
                     };
 
@@ -527,7 +608,7 @@ impl BuckdServer {
                         Ok(_) => dispatch.command_result(result_to_command_result(result)),
                         Err(e) => match check_cert_state(cert_state).await {
                             Some(err) => dispatch.command_result(error_to_command_result(
-                                err.context(format!("{e:?}")).into(),
+                                err.context(format!("{e:?}")),
                             )),
                             _ => dispatch.command_result(error_to_command_result(e)),
                         },
@@ -567,9 +648,7 @@ impl BuckdServer {
         match self.run_streaming_fallible(req, opts, func).await {
             Ok(resp) => Ok(resp),
             Err(e) => match check_cert_state(self.0.cert_state.dupe()).await {
-                Some(err) => Ok(error_to_response_stream(
-                    err.context(format!("{e:?}")).into(),
-                )),
+                Some(err) => Ok(error_to_response_stream(err.context(format!("{e:?}")))),
                 _ => Ok(error_to_response_stream(e)),
             },
         }
@@ -880,12 +959,9 @@ impl DaemonApi for BuckdServer {
 
     async fn ping(&self, req: Request<PingRequest>) -> Result<Response<CommandResult>, Status> {
         self.oneshot(req, DefaultCommandOptions, move |req| async move {
-            match &req.delay {
-                Some(delay) => {
-                    let delay = convert_positive_duration(delay)?;
-                    tokio::time::sleep(delay).await;
-                }
-                _ => {}
+            if let Some(delay) = &req.delay {
+                let delay = convert_positive_duration(delay)?;
+                tokio::time::sleep(delay).await;
             }
 
             let mut payload = vec![
@@ -903,6 +979,7 @@ impl DaemonApi for BuckdServer {
 
     async fn status(&self, req: Request<StatusRequest>) -> Result<Response<CommandResult>, Status> {
         let daemon_state = self.0.daemon_state.dupe();
+        let rt = self.0.rt.clone();
 
         self.oneshot(req, DefaultCommandOptions, move |req| async move {
             let snapshot = if req.snapshot {
@@ -910,8 +987,10 @@ impl DaemonApi for BuckdServer {
                     snapshot::SnapshotCollector::new(
                         daemon_state.data(),
                         daemon_state.paths.buck_out_path(),
+                        rt.clone(),
                     )
-                    .create_snapshot(),
+                    .create_snapshot()
+                    .await,
                 )
             } else {
                 None
@@ -936,8 +1015,10 @@ impl DaemonApi for BuckdServer {
 
             let uptime = Instant::now() - self.0.start_instant;
 
+            let process_info = self.0.process_info.clone();
+
             let mut base = StatusResponse {
-                process_info: Some(self.0.process_info.clone()),
+                process_info: Some(process_info),
                 start_time: Some(self.0.start_time),
                 uptime: Some(uptime.try_into()?),
                 snapshot,
@@ -954,6 +1035,20 @@ impl DaemonApi for BuckdServer {
                 valid_working_directory: Some(valid_working_directory),
                 valid_buck_out_mount: Some(valid_buck_out_mount),
                 io_provider: Some(io_provider),
+                allprocs_cgroup_path: {
+                    #[cfg(unix)]
+                    {
+                        daemon_state
+                            .data()
+                            .memory_tracker
+                            .as_ref()
+                            .map(|mt| mt.cgroup_tree.allprocs().path().to_string())
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        None
+                    }
+                },
                 ..Default::default()
             };
 
@@ -986,6 +1081,21 @@ impl DaemonApi for BuckdServer {
             }
             Ok(GenericResponse {})
         })
+        .await
+    }
+
+    type HydrationStream = ResponseStream;
+    async fn hydration(
+        &self,
+        req: Request<HydrationRequest>,
+    ) -> Result<Response<ResponseStream>, Status> {
+        self.run_streaming(
+            req,
+            DefaultCommandOptions,
+            |context, partial_result_dispatcher, req| {
+                crate::hydration::hydration_command(context, partial_result_dispatcher, req).boxed()
+            },
+        )
         .await
     }
 
@@ -1235,11 +1345,9 @@ impl DaemonApi for BuckdServer {
         &self,
         req: Request<UnstableCrashRequest>,
     ) -> Result<Response<CommandResult>, Status> {
-        self.oneshot(
-            req,
-            DefaultCommandOptions,
-            move |req| async move { crash(req) },
-        )
+        self.oneshot(req, DefaultCommandOptions, move |req| async move {
+            crash(req).await
+        })
         .await
     }
 
@@ -1270,6 +1378,17 @@ impl DaemonApi for BuckdServer {
             }
         }
         Ok(Response::new(UnstableHeapDumpResponse {}))
+    }
+
+    async fn unstable_flush_pgo_profile(
+        &self,
+        _req: Request<UnstableFlushPgoProfileRequest>,
+    ) -> Result<Response<UnstableFlushPgoProfileResponse>, Status> {
+        self.check_if_accepting_requests()?;
+        let pgo_active = buck2_util::pgo::flush_pgo_profile();
+        Ok(Response::new(UnstableFlushPgoProfileResponse {
+            pgo_active,
+        }))
     }
 
     async fn unstable_allocator_stats(
@@ -1326,7 +1445,10 @@ impl DaemonApi for BuckdServer {
 
         let res: buck2_error::Result<_> = try {
             let client_ctx = req.get_ref().client_context()?;
-            let trace_id = client_ctx.trace_id.parse()?;
+            let trace_id = client_ctx
+                .trace_id
+                .parse()
+                .map_err(buck2_error::Error::from)?;
             let (event_source, dispatcher) = self.0.daemon_state.prepare_events(trace_id).await?;
             let active_command = ActiveCommand::new(&dispatcher, client_ctx.sanitized_argv.clone());
             (event_source, dispatcher, active_command)
@@ -1565,8 +1687,11 @@ trait StreamingCommandOptions<Req>: OneshotCommandOptions {
 fn server_shutdown_signal(
     command_receiver: UnboundedReceiver<()>,
     mut shutdown_receiver: UnboundedReceiver<()>,
+    daemon_idle_timeout_s: Option<u64>,
 ) -> buck2_error::Result<impl Future<Output = ()>> {
-    let mut duration = DEFAULT_INACTIVITY_TIMEOUT;
+    let mut duration = daemon_idle_timeout_s
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_INACTIVITY_TIMEOUT);
     if buck2_env!(
         "BUCK2_TESTING_INACTIVITY_TIMEOUT",
         bool,
@@ -1683,3 +1808,66 @@ struct DefaultCommandOptions;
 impl OneshotCommandOptions for DefaultCommandOptions {}
 
 impl<Req> StreamingCommandOptions<Req> for DefaultCommandOptions {}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use futures::channel::mpsc;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_server_shutdown_custom_idle_timeout() {
+        tokio::time::pause();
+
+        let (_cmd_tx, cmd_rx) = mpsc::unbounded::<()>();
+        let (_shutdown_tx, shutdown_rx) = mpsc::unbounded::<()>();
+
+        let shutdown_future = server_shutdown_signal(cmd_rx, shutdown_rx, Some(2)).unwrap();
+        futures::pin_mut!(shutdown_future);
+
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut shutdown_future).await;
+        assert!(result.is_err(), "should not shut down before timeout");
+
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut shutdown_future).await;
+        assert!(result.is_ok(), "should shut down after idle timeout");
+    }
+
+    #[tokio::test]
+    async fn test_server_shutdown_default_idle_timeout() {
+        tokio::time::pause();
+
+        let (_cmd_tx, cmd_rx) = mpsc::unbounded::<()>();
+        let (_shutdown_tx, shutdown_rx) = mpsc::unbounded::<()>();
+
+        let shutdown_future = server_shutdown_signal(cmd_rx, shutdown_rx, None).unwrap();
+        futures::pin_mut!(shutdown_future);
+
+        let result = tokio::time::timeout(Duration::from_secs(3600), &mut shutdown_future).await;
+        assert!(result.is_err(), "should not shut down before 4-day default");
+    }
+
+    #[tokio::test]
+    async fn test_server_shutdown_command_resets_idle_timer() {
+        tokio::time::pause();
+
+        let (cmd_tx, cmd_rx) = mpsc::unbounded::<()>();
+        let (_shutdown_tx, shutdown_rx) = mpsc::unbounded::<()>();
+
+        let shutdown_future = server_shutdown_signal(cmd_rx, shutdown_rx, Some(3)).unwrap();
+        futures::pin_mut!(shutdown_future);
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        cmd_tx.unbounded_send(()).unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut shutdown_future).await;
+        assert!(result.is_err(), "timer should have been reset by command");
+
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut shutdown_future).await;
+        assert!(
+            result.is_ok(),
+            "should shut down after idle timeout post-reset"
+        );
+    }
+}

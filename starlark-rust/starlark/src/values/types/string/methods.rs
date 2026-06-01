@@ -123,7 +123,7 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
     /// ```
     fn elems<'v>(
         this: StringValue<'v>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> anyhow::Result<ValueOfUnchecked<'v, StarlarkIter<String>>> {
         Ok(iterate_chars(this, heap))
     }
@@ -173,7 +173,7 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
     /// ```
     fn codepoints<'v>(
         this: StringValue<'v>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> anyhow::Result<ValueOfUnchecked<'v, StarlarkIter<String>>> {
         Ok(iterate_codepoints(this, heap))
     }
@@ -221,22 +221,30 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
     /// https://github.com/bazelbuild/starlark/blob/master/spec.md#string·endswith
     /// ): determine if a string ends with a given suffix.
     ///
-    /// `S.endswith(suffix)` reports whether the string S has the specified
-    /// suffix.
+    /// `S.endswith(suffix[, start[, end]])` reports whether the string
+    /// `S[start:end]` has the specified suffix.
     ///
     /// ```
     /// # starlark::assert::all_true(r#"
     /// "filename.sky".endswith(".sky") == True
+    /// "hello".endswith("ell", 0, 4) == True
+    /// "hello".endswith("lo", 3) == True
     /// # "#);
     /// ```
     #[starlark(speculative_exec_safe)]
     fn endswith(
         this: &str,
         #[starlark(require = pos)] suffix: StringOrTuple,
+        #[starlark(require = pos, default = NoneOr::None)] start: NoneOr<i32>,
+        #[starlark(require = pos, default = NoneOr::None)] end: NoneOr<i32>,
     ) -> anyhow::Result<bool> {
+        let haystack = match convert_str_indices(this, start.into_option(), end.into_option()) {
+            Some(StrIndices { haystack, .. }) => haystack,
+            None => return Ok(false),
+        };
         match suffix {
-            StringOrTuple::String(x) => Ok(this.ends_with(x)),
-            StringOrTuple::Tuple(xs) => Ok(xs.items.iter().any(|x| this.ends_with(x))),
+            StringOrTuple::String(x) => Ok(haystack.ends_with(x)),
+            StringOrTuple::Tuple(xs) => Ok(xs.items.iter().any(|x| haystack.ends_with(x))),
         }
     }
 
@@ -250,7 +258,7 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
     /// If either or both of `start` or `end` are specified,
     /// they specify a subrange of S to which the search should be restricted.
     /// They are interpreted according to Skylark's [indexing
-    /// conventions](#indexing).
+    /// conventions](https://github.com/bazelbuild/starlark/blob/master/spec.md#indexing).
     ///
     /// If no occurrence is found, `found` returns -1.
     ///
@@ -624,7 +632,7 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
     fn join<'v>(
         this: &str,
         #[starlark(require = pos)] to_join: ValueOfUnchecked<'v, StarlarkIter<String>>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> starlark::Result<ValueOfUnchecked<'v, String>> {
         #[inline(always)]
         fn as_str<'v>(x: Value<'v>) -> crate::Result<StringValue<'v>> {
@@ -680,7 +688,7 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
     fn lstrip<'v>(
         this: StringValue<'v>,
         #[starlark(require = pos)] chars: Option<&str>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> anyhow::Result<StringValue<'v>> {
         let res = match chars {
             None => this.trim_start(),
@@ -714,7 +722,7 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
     fn partition<'v>(
         this: StringValue<'v>,
         #[starlark(require = pos)] needle: StringValue<'v>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> anyhow::Result<(StringValue<'v>, StringValue<'v>, StringValue<'v>)> {
         if needle.is_empty() {
             return Err(anyhow::anyhow!(
@@ -762,7 +770,7 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
         #[starlark(require = pos)] old: &str,
         #[starlark(require = pos)] new: &str,
         #[starlark(require = pos)] count: Option<i32>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> anyhow::Result<StringValue<'v>> {
         match count {
             Some(count) if count >= 0 => {
@@ -882,7 +890,7 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
     fn rpartition<'v>(
         this: StringValue<'v>,
         #[starlark(require = pos)] needle: StringValue<'v>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> anyhow::Result<(StringValue<'v>, StringValue<'v>, StringValue<'v>)> {
         if needle.is_empty() {
             return Err(anyhow::anyhow!(
@@ -922,7 +930,7 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
         this: &str,
         #[starlark(require = pos, default = NoneOr::None)] sep: NoneOr<&str>,
         #[starlark(require = pos, default = NoneOr::None)] maxsplit: NoneOr<i32>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> anyhow::Result<ValueOfUnchecked<'v, UnpackList<String>>> {
         let maxsplit = match maxsplit.into_option() {
             None => None,
@@ -971,7 +979,7 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
     fn rstrip<'v>(
         this: StringValue<'v>,
         #[starlark(require = pos)] chars: Option<&str>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> anyhow::Result<StringValue<'v>> {
         let res = match chars {
             None => this.trim_end(),
@@ -1021,7 +1029,7 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
         this: &str,
         #[starlark(require = pos, default = NoneOr::None)] sep: NoneOr<&str>,
         #[starlark(require = pos, default = NoneOr::None)] maxsplit: NoneOr<i32>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> anyhow::Result<ValueOfUnchecked<'v, UnpackList<String>>> {
         let maxsplit = match maxsplit.into_option() {
             None => None,
@@ -1088,7 +1096,7 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
     fn splitlines<'v>(
         this: &str,
         #[starlark(require = pos, default = false)] keepends: bool,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> anyhow::Result<Vec<StringValue<'v>>> {
         let mut s = this;
         let mut lines: Vec<StringValue> = Vec::new();
@@ -1121,8 +1129,8 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
     /// https://github.com/bazelbuild/starlark/blob/master/spec.md#string·startswith
     /// ): test whether a string starts with a given prefix.
     ///
-    /// `S.startswith(suffix)` reports whether the string S has the specified
-    /// prefix.
+    /// `S.startswith(prefix[, start[, end]])` reports whether the string
+    /// `S[start:end]` has the specified prefix.
     ///
     /// ```
     /// # starlark::assert::all_true(r#"
@@ -1131,16 +1139,26 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
     /// 'abc'.startswith(('a', 'A')) == True
     /// 'ABC'.startswith(('a', 'A')) == True
     /// 'def'.startswith(('a', 'A')) == False
+    /// "//foo".startswith("//", 0, 2) == True
+    /// "//foo".startswith("foo", 2) == True
+    /// "hello".startswith("ell", 1, 4) == True
+    /// "hello".startswith("ell", 2, 4) == False
     /// # "#);
     /// ```
     #[starlark(speculative_exec_safe)]
     fn startswith(
         this: &str,
         #[starlark(require = pos)] prefix: StringOrTuple,
+        #[starlark(require = pos, default = NoneOr::None)] start: NoneOr<i32>,
+        #[starlark(require = pos, default = NoneOr::None)] end: NoneOr<i32>,
     ) -> anyhow::Result<bool> {
+        let haystack = match convert_str_indices(this, start.into_option(), end.into_option()) {
+            Some(StrIndices { haystack, .. }) => haystack,
+            None => return Ok(false),
+        };
         match prefix {
-            StringOrTuple::String(x) => Ok(this.starts_with(x)),
-            StringOrTuple::Tuple(xs) => Ok(xs.items.iter().any(|x| this.starts_with(x))),
+            StringOrTuple::String(x) => Ok(haystack.starts_with(x)),
+            StringOrTuple::Tuple(xs) => Ok(xs.items.iter().any(|x| haystack.starts_with(x))),
         }
     }
 
@@ -1161,7 +1179,7 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
     fn strip<'v>(
         this: StringValue<'v>,
         #[starlark(require = pos)] chars: Option<&str>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> anyhow::Result<StringValue<'v>> {
         let res = match chars {
             None => this.trim(),
@@ -1244,7 +1262,7 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
     fn removeprefix<'v>(
         this: StringValue<'v>,
         #[starlark(require = pos)] prefix: &str,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> anyhow::Result<StringValue<'v>> {
         let x = this.as_str();
         if x.starts_with(prefix) && !prefix.is_empty() {
@@ -1272,7 +1290,7 @@ pub(crate) fn string_methods(builder: &mut MethodsBuilder) {
     fn removesuffix<'v>(
         this: StringValue<'v>,
         #[starlark(require = pos)] suffix: &str,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> anyhow::Result<StringValue<'v>> {
         let x = this.as_str();
         if x.ends_with(suffix) && !suffix.is_empty() {
@@ -1308,5 +1326,31 @@ mod tests {
     fn test_opaque_iterator() {
         assert::is_true("type('foo'.elems()) != type([])");
         assert::is_true("type('foo'.codepoints()) != type([])");
+    }
+
+    #[test]
+    fn test_startswith_with_start_end() {
+        assert::all_true(
+            r#"
+"//foo".startswith("//", 0, 2) == True
+"//foo".startswith("foo", 2) == True
+"hello".startswith("ell", 1, 4) == True
+"hello".startswith("ell", 2, 4) == False
+"hello".startswith("hel", -5) == True
+"hello".startswith(("he", "wo"), 0, 3) == True
+"#,
+        );
+    }
+
+    #[test]
+    fn test_endswith_with_start_end() {
+        assert::all_true(
+            r#"
+"hello".endswith("ell", 0, 4) == True
+"hello".endswith("lo", 3) == True
+"hello".endswith("llo", 0, -1) == False
+"hello".endswith(("lo", "la"), 3) == True
+"#,
+        );
     }
 }

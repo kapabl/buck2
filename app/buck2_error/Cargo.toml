@@ -23,10 +23,10 @@ prost = { workspace = true }
 prost-types = { workspace = true }
 ref-cast = { workspace = true }
 regex = { workspace = true }
-relative-path = { workspace = true }
 rusqlite = { workspace = true }
 rustls-native-certs = { workspace = true }
 rustls-pki-types = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 smallvec = { workspace = true }
 thiserror = { workspace = true }
@@ -50,5 +50,5 @@ starlark_syntax = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fbcode_build)"] }
+[lints]
+workspace = true

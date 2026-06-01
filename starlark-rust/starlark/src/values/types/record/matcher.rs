@@ -17,17 +17,24 @@
 
 use allocative::Allocative;
 use dupe::Dupe;
+use pagable::Pagable;
+use pagable::pagable_typetag;
+use starlark_derive::type_matcher;
 
+use crate as starlark;
 use crate::values::Value;
 use crate::values::record::Record;
 use crate::values::types::type_instance_id::TypeInstanceId;
 use crate::values::typing::type_compiled::matcher::TypeMatcher;
+use crate::values::typing::type_compiled::matcher::TypeMatcherDyn;
 
-#[derive(Hash, Debug, Eq, PartialEq, Clone, Dupe, Allocative)]
+#[derive(Hash, Debug, Eq, PartialEq, Clone, Dupe, Allocative, Pagable)]
+#[pagable_typetag(TypeMatcherDyn)]
 pub(crate) struct RecordTypeMatcher {
     pub(crate) id: TypeInstanceId,
 }
 
+#[type_matcher]
 impl TypeMatcher for RecordTypeMatcher {
     fn matches(&self, value: Value) -> bool {
         match Record::from_value(value) {

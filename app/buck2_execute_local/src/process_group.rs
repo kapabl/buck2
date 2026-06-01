@@ -50,9 +50,12 @@ pub(crate) struct ProcessCommand {
 }
 
 impl ProcessCommand {
-    pub(crate) fn new(cmd: StdCommand, cgroup: Option<CgroupPathBuf>) -> buck2_error::Result<Self> {
+    pub(crate) async fn new(
+        cmd: StdCommand,
+        cgroup: Option<CgroupPathBuf>,
+    ) -> buck2_error::Result<Self> {
         Ok(Self {
-            inner: imp::ProcessCommandImpl::new(cmd, cgroup)?,
+            inner: imp::ProcessCommandImpl::new(cmd, cgroup).await?,
         })
     }
 
@@ -60,7 +63,7 @@ impl ProcessCommand {
     pub(crate) fn spawn(self) -> Result<ProcessGroup, (SpawnError, Self)> {
         match self.inner.spawn() {
             Ok(inner) => Ok(ProcessGroup { inner }),
-            Err((e, inner)) => Err((e.into(), Self { inner })),
+            Err((e, inner)) => Err((e, Self { inner })),
         }
     }
 }
@@ -81,7 +84,7 @@ impl ProcessGroup {
     pub(crate) async fn wait(
         &mut self,
         freeze_rx: impl ActionFreezeEventReceiver,
-    ) -> io::Result<ExitStatus> {
+    ) -> buck2_error::Result<(ExitStatus, Vec<buck2_resource_control::OrphanProcessInfo>)> {
         self.inner.wait(freeze_rx).await
     }
 
@@ -117,17 +120,17 @@ mod tests {
         }
         cmd.arg("exit 2");
 
-        let cmd = ProcessCommand::new(cmd, None).unwrap();
+        let cmd = ProcessCommand::new(cmd, None).await.unwrap();
         let mut child = cmd.spawn().map_err(|x| x.0).unwrap();
 
         let id = child.id().expect("missing id");
         assert!(id > 0);
 
-        let status = child.wait(futures::stream::pending()).await?;
+        let (status, _orphans) = child.wait(futures::stream::pending()).await?;
         assert_eq!(status.code(), Some(2));
 
         // test that the `.wait()` method is fused like tokio
-        let status = child.wait(futures::stream::pending()).await?;
+        let (status, _orphans) = child.wait(futures::stream::pending()).await?;
         assert_eq!(status.code(), Some(2));
 
         // Can't get id after process has exited

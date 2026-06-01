@@ -15,17 +15,26 @@ use allocative::Allocative;
 use async_trait::async_trait;
 use dice_error::DiceResult;
 use dice_futures::cancellation::CancellationContext;
+use dice_futures::owning_future::OwningFuture;
+use dupe::Dupe;
+use futures::FutureExt;
 use futures::future::BoxFuture;
+use pagable::Pagable;
+use pagable::pagable_typetag;
 
 use crate::DiceKeyTrackedInvalidationPaths;
+use crate::OpaqueValue;
 use crate::ProjectionKey;
 use crate::UserCycleDetectorGuard;
 use crate::api::data::DiceData;
 use crate::api::key::Key;
-use crate::api::opaque::OpaqueValue;
+use crate::api::key::NoValueSerialize;
+use crate::api::key::ValueSerialize;
 use crate::api::user_data::UserComputationData;
 use crate::ctx::DiceComputationsImpl;
 use crate::ctx::LinearRecomputeDiceComputationsImpl;
+use crate::impls::ctx::ModernDiceComputationsData;
+use crate::impls::key::DiceKeyDyn;
 
 /// The context for computations to register themselves, and request for additional dependencies.
 /// The dependencies accessed are tracked for caching via the `DiceCtx`.
@@ -316,6 +325,12 @@ impl DiceComputations<'_> {
         closure
     }
 
+    /// Returns a handle to the DICE data that provides access to global and per-transaction
+    /// data without the ability to request new keys.
+    pub fn data(&self) -> DiceComputationsData {
+        self.0.data()
+    }
+
     /// Data that is static per the entire lifetime of Dice. These data are initialized at the
     /// time that Dice is initialized via the constructor.
     pub fn global_data(&self) -> &DiceData {
@@ -345,6 +360,28 @@ impl DiceComputations<'_> {
     pub fn get_invalidation_paths(&mut self) -> DiceKeyTrackedInvalidationPaths {
         self.0.get_invalidation_paths()
     }
+
+    /// Spawn a computation on a new tokio task.
+    ///
+    /// This allows spawning work that requires access to the `DiceComputations` context
+    /// without running into lifetime issues with `tokio::spawn` requiring `'static` futures.
+    /// Dependencies accessed in the spawned task are tracked and merged back into the
+    /// parent computation. If the returned future is dropped, the spawned task will be cancelled.
+    pub fn spawned<'a, T, Compute>(
+        &'a mut self,
+        closure: Compute,
+    ) -> impl Future<Output = T> + use<'a, Compute, T>
+    where
+        T: Send + 'static,
+        Compute: (for<'x> FnOnce(
+                &'x mut DiceComputations<'_>,
+                &'x CancellationContext,
+            ) -> BoxFuture<'x, T>)
+            + Send
+            + 'static,
+    {
+        self.0.spawned(closure)
+    }
 }
 
 pub struct LinearRecomputeDiceComputations<'a>(pub(crate) LinearRecomputeDiceComputationsImpl<'a>);
@@ -353,6 +390,46 @@ impl LinearRecomputeDiceComputations<'_> {
     pub fn get(&self) -> DiceComputations<'_> {
         self.0.get()
     }
+
+    /// Spawn a computation on a new tokio task.
+    ///
+    /// See [`DiceComputations::spawned`] for details.
+    pub fn spawned<'a, T, Compute>(
+        &'a self,
+        closure: Compute,
+    ) -> impl Future<Output = T> + use<'a, Compute, T>
+    where
+        T: Send + 'static,
+        Compute: (for<'x> FnOnce(
+                &'x mut DiceComputations<'_>,
+                &'x CancellationContext,
+            ) -> BoxFuture<'x, T>)
+            + Send
+            + 'static,
+    {
+        OwningFuture::new(self.get(), |ctx| ctx.spawned(closure).boxed())
+    }
+}
+
+/// A holder for the user data attached to DICE. APIs that require access to data stored on DICE
+/// but that won't request keys can indicate that by accepting a `DiceComputationsData`.
+#[derive(Clone, Dupe)]
+pub struct DiceComputationsData(pub(crate) ModernDiceComputationsData);
+
+impl DiceComputationsData {
+    /// Data that is static per the entire lifetime of Dice. These data are initialized at the
+    /// time that Dice is initialized via the constructor.
+    pub fn global_data(&self) -> &DiceData {
+        self.0.global_data()
+    }
+
+    /// Data that is static for the lifetime of the current request context. This lifetime is
+    /// the lifetime of the top-level `DiceComputation` used for all requests.
+    /// The data is also specific to each request context, so multiple concurrent requests can
+    /// each have their own individual data.
+    pub fn per_transaction_data(&self) -> &UserComputationData {
+        self.0.per_transaction_data()
+    }
 }
 
 // This assertion assures we don't unknowingly regress the size of this critical future.
@@ -360,13 +437,15 @@ impl LinearRecomputeDiceComputations<'_> {
 #[allow(unused, clippy::diverging_sub_expression)]
 fn _assert_dice_compute_future_sizes() {
     let ctx: DiceComputations = panic!();
-    #[derive(Allocative, Debug, Clone, PartialEq, Eq, Hash)]
+    #[derive(Allocative, Debug, Clone, PartialEq, Eq, Hash, Pagable)]
+    #[pagable_typetag(DiceKeyDyn)]
     struct K(u64);
     impl std::fmt::Display for K {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             panic!()
         }
     }
+
     #[async_trait]
     impl Key for K {
         type Value = Arc<String>;
@@ -381,6 +460,10 @@ fn _assert_dice_compute_future_sizes() {
 
         fn equality(x: &Self::Value, y: &Self::Value) -> bool {
             panic!()
+        }
+
+        fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+            NoValueSerialize::<Self::Value>::new()
         }
     }
     let k: K = panic!();

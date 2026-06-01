@@ -38,10 +38,10 @@ use dice::DiceComputations;
 use dupe::Dupe;
 use futures::FutureExt;
 use gazebo::prelude::SliceExt;
+use pagable::Pagable;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
-use starlark::environment::MethodsStatic;
 use starlark::starlark_module;
 use starlark::values::AllocValue;
 use starlark::values::FrozenHeap;
@@ -55,6 +55,7 @@ use starlark::values::ValueTyped;
 use starlark::values::dict::AllocDict;
 use starlark::values::dict::DictType;
 use starlark::values::starlark_value;
+use starlark_map::ordered_map::OrderedMap;
 use strong_hash::StrongHash;
 
 use crate::bxl::starlark_defs::context::BxlContext;
@@ -119,6 +120,10 @@ pub(crate) async fn resolve_bxl_execution_platform(
         buck2_error::Ok(label)
     })?;
 
+    // Finalize the partial resolution with empty exec_dep_cfgs
+    // (BXL doesn't use modifiers for exec_deps)
+    let resolved_execution = resolved_execution.finalize(OrderedMap::new());
+
     Ok(BxlExecutionResolution {
         resolved_execution,
         exec_deps_configured,
@@ -126,7 +131,7 @@ pub(crate) async fn resolve_bxl_execution_platform(
     })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Allocative)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Allocative, Pagable)]
 pub(crate) struct BxlExecutionResolution {
     pub(crate) resolved_execution: ExecutionPlatformResolution,
     pub(crate) exec_deps_configured: Vec<ConfiguredProvidersLabel>,
@@ -198,8 +203,8 @@ impl<'v> BxlActions<'v> {
         actions: ValueTyped<'v, AnalysisActions<'v>>,
         exec_deps: Vec<ConfiguredProvidersLabel>,
         toolchains: Vec<ConfiguredProvidersLabel>,
-        heap: &'v Heap,
-        frozen_heap: &'v FrozenHeap,
+        heap: Heap<'v>,
+        frozen_heap: &FrozenHeap,
         ctx: &'c mut DiceComputations<'_>,
     ) -> buck2_error::Result<BxlActions<'v>> {
         let exec_deps = alloc_deps(exec_deps, heap, frozen_heap, ctx).await?;
@@ -224,11 +229,11 @@ impl<'v> BxlActions<'v> {
     }
 }
 
-async fn alloc_deps<'v, 'c>(
+async fn alloc_deps<'v>(
     deps: Vec<ConfiguredProvidersLabel>,
-    heap: &'v Heap,
-    frozen_heap: &'v FrozenHeap,
-    ctx: &'c mut DiceComputations<'_>,
+    heap: Heap<'v>,
+    frozen_heap: &FrozenHeap,
+    ctx: &mut DiceComputations<'_>,
 ) -> buck2_error::Result<ValueOfUnchecked<'v, DictType<StarlarkProvidersLabel, Dependency<'v>>>> {
     let analysis_results: Vec<_> = ctx
         .try_compute_join(deps, |ctx, target| {
@@ -263,16 +268,17 @@ async fn alloc_deps<'v, 'c>(
     Ok(heap.alloc_typed_unchecked(AllocDict(deps)).cast())
 }
 
+starlark::methods_static!(BXL_ACTIONS_METHODS = bxl_actions_methods);
+
 #[starlark_value(type = "bxl.Actions", StarlarkTypeRepr, UnpackValue)]
 impl<'v> StarlarkValue<'v> for BxlActions<'v> {
     fn get_methods() -> Option<&'static Methods> {
-        static RES: MethodsStatic = MethodsStatic::new();
-        RES.methods(bxl_actions_methods)
+        Some(BXL_ACTIONS_METHODS.methods())
     }
 }
 
 impl<'v> AllocValue<'v> for BxlActions<'v> {
-    fn alloc_value(self, heap: &'v Heap) -> Value<'v> {
+    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
         heap.alloc_complex_no_freeze(self)
     }
 }
@@ -301,7 +307,8 @@ fn bxl_actions_methods(builder: &mut MethodsBuilder) {
             soft_error!(
                 "bxl_acessing_exec_platform",
                 buck2_error!(buck2_error::ErrorTag::Input, "Anon target or dynamic action accesses bxl.Actions.exec_deps."),
-                quiet: true
+                quiet: true,
+                error_on_oss: true
             )?;
         }
 
@@ -318,7 +325,8 @@ fn bxl_actions_methods(builder: &mut MethodsBuilder) {
             soft_error!(
                 "bxl_acessing_exec_platform",
                 buck2_error!(buck2_error::ErrorTag::Input, "Anon target or dynamic action accesses bxl.Actions.toolchains."),
-                quiet: true
+                quiet: true,
+                error_on_oss: true
             )?;
         }
         Ok(this.toolchains)

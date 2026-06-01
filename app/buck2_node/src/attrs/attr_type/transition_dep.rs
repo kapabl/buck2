@@ -17,6 +17,7 @@ use buck2_core::configuration::transition::id::TransitionId;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
 use buck2_core::provider::label::ProvidersLabel;
 use dupe::Dupe;
+use pagable::Pagable;
 
 use crate::attrs::attr_type::configuration_dep::ConfigurationDepKind;
 use crate::attrs::configuration_context::AttrConfigurationContext;
@@ -25,7 +26,7 @@ use crate::attrs::configured_traversal::ConfiguredAttrTraversal;
 use crate::attrs::traversal::CoercedAttrTraversal;
 use crate::provider_id_set::ProviderIdSet;
 
-#[derive(Debug, PartialEq, Eq, Hash, Allocative)]
+#[derive(Debug, Pagable, PartialEq, Eq, Hash, Allocative)]
 pub struct TransitionDepAttrType {
     pub required_providers: ProviderIdSet,
     pub transition: Option<Arc<TransitionId>>,
@@ -63,7 +64,7 @@ impl TransitionDepAttrType {
     }
 }
 
-#[derive(Hash, PartialEq, Eq, Debug, Clone, Allocative)]
+#[derive(Hash, PartialEq, Eq, Debug, Clone, Allocative, Pagable)]
 pub struct ConfiguredTransitionDep {
     pub dep: ConfiguredProvidersLabel,
     pub required_providers: ProviderIdSet,
@@ -95,7 +96,16 @@ impl ConfiguredTransitionDep {
     }
 }
 
-#[derive(derive_more::Display, Debug, Hash, PartialEq, Eq, Clone, Allocative)]
+#[derive(
+    derive_more::Display,
+    Debug,
+    Hash,
+    PartialEq,
+    Eq,
+    Clone,
+    Allocative,
+    Pagable
+)]
 #[display("{}", dep)]
 pub struct CoercedTransitionDep {
     pub dep: ProvidersLabel,
@@ -135,7 +145,7 @@ impl CoercedTransitionDep {
                 traversal.configuration_dep(label, ConfigurationDepKind::Transition)?
             }
         };
-        traversal.transition_dep(&self.dep, &transition)
+        traversal.transition_dep(&self.dep, transition)
     }
 
     /// If there's a dynamic transition, return the target

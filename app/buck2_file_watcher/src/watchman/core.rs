@@ -365,6 +365,7 @@ struct SyncableQueryHandler<T, P> {
     last_clock: ClockSpec,
     last_mergebase: Option<String>,
     mergebase_with: Option<String>,
+    dice_clear_on_mergebase_change: bool,
     control_rx: UnboundedReceiver<SyncableQueryCommand<T, P>>,
 }
 
@@ -423,6 +424,7 @@ where
             } => {
                 if self.mergebase_with.is_none()
                     || self.last_mergebase.is_some() && self.last_mergebase == merge_base
+                    || !self.dice_clear_on_mergebase_change
                 {
                     (
                         self.processor
@@ -489,7 +491,7 @@ where
     ) -> buck2_error::Result<WatchmanSyncResult> {
         let client = client
             .as_mut()
-            .buck_error_context("No Watchman connection")?;
+            .ok_or_else(|| internal_error!("No Watchman connection"))?;
 
         let make_query = |last_clock, last_mergebase| {
             let mut query = self.query.clone();
@@ -609,7 +611,7 @@ where
         async move {
             tx_res
                 .ok()
-                .buck_error_context("SyncableQueryHandler has exited")?;
+                .ok_or_else(|| internal_error!("SyncableQueryHandler has exited"))?;
 
             let out = sync_done_rx
                 .await
@@ -629,6 +631,7 @@ where
         processor: Box<dyn SyncableQueryProcessor<Output = T, Payload = P>>,
         mergebase_with: Option<String>,
         empty_on_fresh_instance: bool,
+        dice_clear_on_mergebase_change: bool,
     ) -> buck2_error::Result<SyncableQuery<T, P>> {
         let path = path.as_ref();
         let path = CanonicalPath::canonicalize(path)
@@ -660,6 +663,7 @@ where
                 last_clock: ClockSpec::default(),
                 last_mergebase: None,
                 mergebase_with,
+                dice_clear_on_mergebase_change,
                 processor,
                 control_rx,
             };

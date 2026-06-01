@@ -32,8 +32,12 @@ use buck2_node::target_calculation::ConfiguredTargetCalculationImpl;
 use derive_more::Display;
 use dice::DiceComputations;
 use dice::Key;
+use dice::OkPagableValueSerialize;
+use dice::ValueSerialize;
 use dice_futures::cancellation::CancellationContext;
 use dupe::Dupe;
+use pagable::Pagable;
+use pagable::pagable_typetag;
 
 use crate::configuration::get_platform_configuration;
 use crate::execution::get_execution_platform_toolchain_dep;
@@ -43,8 +47,9 @@ async fn get_target_platform_detector(
 ) -> buck2_error::Result<Arc<TargetPlatformDetector>> {
     // This requires a bit of computation so cache it on the graph.
     // TODO(cjhopman): Should we construct this (and similar buckconfig-derived objects) as part of the buck config itself?
-    #[derive(Clone, Display, Debug, Dupe, Eq, Hash, PartialEq, Allocative)]
+    #[derive(Clone, Display, Debug, Dupe, Eq, Hash, PartialEq, Allocative, Pagable)]
     #[display("TargetPlatformDetectorKey")]
+    #[pagable_typetag(dice::DiceKeyDyn)]
     struct TargetPlatformDetectorKey;
 
     #[async_trait]
@@ -89,6 +94,10 @@ async fn get_target_platform_detector(
                 _ => false,
             }
         }
+
+        fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+            OkPagableValueSerialize::<Self::Value>::new()
+        }
     }
 
     ctx.compute(&TargetPlatformDetectorKey).await?
@@ -100,9 +109,7 @@ async fn get_default_platform(
 ) -> buck2_error::Result<ConfigurationData> {
     let detector = get_target_platform_detector(ctx).await?;
     if let Some(target) = detector.detect(target) {
-        return get_platform_configuration(ctx, target)
-            .await
-            .map_err(buck2_error::Error::from);
+        return get_platform_configuration(ctx, target).await;
     }
     // TODO(cjhopman): This needs to implement buck1's approach to determining target platform, it's currently missing the fallback to buckconfig parser.target_platform.
     Ok(ConfigurationData::unspecified())
@@ -150,6 +157,9 @@ impl ConfiguredTargetCalculationImpl for ConfiguredTargetCalculationInstance {
                     current_cfg,
                     &global_cfg_options.cli_modifiers,
                     node.rule_type(),
+                    // configuring_exec_dep: false because this is configuring a regular target,
+                    // not an execution dependency.
+                    false,
                 )
                 .await
                 .with_buck_error_context(|| format!("Resolving modifiers for target `{target}`"))

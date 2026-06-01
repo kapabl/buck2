@@ -14,7 +14,6 @@ use std::str::FromStr;
 use buck2_error::buck2_error;
 use dupe::Dupe;
 use os_str_bytes::OsStrBytes;
-use rand::Rng;
 
 /// Returns true or false for percentage-based feature rollouts based on a configuration string.
 /// Configurations supported today are random and hostname.
@@ -59,7 +58,7 @@ impl RolloutPercentage {
                     }
                 }
             }
-            Inner::Rate(pct) => rand::thread_rng().r#gen::<f64>() < pct,
+            Inner::Rate(pct) => rand::random::<f64>() < pct,
             Inner::Bool(b) => b,
         }
     }
@@ -139,8 +138,8 @@ fn rate(val: f64) -> buck2_error::Result<f64> {
 #[cfg(test)]
 mod tests {
     use assert_matches::assert_matches;
-    use rand::distributions::Alphanumeric;
-    use rand::distributions::DistString;
+    use rand::distr::Alphanumeric;
+    use rand::distr::SampleString;
 
     use super::*;
 
@@ -167,7 +166,7 @@ mod tests {
     fn test_roll() {
         let hostname = || {
             Some(OsString::from(
-                Alphanumeric.sample_string(&mut rand::thread_rng(), 16),
+                Alphanumeric.sample_string(&mut rand::rng(), 16),
             ))
         };
 

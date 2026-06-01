@@ -75,7 +75,13 @@ macro_rules! impl_strong_hash_for_impl_hash {
     };
 }
 
-impl_strong_hash_for_impl_hash!(bool u8 i8 u16 i16 u32 i32 u64 i64 usize str &str String);
+impl_strong_hash_for_impl_hash!(bool u8 i8 u16 i16 u32 i32 u64 i64 usize str String);
+
+impl<T: StrongHash + ?Sized> StrongHash for &T {
+    fn strong_hash<H: Hasher>(&self, state: &mut H) {
+        (**self).strong_hash(state);
+    }
+}
 
 impl<T: StrongHash> StrongHash for [T] {
     fn strong_hash<H: Hasher>(&self, state: &mut H) {
@@ -86,16 +92,10 @@ impl<T: StrongHash> StrongHash for [T] {
     }
 }
 
-impl<T: StrongHash> StrongHash for &[T] {
-    fn strong_hash<H: Hasher>(&self, state: &mut H) {
-        <[T] as StrongHash>::strong_hash(*self, state);
-    }
-}
-
 impl<T: StrongHash> StrongHash for Vec<T> {
     fn strong_hash<H: Hasher>(&self, state: &mut H) {
         self.len().strong_hash(state);
-        (&self[..]).strong_hash(state);
+        self[..].strong_hash(state);
     }
 }
 

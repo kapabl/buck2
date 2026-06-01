@@ -66,6 +66,10 @@ use crate::eval::compiler::def::Def;
 use crate::eval::compiler::def::FrozenDef;
 use crate::eval::runtime::arguments::ArgumentsFull;
 use crate::eval::runtime::frame_span::FrameSpan;
+use crate::pagable::starlark_deserialize::StarlarkDeserialize;
+use crate::pagable::starlark_deserialize::StarlarkDeserializeContext;
+use crate::pagable::starlark_serialize::StarlarkSerialize;
+use crate::pagable::starlark_serialize::StarlarkSerializeContext;
 use crate::sealed::Sealed;
 use crate::typing::ParamIsRequired;
 use crate::typing::ParamSpec;
@@ -74,7 +78,6 @@ use crate::typing::TyCallable;
 use crate::util::ArcStr;
 use crate::values::FreezeResult;
 use crate::values::Freezer;
-use crate::values::FrozenRef;
 use crate::values::FrozenStringValue;
 use crate::values::FrozenValueTyped;
 use crate::values::Heap;
@@ -245,16 +248,12 @@ impl Equivalent<Value<'_>> for FrozenValue {
 /// when working directly with [`FrozenValue`]s. See the type [`OwnedFrozenValue`](crate::values::OwnedFrozenValue)
 /// for a little bit more safety.
 #[derive(Clone, Copy, Dupe, ProvidesStaticType, Allocative)]
+#[derive(pagable::PagablePanic)]
 // One possible change: moving from Blackhole during GC
 pub struct FrozenValue(
     #[allocative(skip)] // Because it is owned by the heap.
     pub(crate)  FrozenPointer<'static>,
 );
-
-// These can both be shared, but not obviously, because we hide a fake RefCell in Pointer to stop
-// it having variance.
-unsafe impl Send for FrozenValue {}
-unsafe impl Sync for FrozenValue {}
 
 #[derive(thiserror::Error, Debug)]
 #[error("Integer value is too big to fit in {integer_type}: {value}")]
@@ -572,7 +571,7 @@ impl<'v> Value<'v> {
     }
 
     /// `x[index]`.
-    pub fn at(self, index: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub fn at(self, index: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         self.get_ref().at(index, heap)
     }
 
@@ -582,7 +581,7 @@ impl<'v> Value<'v> {
         start: Option<Value<'v>>,
         stop: Option<Value<'v>>,
         stride: Option<Value<'v>>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> crate::Result<Value<'v>> {
         self.get_ref().slice(start, stop, stride, heap)
     }
@@ -598,22 +597,22 @@ impl<'v> Value<'v> {
     }
 
     /// `+x`.
-    pub fn plus(self, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub fn plus(self, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         self.get_ref().plus(heap)
     }
 
     /// `-x`.
-    pub fn minus(self, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub fn minus(self, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         self.get_ref().minus(heap)
     }
 
     /// `x - other`.
-    pub fn sub(self, other: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub fn sub(self, other: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         self.get_ref().sub(other, heap)
     }
 
     /// `x * other`.
-    pub fn mul(self, other: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub fn mul(self, other: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         match self.get_ref().mul(other, heap) {
             Some(r) => r,
             _ => match other.get_ref().rmul(self, heap) {
@@ -624,53 +623,53 @@ impl<'v> Value<'v> {
     }
 
     /// `x % other`.
-    pub fn percent(self, other: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub fn percent(self, other: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         self.get_ref().percent(other, heap)
     }
 
     /// `x / other`.
-    pub fn div(self, other: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub fn div(self, other: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         self.get_ref().div(other, heap)
     }
 
     /// `x // other`.
-    pub fn floor_div(self, other: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub fn floor_div(self, other: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         self.get_ref().floor_div(other, heap)
     }
 
     /// `x & other`.
-    pub fn bit_and(self, other: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub fn bit_and(self, other: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         self.get_ref().bit_and(other, heap)
     }
 
     /// `x | other`.
-    pub fn bit_or(self, other: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub fn bit_or(self, other: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         self.get_ref().bit_or(other, heap)
     }
 
     /// `x ^ other`.
-    pub fn bit_xor(self, other: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub fn bit_xor(self, other: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         self.get_ref().bit_xor(other, heap)
     }
 
     /// `~x`.
-    pub fn bit_not(self, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub fn bit_not(self, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         self.get_ref().bit_not(heap)
     }
 
     /// `x << other`.
-    pub fn left_shift(self, other: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub fn left_shift(self, other: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         self.get_ref().left_shift(other, heap)
     }
 
     /// `x >> other`.
-    pub fn right_shift(self, other: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub fn right_shift(self, other: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         self.get_ref().right_shift(other, heap)
     }
 
     pub(crate) fn invoke_with_loc(
         self,
-        location: Option<FrozenRef<'static, FrameSpan>>,
+        location: Option<&'static FrameSpan>,
         args: &Arguments<'v, '_>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> crate::Result<Value<'v>> {
@@ -687,6 +686,21 @@ impl<'v> Value<'v> {
             Some(&def.parameters)
         } else if let Some(def) = self.downcast_ref::<FrozenDef>() {
             Some(def.parameters.as_value())
+        } else {
+            None
+        }
+    }
+
+    /// Returns the name of a callable value, if known.
+    ///
+    /// Works for user-defined functions (`def`/`lambda`) and native functions.
+    pub fn function_name(self) -> Option<&'v str> {
+        if let Some(def) = self.downcast_ref::<Def>() {
+            Some(def.def_info.name.as_str())
+        } else if let Some(def) = self.downcast_ref::<FrozenDef>() {
+            Some(def.def_info.name.as_str())
+        } else if let Some(native) = self.downcast_ref::<NativeFunction>() {
+            Some(&native.name)
         } else {
             None
         }
@@ -804,7 +818,7 @@ impl<'v> Value<'v> {
 
     /// Add two [`Value`]s together. Will first try using [`add`](StarlarkValue::add),
     /// before falling back to [`radd`](StarlarkValue::radd).
-    pub fn add(self, other: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub fn add(self, other: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         // Fast special case for ints.
         if let Some(ls) = self.unpack_inline_int() {
             if let Some(rs) = other.unpack_inline_int() {
@@ -843,12 +857,11 @@ impl<'v> Value<'v> {
     }
 
     /// Implement the `str()` function - converts a string value to itself,
-    /// otherwise uses `repr()`.
+    /// otherwise calls `collect_str()` (which handles bytes, etc.).
     pub fn to_str(self) -> String {
-        match self.unpack_str() {
-            None => self.to_repr(),
-            Some(s) => s.to_owned(),
-        }
+        let mut s = String::new();
+        self.collect_str(&mut s);
+        s
     }
 
     /// Implement the `repr()` function.
@@ -891,7 +904,7 @@ impl<'v> Value<'v> {
 
     /// Produce an iterable from a value.
     #[inline]
-    pub fn iterate(self, heap: &'v Heap) -> crate::Result<StarlarkIterator<'v>> {
+    pub fn iterate(self, heap: Heap<'v>) -> crate::Result<StarlarkIterator<'v>> {
         let iter = self.get_ref().iterate(self, heap)?;
         Ok(StarlarkIterator::new(iter, heap))
     }
@@ -952,7 +965,7 @@ impl<'v> Value<'v> {
     }
 
     /// Return the attribute with the given name.
-    pub fn get_attr(self, attribute: &str, heap: &'v Heap) -> crate::Result<Option<Value<'v>>> {
+    pub fn get_attr(self, attribute: &str, heap: Heap<'v>) -> crate::Result<Option<Value<'v>>> {
         let aref = self.get_ref();
         if let Some(methods) = aref.vtable().methods() {
             let attribute = Hashed::new(attribute);
@@ -966,7 +979,7 @@ impl<'v> Value<'v> {
     }
 
     /// Like `get_attr` but return an error if the attribute is not available.
-    pub fn get_attr_error(self, attribute: &str, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub fn get_attr_error(self, attribute: &str, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         match self.get_attr(attribute, heap)? {
             None => ValueError::unsupported_owned(self.get_type(), &format!(".{attribute}"), None),
             Some(x) => Ok(x),
@@ -975,7 +988,7 @@ impl<'v> Value<'v> {
 
     /// Query whether an attribute exists on a type. Should be equivalent to whether
     /// [`get_attr`](Value::get_attr) succeeds, but potentially more efficient.
-    pub fn has_attr(self, attribute: &str, heap: &'v Heap) -> bool {
+    pub fn has_attr(self, attribute: &str, heap: Heap<'v>) -> bool {
         let aref = self.get_ref();
         if let Some(methods) = aref.vtable().methods() {
             if methods.get(attribute).is_some() {
@@ -1069,11 +1082,6 @@ impl FrozenValue {
     }
 
     #[inline]
-    pub(crate) fn new_repr<'a, T: AValue<'a>>(x: &'static AValueRepr<AValueImpl<'a, T>>) -> Self {
-        Self::new_ptr(&x.header, T::IS_STR)
-    }
-
-    #[inline]
     pub(crate) fn new_ptr_usize_with_str_tag(x: usize) -> Self {
         Self(FrozenPointer::new_frozen_usize_with_str_tag(x))
     }
@@ -1081,7 +1089,7 @@ impl FrozenValue {
     /// Create a new value representing `None` in Starlark.
     #[inline]
     pub fn new_none() -> Self {
-        Self::new_repr(&VALUE_NONE)
+        VALUE_NONE.to_frozen_value()
     }
 
     /// Create a new boolean in Starlark.
@@ -1089,7 +1097,7 @@ impl FrozenValue {
     pub fn new_bool(x: bool) -> Self {
         // Implemented by indexing into a static so that
         // the compiler makes this function branchless.
-        Self::new_repr(&VALUE_FALSE_TRUE[x as usize])
+        VALUE_FALSE_TRUE[x as usize].to_frozen_value()
     }
 
     /// Create a new int in Starlark.
@@ -1112,19 +1120,19 @@ impl FrozenValue {
     /// Create a new empty tuple.
     #[inline]
     pub(crate) fn new_empty_tuple() -> Self {
-        FrozenValue::new_repr(&VALUE_EMPTY_TUPLE)
+        VALUE_EMPTY_TUPLE.to_frozen_value()
     }
 
     /// Create a new empty list.
     #[inline]
     pub fn new_empty_list() -> Self {
-        FrozenValue::new_repr(&VALUE_EMPTY_FROZEN_LIST)
+        VALUE_EMPTY_FROZEN_LIST.to_frozen_value()
     }
 
     /// Create a new empty dict.
     #[inline]
     pub fn new_empty_dict() -> Self {
-        FrozenValue::new_repr(&VALUE_EMPTY_FROZEN_DICT)
+        VALUE_EMPTY_FROZEN_DICT.to_frozen_value()
     }
 
     #[inline]
@@ -1222,28 +1230,6 @@ impl FrozenValue {
             // Empty tuple is statically allocated.
             || matches!(Tuple::from_value(self.to_value()), Some(t) if t.len() == 0)
     }
-
-    /// Downcast to given type.
-    #[inline]
-    pub fn downcast_frozen_ref<T: StarlarkValue<'static>>(self) -> Option<FrozenRef<'static, T>> {
-        self.downcast_ref::<T>().map(|value| FrozenRef { value })
-    }
-
-    /// Downcast to string.
-    #[inline]
-    pub fn downcast_frozen_str(self) -> Option<FrozenRef<'static, str>> {
-        self.to_value()
-            .unpack_str()
-            .map(|value| FrozenRef { value })
-    }
-
-    /// Note: see docs about ['Value::unpack_box_str'] about instability
-    #[inline]
-    pub fn downcast_frozen_starlark_str(self) -> Option<FrozenRef<'static, StarlarkStr>> {
-        self.to_value()
-            .unpack_starlark_str()
-            .map(|value| FrozenRef { value })
-    }
 }
 
 impl<'v> Serialize for Value<'v> {
@@ -1264,6 +1250,18 @@ impl Serialize for FrozenValue {
         S: Serializer,
     {
         self.to_value().serialize(s)
+    }
+}
+
+impl StarlarkSerialize for FrozenValue {
+    fn starlark_serialize(&self, ctx: &mut dyn StarlarkSerializeContext) -> crate::Result<()> {
+        ctx.serialize_frozen_value(*self)
+    }
+}
+
+impl StarlarkDeserialize for FrozenValue {
+    fn starlark_deserialize(ctx: &mut dyn StarlarkDeserializeContext<'_>) -> crate::Result<Self> {
+        ctx.deserialize_frozen_value()
     }
 }
 
@@ -1329,11 +1327,7 @@ pub trait ValueLike<'v>:
 
     /// `str(x)`.
     fn collect_str(self, collector: &mut String) {
-        if let Some(s) = self.to_value().unpack_str() {
-            collector.push_str(s);
-        } else {
-            self.collect_repr(collector);
-        }
+        self.collect_repr(collector);
     }
 
     /// `x == other`.
@@ -1413,6 +1407,22 @@ impl<'v> ValueLike<'v> for Value<'v> {
         }
     }
 
+    fn collect_str(self, collector: &mut String) {
+        // Fast path: strings don't need cycle detection or vtable dispatch.
+        if let Some(s) = self.unpack_starlark_str() {
+            collector.push_str(s.as_str());
+            return;
+        }
+        match repr_stack_push(self) {
+            Ok(_guard) => {
+                self.get_ref().collect_str(collector);
+            }
+            Err(..) => {
+                self.get_ref().collect_repr_cycle(collector);
+            }
+        }
+    }
+
     fn write_hash(self, hasher: &mut StarlarkHasher) -> crate::Result<()> {
         self.get_ref().write_hash(hasher)
     }
@@ -1456,6 +1466,11 @@ impl<'v> ValueLike<'v> for FrozenValue {
     }
 
     #[inline]
+    fn collect_str(self, collector: &mut String) {
+        self.to_value().collect_str(collector)
+    }
+
+    #[inline]
     fn write_hash(self, hasher: &mut StarlarkHasher) -> crate::Result<()> {
         self.to_value().write_hash(hasher)
     }
@@ -1495,32 +1510,34 @@ mod tests {
 
     #[test]
     fn test_downcast_ref() {
-        let heap = Heap::new();
-        let string = heap.alloc_str("asd").to_value();
-        let none = Value::new_none();
-        let integer = Value::testing_new_int(17);
+        Heap::temp(|heap| {
+            let string = heap.alloc_str("asd").to_value();
+            let none = Value::new_none();
+            let integer = Value::testing_new_int(17);
 
-        assert!(string.downcast_ref::<NoneType>().is_none());
-        assert!(integer.downcast_ref::<NoneType>().is_none());
-        assert!(none.downcast_ref::<NoneType>().is_some());
+            assert!(string.downcast_ref::<NoneType>().is_none());
+            assert!(integer.downcast_ref::<NoneType>().is_none());
+            assert!(none.downcast_ref::<NoneType>().is_some());
 
-        assert_eq!(
-            "asd",
-            string.downcast_ref::<StarlarkStr>().unwrap().as_str()
-        );
-        assert!(integer.downcast_ref::<StarlarkStr>().is_none());
-        assert!(none.downcast_ref::<StarlarkStr>().is_none());
+            assert_eq!(
+                "asd",
+                string.downcast_ref::<StarlarkStr>().unwrap().as_str()
+            );
+            assert!(integer.downcast_ref::<StarlarkStr>().is_none());
+            assert!(none.downcast_ref::<StarlarkStr>().is_none());
 
-        assert!(string.downcast_ref::<PointerI32>().is_none());
-        assert_eq!(17, integer.downcast_ref::<PointerI32>().unwrap().get());
-        assert!(none.downcast_ref::<PointerI32>().is_none());
+            assert!(string.downcast_ref::<PointerI32>().is_none());
+            assert_eq!(17, integer.downcast_ref::<PointerI32>().unwrap().get());
+            assert!(none.downcast_ref::<PointerI32>().is_none());
+        });
     }
 
     #[test]
     fn test_unpack_i32() {
-        let heap = Heap::new();
-        let value = heap.alloc(i32::MAX);
-        assert_eq!(Some(i32::MAX), value.unpack_i32());
+        Heap::temp(|heap| {
+            let value = heap.alloc(i32::MAX);
+            assert_eq!(Some(i32::MAX), value.unpack_i32());
+        });
     }
 
     #[test]
@@ -1531,13 +1548,14 @@ mod tests {
 
     #[test]
     fn test_unpack_bigint() {
-        let heap = Heap::new();
-        let value = heap.alloc(BigInt::from(i64::MAX));
-        assert_eq!(None, value.unpack_i32());
-        assert_eq!(
-            Some(BigInt::from(i64::MAX)),
-            BigInt::unpack_value(value).unwrap()
-        );
+        Heap::temp(|heap| {
+            let value = heap.alloc(BigInt::from(i64::MAX));
+            assert_eq!(None, value.unpack_i32());
+            assert_eq!(
+                Some(BigInt::from(i64::MAX)),
+                BigInt::unpack_value(value).unwrap()
+            );
+        });
     }
 
     #[test]
@@ -1556,12 +1574,13 @@ mod tests {
             Value::new_none().to_string_for_type_error(),
         );
 
-        let heap = Heap::new();
-        let list = heap.alloc(AllocList(0..12345));
-        assert_eq!(
-            "list (repr: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,<<...>>42, 12343, 12344])",
-            list.to_string_for_type_error(),
-        );
+        Heap::temp(|heap| {
+            let list = heap.alloc(AllocList(0..12345));
+            assert_eq!(
+                "list (repr: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,<<...>>42, 12343, 12344])",
+                list.to_string_for_type_error(),
+            );
+        });
     }
 
     #[test]
@@ -1573,6 +1592,33 @@ mod tests {
             e.to_string().contains("Value is not callable: NoneType"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn test_function_name_def() {
+        let module = assert::pass_module("def my_func(x, y): return x + y");
+        let f = module.get("my_func").unwrap();
+        assert_eq!(Some("my_func"), f.value().function_name());
+    }
+
+    #[test]
+    fn test_function_name_lambda() {
+        let module = assert::pass_module("f = lambda x: x");
+        let f = module.get("f").unwrap();
+        assert_eq!(Some("lambda"), f.value().function_name());
+    }
+
+    #[test]
+    fn test_function_name_native() {
+        let g = Globals::standard();
+        let f = g.get("bool").unwrap();
+        assert_eq!(Some("bool"), f.function_name());
+    }
+
+    #[test]
+    fn test_function_name_non_callable() {
+        assert_eq!(None, Value::new_none().function_name());
+        assert_eq!(None, Value::testing_new_int(5).function_name());
     }
 
     #[test]

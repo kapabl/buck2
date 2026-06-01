@@ -12,6 +12,8 @@
 
 use buck2_error::BuckErrorContext;
 use buck2_error::internal_error;
+use buck2_interpreter::types::select_fail::StarlarkSelectFail;
+use buck2_interpreter::types::select_incompatible::StarlarkSelectIncompatible;
 use buck2_node::attrs::attr_type::AttrType;
 use buck2_node::attrs::coerced_attr::CoercedAttr;
 use buck2_node::attrs::coerced_attr::CoercedConcat;
@@ -87,7 +89,31 @@ impl CoercedAttrExr for CoercedAttr {
                                 .ok_or_else(|| SelectError::KeyNotString(k.to_repr()))?;
                             let v = match default_attr {
                                 Some(default_attr) if v.is_none() => default_attr.clone(),
-                                _ => CoercedAttr::coerce(attr, configurable, ctx, v, default_attr)?,
+                                _ => match CoercedAttr::coerce(
+                                    attr,
+                                    configurable,
+                                    ctx,
+                                    v,
+                                    default_attr,
+                                ) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        if let Some(select_fail) = StarlarkSelectFail::from_value(v)
+                                        {
+                                            CoercedAttr::SelectFail(
+                                                ctx.intern_str(select_fail.as_str()),
+                                            )
+                                        } else if let Some(select_incompatible) =
+                                            StarlarkSelectIncompatible::from_value(v)
+                                        {
+                                            CoercedAttr::SelectIncompatible(
+                                                ctx.intern_str(select_incompatible.as_str()),
+                                            )
+                                        } else {
+                                            return Err(e);
+                                        }
+                                    }
+                                },
                             };
                             if k == "DEFAULT" {
                                 if default.is_some() {
@@ -125,13 +151,13 @@ impl CoercedAttrExr for CoercedAttr {
                         CoercedAttr::Concat(l) => l.0.into_vec(),
                         l => vec![l],
                     };
-                    let r = CoercedAttr::coerce(attr, configurable, ctx, r, None)?;
-                    let r = match r {
-                        CoercedAttr::Concat(r) => r.0.into_vec(),
-                        r => vec![r],
+                    match CoercedAttr::coerce(attr, configurable, ctx, r, None)? {
+                        CoercedAttr::Concat(r) => {
+                            l.extend(r.0.into_vec());
+                        }
+                        r => l.push(r),
                     };
 
-                    l.extend(r);
                     Ok(CoercedAttr::Concat(CoercedConcat(l.into_boxed_slice())))
                 }
             }

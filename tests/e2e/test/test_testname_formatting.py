@@ -13,7 +13,6 @@ import json
 from typing import Any, List
 
 import pytest
-
 from buck2.tests.e2e_util.api.buck import Buck
 from buck2.tests.e2e_util.asserts import expect_failure
 from buck2.tests.e2e_util.buck_workspace import buck_test
@@ -55,11 +54,13 @@ async def testname_formatting(
 
 
 def get_test_name_from_end_event(event: Any) -> List[str]:
-    return event["Event"]["data"]["SpanEnd"]["data"]["TestEnd"]["suite"]["test_names"]
+    return event["Event"]["data"]["SpanEnd"]["data"]["TestRun"]["suite"]["test_names"]
 
 
 def get_events_test_names(log: List[str]) -> List[str]:
-    test_end_events = [json.loads(line) for line in log if "TestEnd" in line]
+    test_end_events = [
+        json.loads(line) for line in log if '"SpanEnd"' in line and '"TestRun"' in line
+    ]
     test_end_events = [
         test_name
         for test_event in test_end_events

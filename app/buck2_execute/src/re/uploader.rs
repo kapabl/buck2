@@ -9,8 +9,6 @@
  */
 
 use std::borrow::Borrow;
-use std::collections::HashMap;
-use std::collections::HashSet;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -34,6 +32,9 @@ use buck2_directory::directory::entry::DirectoryEntry;
 use buck2_directory::directory::fingerprinted_directory::FingerprintedDirectory;
 use buck2_error::BuckErrorContext;
 use buck2_error::conversion::from_any_with_tag;
+use buck2_error::internal_error;
+use buck2_hash::StdBuckHashMap;
+use buck2_hash::StdBuckHashSet;
 use chrono::Duration;
 use chrono::Utc;
 use dupe::Dupe;
@@ -70,7 +71,7 @@ use crate::re::metadata::RemoteExecutionMetadataExt;
 #[derive(Clone, Debug, Default)]
 pub struct UploadStats {
     pub total: ReUploadMetrics,
-    pub by_extension: HashMap<String, ReUploadMetrics>,
+    pub by_extension: StdBuckHashMap<String, ReUploadMetrics>,
 }
 
 pub struct Uploader {}
@@ -86,7 +87,7 @@ impl Uploader {
         deduplicate_get_digests_ttl_calls: bool,
     ) -> buck2_error::Result<(
         Vec<InlinedBlobWithDigest>,
-        HashSet<&'a TrackedCasDigest<FileDigestKind>>,
+        StdBuckHashSet<&'a TrackedCasDigest<FileDigestKind>>,
     )> {
         // RE mentions they usually take 5-10 minutes of leeway so we mirror this here.
         let now = Utc::now();
@@ -98,7 +99,7 @@ impl Uploader {
         let ttl_deadline = now + Duration::seconds(ttl_wanted);
 
         // See if anything needs uploading
-        let mut input_digests = blobs.keys().collect::<HashSet<_>>();
+        let mut input_digests = blobs.keys().collect::<StdBuckHashSet<_>>();
         {
             // Collect the digests we need to upload
             for entry in input_dir.unordered_walk().without_paths() {
@@ -120,7 +121,7 @@ impl Uploader {
         };
 
         let mut upload_blobs = Vec::new();
-        let mut missing_digests = HashSet::new();
+        let mut missing_digests = StdBuckHashSet::default();
         add_injected_missing_digests(&input_digests, &mut missing_digests)?;
 
         let digests_and_ttls_iterator = if deduplicate_get_digests_ttl_calls {
@@ -149,7 +150,7 @@ impl Uploader {
             let input_digests_ttls = fut.await?;
 
             struct DigestsWithTtlIterator<I> {
-                ttls: HashMap<TrackedFileDigest, i64>,
+                ttls: StdBuckHashMap<TrackedFileDigest, i64>,
                 inner: I,
             }
 
@@ -161,9 +162,10 @@ impl Uploader {
 
                 fn next(&mut self) -> Option<buck2_error::Result<(&'a TrackedFileDigest, i64)>> {
                     let digest = self.inner.next()?;
-                    let digest_ttl = self.ttls.get(digest).with_buck_error_context(|| {
-                        format!("Did not get a TTL for digest: {}", digest)
-                    });
+                    let digest_ttl = self
+                        .ttls
+                        .get(digest)
+                        .ok_or_else(|| internal_error!("Did not get a TTL for digest: {}", digest));
                     Some(digest_ttl.map(|ttl| (digest, *ttl)))
                 }
             }
@@ -394,7 +396,7 @@ impl Uploader {
         // Compute stats of digests we're about to upload so we can report them
         // to the span end event of this stage of execution.
         let stats = {
-            let mut stats_by_extension = HashMap::new();
+            let mut stats_by_extension = StdBuckHashMap::default();
             let mut named_digest_byte_count: u64 = 0;
             for nd in &upload_files {
                 // Aggregate metrics by file extension.
@@ -506,8 +508,8 @@ fn error_for_missing_file(
 /// This is used for tests. We allow an environment variable to be set to report that some digests
 /// are _always_ missing if they are required. This lets us test our upload paths more easily.
 fn add_injected_missing_digests<'a>(
-    input_digests: &HashSet<&'a TrackedFileDigest>,
-    missing_digests: &mut HashSet<&'a TrackedFileDigest>,
+    input_digests: &StdBuckHashSet<&'a TrackedFileDigest>,
+    missing_digests: &mut StdBuckHashSet<&'a TrackedFileDigest>,
 ) -> buck2_error::Result<()> {
     fn convert_digests(val: &str) -> buck2_error::Result<Vec<FileDigest>> {
         val.split(' ')
@@ -567,11 +569,11 @@ struct GetDigestsTtlDeduper<'s> {
     /// Maps a given digest to a request that will produce this digest (and
     /// possibly / likely others). The request is referenced as an ID that
     /// can be used to lookup in `queries`.
-    digests: HashMap<TrackedFileDigest, RequestId>,
+    digests: StdBuckHashMap<TrackedFileDigest, RequestId>,
     /// Maps a request to the actual future that will contain its results.
-    queries: HashMap<
+    queries: StdBuckHashMap<
         RequestId,
-        Shared<BoxFuture<'s, buck2_error::Result<HashMap<TrackedFileDigest, i64>>>>,
+        Shared<BoxFuture<'s, buck2_error::Result<StdBuckHashMap<TrackedFileDigest, i64>>>>,
     >,
 }
 
@@ -586,13 +588,13 @@ impl<'s> GetDigestsTtlDeduper<'s> {
         digest_config: DigestConfig,
         digests: impl IntoIterator<Item = &'a TrackedFileDigest>,
     ) -> (
-        impl Future<Output = buck2_error::Result<HashMap<TrackedFileDigest, i64>>> + 's,
+        impl Future<Output = buck2_error::Result<StdBuckHashMap<TrackedFileDigest, i64>>> + 's,
         usize,
         usize,
     ) {
         let mut guard = deduper.lock().expect("Poisoned lock");
 
-        let mut reqs = HashSet::new();
+        let mut reqs = StdBuckHashSet::default();
 
         let mut to_schedule = Vec::new();
 
@@ -657,7 +659,7 @@ fn query_digest_ttls<'s>(
     identity: Option<&ReActionIdentity<'_>>,
     digest_config: DigestConfig,
     input_digests: Vec<TrackedFileDigest>,
-) -> BoxFuture<'s, buck2_error::Result<HashMap<TrackedFileDigest, i64>>> {
+) -> BoxFuture<'s, buck2_error::Result<StdBuckHashMap<TrackedFileDigest, i64>>> {
     let client = client.dupe();
     let metadata = use_case.metadata(identity);
     let digests = input_digests.iter().map(|d| d.to_re()).collect();

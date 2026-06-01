@@ -16,21 +16,21 @@ use std::sync::atomic::Ordering;
 use allocative::Allocative;
 use dupe::Dupe;
 use either::Either;
+use pagable::Pagable;
 use starlark::any::ProvidesStaticType;
 use starlark::collections::StarlarkHasher;
 use starlark::environment::GlobalsBuilder;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
-use starlark::environment::MethodsStatic;
 use starlark::values::Freeze;
 use starlark::values::NoSerialize;
+use starlark::values::StarlarkPagable;
 use starlark::values::StarlarkValue;
 use starlark::values::Trace;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
 use starlark::values::ValueLike;
 use starlark::values::starlark_value;
-use starlark::values::starlark_value_as_type::StarlarkValueAsType;
 
 use crate::interpreter::rule_defs::artifact_tagging::StarlarkTaggedCommandLine;
 use crate::interpreter::rule_defs::artifact_tagging::StarlarkTaggedValue;
@@ -52,7 +52,9 @@ use crate::interpreter::rule_defs::cmd_args::value_as::ValueAsCommandLineLike;
     Trace,
     ProvidesStaticType,
     NoSerialize,
-    Allocative
+    Allocative,
+    Pagable, // Need a way to avoid collisions if shared between processes.
+    StarlarkPagable
 )]
 pub struct ArtifactTag {
     identity: u64,
@@ -79,11 +81,12 @@ impl fmt::Display for ArtifactTag {
 
 starlark_simple_value!(ArtifactTag);
 
+starlark::methods_static!(ARTIFACT_TAG_METHODS = artifact_tag_methods);
+
 #[starlark_value(type = "ArtifactTag")]
 impl<'v> StarlarkValue<'v> for ArtifactTag {
     fn get_methods() -> Option<&'static Methods> {
-        static RES: MethodsStatic = MethodsStatic::new();
-        RES.methods(artifact_tag_methods)
+        Some(ARTIFACT_TAG_METHODS.methods())
     }
 
     fn equals(&self, other: Value<'v>) -> starlark::Result<bool> {
@@ -160,6 +163,5 @@ fn artifact_tag_methods(_: &mut MethodsBuilder) {
 }
 
 #[starlark_module]
-pub(crate) fn register_artifact_tag(globals: &mut GlobalsBuilder) {
-    const ArtifactTag: StarlarkValueAsType<ArtifactTag> = StarlarkValueAsType::new();
-}
+#[starlark_types(ArtifactTag as ArtifactTag)]
+pub(crate) fn register_artifact_tag(globals: &mut GlobalsBuilder) {}

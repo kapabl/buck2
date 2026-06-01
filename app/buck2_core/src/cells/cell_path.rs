@@ -9,10 +9,10 @@
  */
 
 use allocative::Allocative;
-use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
 use dupe::Dupe;
-use relative_path::RelativePath;
+use pagable::Pagable;
 use strong_hash::StrongHash;
 
 use crate::cells::name::CellName;
@@ -36,7 +36,8 @@ struct StripPrefixError(CellName, CellName);
     Ord,
     PartialOrd,
     Allocative,
-    StrongHash
+    StrongHash,
+    Pagable
 )]
 #[display("{}", self.as_ref())]
 pub struct CellPath {
@@ -212,47 +213,6 @@ impl CellPath {
         self.as_ref().strip_prefix(base)
     }
 
-    /// Build an owned `CellPath`, joined with the given path and
-    /// normalized.
-    ///
-    /// ```
-    /// use std::convert::TryFrom;
-    ///
-    /// use buck2_core::cells::cell_path::CellPath;
-    /// use buck2_core::cells::name::CellName;
-    /// use buck2_core::cells::paths::CellRelativePathBuf;
-    ///
-    /// assert_eq!(
-    ///     CellPath::new(
-    ///         CellName::testing_new("cell"),
-    ///         CellRelativePathBuf::unchecked_new("foo/bar".into())
-    ///     )
-    ///     .join_normalized("../baz.txt")?,
-    ///     CellPath::new(
-    ///         CellName::testing_new("cell"),
-    ///         CellRelativePathBuf::unchecked_new("foo/baz.txt".into())
-    ///     ),
-    /// );
-    ///
-    /// assert_eq!(
-    ///     CellPath::new(
-    ///         CellName::testing_new("cell"),
-    ///         CellRelativePathBuf::unchecked_new("foo".into())
-    ///     )
-    ///     .join_normalized("../../baz.txt")
-    ///     .is_err(),
-    ///     true
-    /// );
-    ///
-    /// # buck2_error::Ok(())
-    /// ```
-    pub fn join_normalized<P: AsRef<RelativePath>>(
-        &self,
-        path: P,
-    ) -> buck2_error::Result<CellPath> {
-        Ok(CellPath::new(self.cell, self.path.join_normalized(path)?))
-    }
-
     /// Checks that cell matches and `self` path starts with `base` path
     ///
     /// ```
@@ -326,7 +286,7 @@ impl<'a> CellPathRef<'a> {
     pub fn testing_new(path: &str) -> CellPathRef<'_> {
         let (cell, path) = path
             .split_once("//")
-            .with_buck_error_context(|| format!("invalid path: `{path}`"))
+            .ok_or_else(|| internal_error!("invalid path: `{path}`"))
             .unwrap();
         CellPathRef {
             cell: CellName::testing_new(cell),

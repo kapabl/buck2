@@ -20,13 +20,20 @@ use buck2_build_api::dynamic::calculation::DynamicLambdaCalculation;
 use buck2_build_api::dynamic::calculation::DynamicLambdaResult;
 use buck2_build_signals::node_key::BuildSignalsNodeKey;
 use buck2_build_signals::node_key::BuildSignalsNodeKeyImpl;
+use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
 use buck2_core::deferred::dynamic::DynamicLambdaResultsKey;
 use buck2_core::deferred::key::DeferredHolderKey;
+use buck2_data::ToProtoMessage;
+use buck2_error::BuckErrorContext;
 use dice::CancellationContext;
 use dice::Demand;
 use dice::DiceComputations;
 use dice::Key;
+use dice::OkPagableValueSerialize;
+use dice::ValueSerialize;
 use dupe::Dupe;
+use pagable::Pagable;
+use pagable::pagable_typetag;
 
 use crate::dynamic::deferred::prepare_and_execute_lambda;
 use crate::dynamic::storage::FrozenDynamicLambdaParamsStorageImpl;
@@ -56,8 +63,10 @@ pub(crate) fn init_dynamic_lambda_calculation() {
     Allocative,
     Hash,
     Eq,
-    PartialEq
+    PartialEq,
+    Pagable
 )]
+#[pagable_typetag(dice::DiceKeyDyn)]
 pub struct DynamicLambdaDiceKey(DynamicLambdaResultsKey);
 
 #[async_trait]
@@ -78,8 +87,11 @@ impl Key for DynamicLambdaDiceKey {
             &self.0,
         )?;
 
-        let analysis_values =
-            prepare_and_execute_lambda(ctx, cancellation, lambda, self.0.dupe()).await?;
+        let analysis_values = prepare_and_execute_lambda(ctx, cancellation, lambda, self.0.dupe())
+            .await
+            .with_buck_error_context(|| {
+                format!("Error running dynamic analysis for `{}`", &self.0.owner())
+            })?;
         let res = Arc::new(DynamicLambdaResult { analysis_values });
         ctx.analysis_complete(
             &self_deferred_key,
@@ -99,6 +111,28 @@ impl Key for DynamicLambdaDiceKey {
     fn provide<'a>(&'a self, demand: &mut Demand<'a>) {
         demand.provide_value_with(|| BuildSignalsNodeKey::new(self.dupe()));
     }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        OkPagableValueSerialize::<Self::Value>::new()
+    }
 }
 
-impl BuildSignalsNodeKeyImpl for DynamicLambdaDiceKey {}
+impl BuildSignalsNodeKeyImpl for DynamicLambdaDiceKey {
+    fn critical_path_entry_proto(&self) -> Option<buck2_data::critical_path_entry2::Entry> {
+        let entry = buck2_data::critical_path_entry2::Entry::DynamicAnalysis(
+            buck2_data::critical_path_entry2::DynamicAnalysis {
+                target: match self.0.holder_key() {
+                    DeferredHolderKey::Base(BaseDeferredKey::TargetLabel(target)) => Some(
+                        buck2_data::critical_path_entry2::dynamic_analysis::Target::StandardTarget(
+                            target.as_proto(),
+                        ),
+                    ),
+                    _ => None,
+                },
+                index: self.0.dynamic_actions_index().as_u32(),
+            },
+        );
+
+        Some(entry)
+    }
+}

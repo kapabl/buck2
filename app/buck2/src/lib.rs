@@ -36,6 +36,8 @@ use buck2_client::commands::status::StatusCommand;
 use buck2_client::commands::subscribe::SubscribeCommand;
 use buck2_client::commands::targets::TargetsCommand;
 use buck2_client::commands::test::TestCommand;
+use buck2_client_ctx::agent_context::AgentContextEntry;
+use buck2_client_ctx::agent_context::parse_agent_context;
 use buck2_client_ctx::argfiles::expand_argv;
 use buck2_client_ctx::client_ctx::BuckSubcommand;
 use buck2_client_ctx::client_ctx::ClientCommandContext;
@@ -54,6 +56,7 @@ use buck2_common::argv::Argv;
 use buck2_common::invocation_paths_result::InvocationPathsResult;
 use buck2_common::invocation_roots::get_invocation_paths_result;
 use buck2_core::buck2_env;
+use buck2_core::buck2_env_name;
 use buck2_data::ErrorReport;
 use buck2_error::BuckErrorContext;
 use buck2_error::ErrorTag;
@@ -115,7 +118,8 @@ struct BeforeSubcommandOptions {
         long = "verbose",
         default_value = "1",
         global = true,
-        value_parser= buck_error_clap_parser(Verbosity::try_from_cli)
+        env = buck2_env_name!("BUCK_VERBOSE"),
+        value_parser = buck_error_clap_parser(Verbosity::try_from_cli)
     )]
     verbosity: Verbosity,
 
@@ -128,6 +132,15 @@ struct BeforeSubcommandOptions {
     /// datasets.
     #[clap(long, global = true, value_parser = buck_error_clap_parser(parse_client_metadata))]
     client_metadata: Vec<ClientMetadata>,
+
+    /// Agent context key=value pairs for telemetry.
+    /// Used by AI agents to pass structured metadata. Schema is defined via buckconfig.
+    /// Entries can be comma-separated or passed as separate flags.
+    /// Examples:
+    ///   --agent-context intent=fix,attempt=2,prior_error=missing_target
+    ///   --agent-context intent=build --agent-context attempt=1
+    #[clap(long, global = true, value_delimiter = ',', value_parser = buck_error_clap_parser(parse_agent_context))]
+    agent_context: Vec<AgentContextEntry>,
 
     /// Do not launch a daemon process, run buck server in client process.
     ///
@@ -162,7 +175,7 @@ fn help() -> &'static str {
 #[clap(
     name = "buck2",
     about(Some(help())),
-    version(BuckVersion::get_version()),
+    version(BuckVersion::get_version_for_clap()),
     styles = cli_style::get_styles(),
 )]
 pub(crate) struct Opt {
@@ -235,6 +248,14 @@ pub fn exec(process: ProcessContext<'_>) -> ExitResult {
             .common_opts
             .client_metadata
             .splice(0..0, client_metadata);
+    }
+
+    let agent_env_metadata = AgentContextEntry::from_env()?;
+    if !agent_env_metadata.is_empty() {
+        opt.opt
+            .common_opts
+            .agent_context
+            .splice(0..0, agent_env_metadata);
     }
 
     // If --client-metadata=? was not set and from_env did not find "id", then
@@ -312,7 +333,7 @@ impl ParsedArgv {
         let expanded_args = self.argv.expanded_argv.clone();
         self.opt.exec(
             process,
-            &immediate_config,
+            immediate_config,
             BuckArgMatches::from_clap(&self.matches, &expanded_args),
             self.argv,
         )
@@ -458,7 +479,7 @@ impl CommandKind {
             let v = buck2_daemon::no_buckd::start_in_process_daemon(
                 immediate_config.daemon_startup_config()?,
                 paths.clone().get_result()?,
-                &runtime,
+                runtime,
             )?;
             #[cfg(client_only)]
             let v = unreachable!(); // case covered above
@@ -480,10 +501,11 @@ impl CommandKind {
             trace_id.dupe(),
             &mut shared.stdin,
             &mut shared.restarter,
-            &runtime,
+            runtime,
             common_opts.oncall,
             common_opts.client_metadata,
             common_opts.isolation_dir,
+            common_opts.agent_context,
         );
         if let Some(recorder) = events_ctx.recorder.as_mut() {
             recorder.update_for_client_ctx(&command_ctx, self.command_name());

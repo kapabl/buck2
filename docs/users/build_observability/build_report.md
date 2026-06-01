@@ -12,6 +12,23 @@ successful outcomes are well served by direct usage of the CLI.
 To request a build report, pass `--build-report <path>` to `buck build` on the
 CLI.
 
+You can also pass `--build-report-options` with a comma-separated list of
+options to customize the build report:
+
+- `fill-out-failures`: Fill out the `failures` field in the build report (for
+  Buck1 backwards compatibility).
+- `package-project-relative-paths`: Include the project-relative path of
+  packages for built targets.
+- `include-artifact-hash-information`: Include artifact hash information in the
+  output.
+- `exclude-action-error-diagnostics`: Exclude the `error_diagnostics` field from
+  action errors in the build report. This can reduce the size of build reports
+  when detailed error diagnostic information from action error handlers is not
+  needed.
+- `truncate-error-content`: Truncate error message content in the build report
+  to reduce size. This applies the same truncation limits used for error logging
+  (20KB per error message).
+
 At a high level, the build report outputs information for each of the targets
 that you requested to have built on the CLI. As a result, it may report
 information for more than one configuration or subtarget of a target. For
@@ -57,19 +74,8 @@ BuildReport {
     build_metrics: AllTargetsBuildMetrics,
 
     # Set sketch of configured target graph stored in a hex string.
-    # Enabeld by setting `-c buck2.log_total_configured_graph_sketch=true`.
+    # Enabled by setting `-c buck2.log_total_configured_graph_sketch=true`.
     total_configured_graph_sketch: Optional[str],
-
-    # Set sketch of unconfigured target labels in configured target graph
-    # stored in a hex string.
-    # Enabeld by setting
-    # `-c buck2.log_total_configured_graph_unconfigured_sketch=true`.
-    total_configured_graph_unconfigured_sketch: Optional[str],
-
-    # Reports data about each configuration encountered as part of the build,
-    # if requested. Currently shows total unconfigured sketch per configuration
-    # if `-c buck2.log_total_per_configuration_sketch=true` is set.
-    per_configuration_data: dict[str, PerConfigurationData],
 }
 
 BuildReportEntry {
@@ -90,7 +96,7 @@ BuildReportEntry {
     # The two fields below are included for buck1 backwards compatibility only.
     # They are both computed by aggregating across all the configured targets in
     # the way you might expect.
-    success: "FAIL" | "SUCCESS,
+    success: "FAIL" | "SUCCESS",
     outputs: dict[str, list[Path]],
 
     # The path to the package containing this target, relative to the project
@@ -100,7 +106,7 @@ BuildReportEntry {
 
 ConfiguredBuildReportEntry {
     # Did this target build successfully or not?
-    success: "FAIL" | "SUCCESS,
+    success: "FAIL" | "SUCCESS",
 
     # A map of subtargets that were built to a list of the successfully built
     # outputs for that subtarget.
@@ -121,17 +127,54 @@ ConfiguredBuildReportEntry {
     artifact_info: dict[str, ArtifactInfoFile | ArtifactInfoSymlink | ArtifactInfoExternalSymlink],
 
     # Set sketch of configured target graph stored in a hex string.
-    # Enabeld by setting `-c buck2.log_configured_graph_sketch=true`.
+    # Enabled by setting `-c buck2.log_configured_graph_sketch=true`.
     configured_graph_sketch: Optional[str],
+
+    # Set sketch of retained analysis memory utilization stored in a hex string.
+    #
+    # Computing the cardinality of this sketch returns an (approximate) number of bytes.
+    #
+    # Enabled by setting `-c buck2.log_retained_analysis_memory_sketch=true`
+    retained_analysis_memory_sketch: Optional[str],
+
+    # Set sketch of peak analysis memory utilization stored in a hex string.
+    #
+    # Computing the cardinality of this sketch returns an (approximate) number of bytes.
+    #
+    # Enabled by setting `-c buck2.log_peak_analysis_memory_sketch=true`
+    peak_analysis_memory_sketch: Optional[str],
+
+    # Set sketch of distinct artifact paths stored in a hex string.
+    #
+    # Computing the cardinality of this sketch returns an (approximate) count
+    # of distinct artifact file paths.
+    #
+    # Enabled by setting `-c buck2.log_artifact_count_sketch=true`.
+    artifact_count_sketch: Optional[str],
+
+    # Set sketch of artifact path sizes stored in a hex string. Each path is
+    # weighted by its file size in bytes; computing the cardinality returns an
+    # (approximate) total artifact size in bytes.
+    #
+    # Enabled by setting `-c buck2.log_artifact_size_sketch=true`.
+    artifact_size_sketch: Optional[str],
+
+    # Estimated cardinality of `artifact_count_sketch`. Populated only when
+    # `-c buck2.log_sketch_cardinalities=true` is set; the corresponding sketch
+    # field is left intact in both cases.
+    artifact_count_sketch_cardinality: Optional[float],
+
+    # Estimated cardinality of `artifact_size_sketch`. Populated only when
+    # `-c buck2.log_sketch_cardinalities=true` is set; the corresponding sketch
+    # field is left intact in both cases.
+    artifact_size_sketch_cardinality: Optional[float],
+
+    # Build metrics for this target. Represents the aggregated metrics for
+    # top-level targets. Omitted from the JSON when None.
+    build_metrics: Optional[TargetBuildMetrics],
 
     # Metrics for this target. Represents the aggregated metrics for top level targets.
     metrics: TargetBuildMetrics,
-
-    # Set sketch of unconfigured taret labels in configured target graph
-    # stored in a hex string.
-    # Enabeld by setting
-    # `-c buck2.log_configured_graph_unconfigured_sketch=true`.
-    configured_graph_unconfigured_sketch: Optional[str],
 }
 
 AllTargetsBuildMetrics {
@@ -162,6 +205,17 @@ TargetBuildMetrics {
 
     # Max value for peak memory usage across all local actions.
     local_max_memory_peak_bytes: Optional[u64]
+
+    # The distinct set of RE platform names used by actions for this target
+    # (e.g. "linux-remote-execution", "gpu-remote-execution").
+    # Omitted when empty (no remote actions).
+    re_platform_names: Optional[List[str]]
+
+    # Wall-clock time in milliseconds from the start of the build at which
+    # this top-level target succeeded, failed, or timed out.
+    # Use this to compare durations but don't add it to a start timestamp
+    # to produce an end timestamp.
+    wall_clock_completion_ms: Optional[u64]
 }
 
 AggregatedBuildMetrics {
@@ -177,13 +231,6 @@ AggregatedBuildMetrics {
 
     analysis_retained_memory: float
     declared_actions: float
-}
-
-PerConfigurationData {
-    # Unique hash of the configuration. This is same hash used in buck-out.
-    hash: str,
-    # Sketch of unconfigured target labels for all targets of that configuration
-    total_unconfigured_sketch: str,
 }
 
 Error {
@@ -203,6 +250,10 @@ Error {
     # that the error is associated to as determined by Buck2 internally. This is meant to classify errors
     # more precisely, helping developers better understand the nature of the error.
     error_tags: list[str],
+
+
+    # Error category for the error. One of "USER", "INFRA", "ENVIRONMENT".
+    error_category: str,
 }
 
 ActionError {
@@ -215,14 +266,14 @@ ActionError {
     # Digest of the action
     digest: str,
 
+    # Stringified hash of the same stringified error message that is provided by the action
+    error_content: str,
+
     # Stringified hash of the stderr of the action
-    stderr: str,
+    stderr_content: str,
 
     # Stringified hash of the stdout of the action
-    stdout: str,
-
-    # Stringified hash of the same stringified error message that is provided by the action
-    error: str,
+    stdout_content: str,
 
     # Optional list of error categorizations provided by an error handler which is invoked
     # in the event of a failed action, or an error message if the error handler failed.
@@ -260,18 +311,34 @@ ActionSubError {
     category: str,
 
     # The stringified hash of the extra message provided for the specific sub-error category.
-    message_content: str,
+    message_content: Optional[str],
 
-    # List of error locations, if any
-    locations: Optional[list[ActionErrorLocation]],
-}
-
-ActionErrorLocation {
     # File path where the error appeared, preferably either project-relative or absolute.
-    file: str,
+    file: Optional[str],
 
-    # Optional line number
-    line: Optional[u64]
+    # Line number
+    lnum: Optional[u64],
+
+    # End line (for multi-line spans)
+    end_lnum: Optional[u64],
+
+    # Column number
+    col: Optional[u64],
+
+    # End column (for ranges)
+    end_col: Optional[u64],
+
+    # Type of error (error, warning, info, etc.)
+    error_type: Optional[str],
+
+    # Numeric error code (e.g., 404, 500)
+    error_number: Optional[u64],
+
+    # Subcategory for finer-grained categorization
+    subcategory: Optional[str],
+
+    # Remediation steps for the error
+    remediation: Optional[str],
 }
 
 ArtifactInfoFile {
@@ -329,11 +396,9 @@ The build report currently has at least the following limitations:
     passed, this is a bug.
 1.  It is currently not generated when a non-existent package is specified on
     the command line. This is also a bug.
-1.  It cannot be requested for any buck2 command other than `build`
-1.  Errors do not contain any additional metadata outside of the error message.
-    This will be made available as such metadata is available in buck2.
-1.  The "failures" field is always empty. This will be changed under a
-    backcompat opt-in flag in the future.
+1.  The "failures" field is empty by default. To populate it, pass the
+    `fill-out-failures` option via `--build-report-options` (this exists for
+    buck1 backwards compatibility only; new code should not rely on it).
 
 Finally, it's worth raising that the concept of error deduplication has some
 fundamental limitations; if two targets both refer to the same non-existent

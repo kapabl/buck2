@@ -21,6 +21,9 @@ use std::ops::Add;
 
 use dupe::Dupe;
 
+use crate as starlark;
+use crate::register_starlark_any;
+
 /// Index of the slot in the function frame.
 /// This can be both a local variable or a temporary.
 /// When reading local variable, it must be definitely initialized (e.g. function parameter).
@@ -34,7 +37,8 @@ use dupe::Dupe;
     PartialEq,
     Eq,
     Hash,
-    derive_more::Display
+    derive_more::Display,
+    pagable::Pagable
 )]
 #[display("&{}", _0)]
 pub(crate) struct BcSlot(pub(crate) u32);
@@ -191,7 +195,15 @@ impl BcSlotInRangeFrom {
 /// Slot where the value should be stored.
 ///
 /// The slot may be a local variable, so this slot cannot be used to store a temporary value.
-#[derive(Debug, Copy, Clone, Dupe, derive_more::Display)]
+#[derive(
+    Debug,
+    Copy,
+    Clone,
+    Dupe,
+    derive_more::Display,
+    pagable::Pagable,
+    starlark_derive::StarlarkPagableViaPagable
+)]
 pub(crate) struct BcSlotOut(BcSlot);
 
 impl BcSlotOut {
@@ -200,3 +212,5 @@ impl BcSlotOut {
         self.0
     }
 }
+
+register_starlark_any!(BcSlotOut);

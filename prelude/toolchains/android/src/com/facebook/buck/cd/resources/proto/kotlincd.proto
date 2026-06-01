@@ -58,6 +58,8 @@ message KotlinExtraParams {
   bool shouldKsp2RunIncrementally = 26;
   bool shouldKosabiJvmAbiGenUseK2 = 27;
   string kotlinClassesDir = 28;
+  reserved 29; // was skipClasspathRemovalRebuild, removed after KT-85740 fix
+  string javaBinary = 30;
 }
 
 message PluginParams {

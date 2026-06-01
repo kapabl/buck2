@@ -28,6 +28,7 @@ buck2_data = { workspace = true }
 buck2_error = { workspace = true }
 buck2_events = { workspace = true }
 buck2_fs = { workspace = true }
+buck2_hash = { workspace = true }
 buck2_interpreter = { workspace = true }
 buck2_node = { workspace = true }
 buck2_profile = { workspace = true }
@@ -35,5 +36,5 @@ buck2_query = { workspace = true }
 buck2_server_ctx = { workspace = true }
 buck2_util = { workspace = true }
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fbcode_build)"] }
+[lints]
+workspace = true

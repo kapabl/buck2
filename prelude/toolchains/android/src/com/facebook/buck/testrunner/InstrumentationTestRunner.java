@@ -10,6 +10,7 @@
 
 package com.facebook.buck.testrunner;
 
+import com.android.ddmlib.AndroidDebugBridge;
 import com.android.ddmlib.IDevice;
 import com.android.ddmlib.MultiLineReceiver;
 import com.android.ddmlib.testrunner.ITestRunListener;
@@ -18,8 +19,10 @@ import com.android.ddmlib.testrunner.TestIdentifier;
 import com.facebook.buck.android.exopackage.AdbUtils;
 import com.facebook.buck.android.exopackage.AndroidDevice;
 import com.facebook.buck.android.exopackage.AndroidDeviceImpl;
+import com.facebook.buck.testresultsoutput.TestResultsOutputEvent.RunFailureStatus;
 import com.facebook.buck.testresultsoutput.TestResultsOutputSender;
 import com.facebook.buck.testrunner.reportlayer.LogExtractorReportLayer;
+import com.facebook.buck.testrunner.reportlayer.PerfettoReportLayer;
 import com.facebook.buck.testrunner.reportlayer.ReportLayer;
 import com.facebook.buck.testrunner.reportlayer.TombstonesReportLayer;
 import com.facebook.buck.testrunner.reportlayer.VideoRecordingReportLayer;
@@ -29,7 +32,7 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
-import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.FileVisitOption;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -44,6 +47,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.stream.Stream;
@@ -81,8 +85,25 @@ public class InstrumentationTestRunner extends DeviceRunner {
       "TEST_RESULT_APP_SCOPED_ARTIFACT_ANNOTATIONS_DIR";
   private static final String FORWARDABLE_ENV_PREFIX = "AIT_";
 
+  private static final long ADB_CONNECT_TIMEOUT_MS = 30000;
+  private static final long ADB_CONNECT_TIME_STEP_MS = ADB_CONNECT_TIMEOUT_MS / 10;
+
+  /** Env var gate for per-test JaCoCo coverage. */
+  static final String PER_TEST_COVERAGE_ENABLED_ENV = "PER_TEST_COVERAGE_ENABLED";
+
+  /** Host env var set by the coverage wrapper to the pull destination for per-test artifacts. */
+  static final String PER_TEST_COVERAGE_DIR_ENV = "PER_TEST_COVERAGE_DIR";
+
+  /** Instrumentation arg read by the on-device per-test coverage listener. */
+  static final String PER_TEST_COVERAGE_DIR_ARG = "PER_TEST_COVERAGE_DIR";
+
+  private static final String PER_TEST_COVERAGE_SUBDIR = "per_test_coverage";
+
   /** Env var to enable per-test timeout enforcement. */
   static final String PER_TEST_TIMEOUT_ENABLED_ENV = "ANDROID_PER_TEST_TIMEOUT_ENABLED";
+
+  /** Env var to enable proactive target-level timeout stack traces. */
+  static final String PROACTIVE_TIMEOUT_ENABLED_ENV = "ANDROID_PROACTIVE_TIMEOUT_ENABLED";
 
   /** Env var to set the timeout multiplier for long-running tests. */
   static final String PER_TEST_TIMEOUT_MULTIPLIER_ENV = "ANDROID_PER_TEST_TIMEOUT_MULTIPLIER";
@@ -134,9 +155,7 @@ public class InstrumentationTestRunner extends DeviceRunner {
   private final CrashAnalyzer crashAnalyzer = new CrashAnalyzer();
   private List<ReportLayer> reportLayers = new ArrayList<>();
 
-  private IDevice device = null;
   protected final AndroidDevice androidDevice;
-  protected final AdbUtils adbUtils;
   private volatile boolean testRunFailed = false;
 
   /**
@@ -232,7 +251,6 @@ public class InstrumentationTestRunner extends DeviceRunner {
     this.preTestSetupScript = preTestSetupScript;
     this.apexesToInstall = apexesToInstall;
     this.userId = userId;
-    this.adbUtils = new AdbUtils(getAdbPath(), 0);
     this.androidDevice = initializeAndroidDevice();
   }
 
@@ -257,6 +275,7 @@ public class InstrumentationTestRunner extends DeviceRunner {
     boolean disableAnimations = false;
     boolean collectTombstones = false;
     boolean recordVideo = false;
+    boolean collectPerfetto = false;
     Map<String, String> extraInstrumentationArguments = new HashMap<String, String>();
     Map<String, String> extraFilesToPull = new HashMap<String, String>();
     Map<String, String> extraDirsToPull = new HashMap<String, String>();
@@ -377,6 +396,9 @@ public class InstrumentationTestRunner extends DeviceRunner {
           case VideoRecordingReportLayer.ARG:
             recordVideo = true;
             break;
+          case PerfettoReportLayer.ARG:
+            collectPerfetto = true;
+            break;
           case LogExtractorReportLayer.ARG:
             String logExtractorArg = args[++i];
             String[] logExtractorArgSplit = logExtractorArg.split("=", 2);
@@ -467,10 +489,6 @@ public class InstrumentationTestRunner extends DeviceRunner {
     return packageName;
   }
 
-  public IDevice getDevice() {
-    return this.device;
-  }
-
   public boolean hasTestRunFailed() {
     return this.testRunFailed;
   }
@@ -513,6 +531,9 @@ public class InstrumentationTestRunner extends DeviceRunner {
       runner.addReportLayer(new VideoRecordingReportLayer(runner));
     }
     runner.addReportLayer(new TombstonesReportLayer(runner, argsParser.collectTombstones));
+    if (argsParser.collectPerfetto) {
+      runner.addReportLayer(new PerfettoReportLayer(runner));
+    }
     if (!argsParser.logExtractors.isEmpty()) {
       runner.addReportLayer(new LogExtractorReportLayer(runner, argsParser.logExtractors));
     }
@@ -571,6 +592,47 @@ public class InstrumentationTestRunner extends DeviceRunner {
         device = devices.get(0);
       }
     } else if (deviceSerial != null) {
+      // For TCP-connected devices (e.g., emulators at host:port), ensure the ADB server
+      // knows about the device before we proceed. ADB servers don't auto-discover TCP
+      // devices — "adb connect" must be called first.
+      if (isTcpDevice(deviceSerial)) {
+        boolean found = false;
+        for (AndroidDevice d : this.adbUtils.getDevices()) {
+          if (d.getSerialNumber().equals(deviceSerial)) {
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
+          System.err.println("Device " + deviceSerial + " not found, attempting adb connect...");
+          connectTcpDevice(deviceSerial);
+          long start = System.currentTimeMillis();
+          while (!found) {
+            long timeLeft = start + ADB_CONNECT_TIMEOUT_MS - System.currentTimeMillis();
+            if (timeLeft <= 0) {
+              break;
+            }
+            try {
+              Thread.sleep(ADB_CONNECT_TIME_STEP_MS);
+            } catch (InterruptedException e) {
+              Thread.currentThread().interrupt();
+              break;
+            }
+            for (AndroidDevice d : this.adbUtils.getDevices()) {
+              if (d.getSerialNumber().equals(deviceSerial)) {
+                found = true;
+                break;
+              }
+            }
+          }
+          if (!found) {
+            System.err.println(
+                "Warning: Device "
+                    + deviceSerial
+                    + " not found after adb connect, proceeding anyway");
+          }
+        }
+      }
       device = new AndroidDeviceImpl(deviceSerial, this.adbUtils);
     }
 
@@ -581,10 +643,85 @@ public class InstrumentationTestRunner extends DeviceRunner {
     return device;
   }
 
+  /**
+   * Resolves a ddmlib {@link IDevice} for the given serial number. This is needed solely because
+   * {@link RemoteAndroidTestRunner} requires an {@link IDevice} to execute {@code am instrument}.
+   * All other device interactions use {@link AndroidDevice} via {@link AdbUtils}.
+   */
+  protected IDevice resolveIDevice(String serial) throws InterruptedException {
+    AndroidDebugBridge.initIfNeeded(/* clientSupport */ false);
+    AndroidDebugBridge adb = AndroidDebugBridge.createBridge(getAdbPath(), false);
+    if (adb == null) {
+      System.err.println("Failed to connect to adb. Make sure adb server is running.");
+      System.exit(1);
+      return null;
+    }
+
+    long start = System.currentTimeMillis();
+    while (!adb.isConnected() || !adb.hasInitialDeviceList()) {
+      long timeLeft = start + ADB_CONNECT_TIMEOUT_MS - System.currentTimeMillis();
+      if (timeLeft <= 0) {
+        break;
+      }
+      Thread.sleep(ADB_CONNECT_TIME_STEP_MS);
+    }
+
+    if (!adb.isConnected() || !adb.hasInitialDeviceList()) {
+      System.err.println("Unable to set up adb.");
+      System.exit(1);
+      return null;
+    }
+
+    for (IDevice device : adb.getDevices()) {
+      if (device.getSerialNumber().equals(serial)) {
+        return device;
+      }
+    }
+
+    System.err.printf("Unable to find device with serial %s via ddmlib%n", serial);
+    System.exit(1);
+    return null;
+  }
+
+  /**
+   * Returns true if the serial looks like a TCP-connected device (host:port format), which is
+   * typical for emulators connected via {@code adb connect}.
+   */
+  private static boolean isTcpDevice(String serial) {
+    return serial != null && serial.contains(":");
+  }
+
+  /**
+   * Runs {@code adb connect <serial>} to ensure the ADB server knows about a TCP-connected device
+   * (e.g., an emulator).
+   */
+  private void connectTcpDevice(String serial) {
+    try {
+      String result = adbUtils.executeAdbCommand("connect " + serial, null, true);
+      System.err.println("adb connect " + serial + ": " + result.trim());
+    } catch (Exception e) {
+      System.err.println("Failed to run adb connect " + serial + ": " + e.getMessage());
+    }
+  }
+
   @SuppressWarnings({"PMD.BlacklistedSystemGetenv", "PMD.BlacklistedDefaultProcessMethod"})
   public void run() throws Throwable {
-    IDevice device = getAndroidDevice(deviceArgs.autoRunOnConnectedDevice, deviceArgs.deviceSerial);
-    this.device = device;
+    // Proactive timeout: start the timer as early as possible since TPX_TIMEOUT_SEC counts from
+    // process start. ADB setup (APK install, directory creation) can consume significant time,
+    // so placing this after setup would cause the timer to fire too late.
+    Optional<TestResultsOutputSender> testResultsOutputSender =
+        TestResultsOutputSender.fromDefaultEnvName();
+    TpxTimeoutBufferManager tpxTimeoutBufferManager = null;
+    if (testResultsOutputSender.isPresent()
+        && "true".equals(System.getenv(PROACTIVE_TIMEOUT_ENABLED_ENV))) {
+      ScheduledExecutorService watchdogExecutor = Executors.newScheduledThreadPool(1);
+      tpxTimeoutBufferManager =
+          TpxTimeoutBufferManager.create(testResultsOutputSender.get(), watchdogExecutor);
+    }
+
+    // Resolve a ddmlib IDevice solely for RemoteAndroidTestRunner compatibility.
+    // All other device interactions use this.androidDevice (AdbUtils-based).
+    IDevice iDevice = resolveIDevice(androidDevice.getSerialNumber());
 
     if (this.instrumentationApkPath != null) {
       if (this.apkUnderTestPath != null) {
@@ -689,7 +826,8 @@ public class InstrumentationTestRunner extends DeviceRunner {
         System.err.println(
             String.format(
                 "Installing APEX %d/%d: %s...", i + 1, this.apexesToInstall.size(), apexPath));
-        androidDevice.installApexOnDevice(new File(apexPath), false, isLast, softRebootAvailable);
+        androidDevice.installApexOnDevice(
+            new File(apexPath), false, isLast, softRebootAvailable, true);
       }
 
       System.err.println(
@@ -732,6 +870,8 @@ public class InstrumentationTestRunner extends DeviceRunner {
       }
     }
 
+    String hostPerTestCoverageDir = setUpPerTestCoveragePull();
+
     if (this.clearPackageData) {
       executeAdbShellCommand("pm clear " + this.packageName);
       executeAdbShellCommand("pm clear " + this.targetPackageName);
@@ -773,10 +913,7 @@ public class InstrumentationTestRunner extends DeviceRunner {
 
     try {
       RemoteAndroidTestRunner runner =
-          new RemoteAndroidTestRunner(
-              this.packageName,
-              this.testRunner,
-              getAndroidDevice(deviceArgs.autoRunOnConnectedDevice, deviceArgs.deviceSerial));
+          new RemoteAndroidTestRunner(this.packageName, this.testRunner, iDevice);
 
       for (Map.Entry<String, String> entry : this.extraInstrumentationArguments.entrySet()) {
         runner.addInstrumentationArg(
@@ -863,24 +1000,30 @@ public class InstrumentationTestRunner extends DeviceRunner {
       listeners.add(trimLineListener);
       listeners.add(buckXmlListener);
 
-      // Add timeout enforcement listener if enabled
-      if ("true".equals(System.getenv(PER_TEST_TIMEOUT_ENABLED_ENV))) {
-        listeners.add(new InstrumentationTimeoutEnforcingRunListener(buckXmlListener));
-      }
+      // Determine the result listener for timeout enforcement.
+      ITestRunListener resultListener = buckXmlListener;
 
-      Optional<TestResultsOutputSender> testResultsOutputSender =
-          TestResultsOutputSender.fromDefaultEnvName();
       if (testResultsOutputSender.isPresent()) {
         InstrumentationTpxStandardOutputTestListener tpxListener =
             new InstrumentationTpxStandardOutputTestListener(
                 testResultsOutputSender.get(), androidDevice, adbUtils);
         listeners.add(tpxListener);
+        resultListener = tpxListener;
+      }
+
+      if ("true".equals(System.getenv(PER_TEST_TIMEOUT_ENABLED_ENV))) {
+        listeners.add(new InstrumentationTimeoutEnforcingRunListener(resultListener));
       }
 
       if (this.userId != null) {
         runner.addInstrumentationArg("user", this.userId.toString());
       }
       runner.run(listeners);
+
+      // All tests completed normally — mark as completed so proactive timer is a no-op
+      if (tpxTimeoutBufferManager != null) {
+        tpxTimeoutBufferManager.markCompleted();
+      }
 
       if (this.disableAnimations) {
         setAnimationScales(originalWindowAnimationScales);
@@ -927,6 +1070,8 @@ public class InstrumentationTestRunner extends DeviceRunner {
         pullDir(resolvedPath, entry.getValue());
       }
 
+      maybeEmitPerTestCoverageInfraFailure(hostPerTestCoverageDir, testResultsOutputSender);
+
     } finally {
       this.collectAdbLogs();
 
@@ -955,6 +1100,68 @@ public class InstrumentationTestRunner extends DeviceRunner {
 
   public Process exec(String command) throws IOException {
     return Runtime.getRuntime().exec(command);
+  }
+
+  @Nullable
+  private String setUpPerTestCoveragePull() {
+    if (!"true".equals(getenv(PER_TEST_COVERAGE_ENABLED_ENV))) {
+      return null;
+    }
+
+    String appScopedStoragePerTestCoveragePath =
+        getAppScopedStoragePath(
+            packageName, targetPackageName, isSelfInstrumenting, PER_TEST_COVERAGE_SUBDIR);
+    String hostPerTestCoverageDir = getHostPerTestCoverageDir();
+    if (appScopedStoragePerTestCoveragePath != null && hostPerTestCoverageDir != null) {
+      extraDirsToPull.put(appScopedStoragePerTestCoveragePath, hostPerTestCoverageDir);
+      extraInstrumentationArguments.put(
+          PER_TEST_COVERAGE_DIR_ARG, appScopedStoragePerTestCoveragePath);
+    }
+    return hostPerTestCoverageDir;
+  }
+
+  @Nullable
+  private String getHostPerTestCoverageDir() {
+    String hostPerTestCoverageDir = getenv(PER_TEST_COVERAGE_DIR_ENV);
+    if (hostPerTestCoverageDir != null && !hostPerTestCoverageDir.isEmpty()) {
+      return hostPerTestCoverageDir;
+    }
+
+    String testArtifactsPath = getenv(TEST_RESULT_ARTIFACTS_ENV);
+    if (testArtifactsPath == null || testArtifactsPath.isEmpty()) {
+      return null;
+    }
+    return Paths.get(testArtifactsPath, PER_TEST_COVERAGE_SUBDIR).toString();
+  }
+
+  // Pairs with PerTestAndroidJacocoRunListener#recordCoverageError, which writes
+  // "coverage_error.txt" inside the per-test coverage output dir on the first agent-side failure.
+  // Without this signal a silently-broken agent looks identical to a successful run with zero
+  // probes (empty manifest.jsonl) — surfacing it as INFRA_FAILURE makes the next regression
+  // visible in test results instead of waiting for someone to notice missing per-test artifacts.
+  private static void maybeEmitPerTestCoverageInfraFailure(
+      String hostPerTestCoverageDir, Optional<TestResultsOutputSender> sender) {
+    if (hostPerTestCoverageDir == null || !sender.isPresent()) {
+      return;
+    }
+    Path sentinel = Paths.get(hostPerTestCoverageDir, "coverage_error.txt");
+    if (!Files.exists(sentinel)) {
+      return;
+    }
+    try {
+      String contents = new String(Files.readAllBytes(sentinel), StandardCharsets.UTF_8);
+      int newline = contents.indexOf('\n');
+      String firstLine = (newline >= 0) ? contents.substring(0, newline) : contents;
+      sender
+          .get()
+          .sendRunFailure(
+              RunFailureStatus.INFRA_FAILURE,
+              System.currentTimeMillis(),
+              "Per-test coverage collection failed: " + firstLine,
+              contents);
+    } catch (IOException e) {
+      System.err.printf("Failed to read per-test coverage error sentinel: %s\n", e);
+    }
   }
 
   @Nullable
@@ -1060,7 +1267,7 @@ public class InstrumentationTestRunner extends DeviceRunner {
     }
     Path annotationsPath =
         Paths.get(testArtifactsAnnotationsPath, String.format("%s.annotation", name));
-    Files.write(annotationsPath, annotationTemplate.getBytes(Charset.forName("UTF-8")));
+    Files.write(annotationsPath, annotationTemplate.getBytes(StandardCharsets.UTF_8));
 
     // create the artifact file
     return Paths.get(testArtifactsPath, name);
@@ -1117,6 +1324,14 @@ public class InstrumentationTestRunner extends DeviceRunner {
             androidDevice.getSerialNumber(),
             true);
     return output.contains("exists");
+  }
+
+  /**
+   * Execute adb shell command. Public wrapper around executeAdbShellCommand for use by report
+   * layers in other packages.
+   */
+  public String runShellCommand(String command) throws Exception {
+    return executeAdbShellCommand(command);
   }
 
   protected void transferFile(String operation, String source, String destination)

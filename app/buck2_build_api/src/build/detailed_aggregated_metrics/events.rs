@@ -20,6 +20,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::build::detailed_aggregated_metrics::implementation::state::DetailedAggregatedMetricsStateTracker;
 use crate::build::detailed_aggregated_metrics::types::ActionExecutionMetrics;
+use crate::build::detailed_aggregated_metrics::types::ActionGraphSketchResult;
 use crate::build::detailed_aggregated_metrics::types::DetailedAggregatedMetrics;
 use crate::build::detailed_aggregated_metrics::types::PerBuildEvents;
 use crate::build::detailed_aggregated_metrics::types::TopLevelTargetSpec;
@@ -31,6 +32,10 @@ pub(crate) enum DetailedAggregatedMetricsEvent {
     ComputeMetrics(
         PerBuildEvents,
         tokio::sync::oneshot::Sender<buck2_error::Result<DetailedAggregatedMetrics>>,
+    ),
+    ComputeActionGraphSketch(
+        Vec<TopLevelTargetSpec>,
+        tokio::sync::oneshot::Sender<buck2_error::Result<ActionGraphSketchResult>>,
     ),
     ActionExecuted(ActionExecutionMetrics),
 }
@@ -58,34 +63,41 @@ impl DetailedAggregatedMetricsEventHandler {
         )
     }
 
-    pub fn action_executed(&self, ev: ActionExecutionMetrics) {
+    pub fn action_executed(&self, ev: ActionExecutionMetrics) -> buck2_error::Result<()> {
         self.0
             .sender
             .send(DetailedAggregatedMetricsEvent::ActionExecuted(ev))
-            .expect(
-                "DetailedAggregagatedMetrics event handler should never exit while sender lives",
-            );
+            .map_err(|_| {
+                internal_error!("DetailedAggregatedMetrics event handler exited while sender lives")
+            })?;
+        Ok(())
     }
 
-    pub fn analysis_started(&self, key: &DeferredHolderKey) {
+    pub fn analysis_started(&self, key: &DeferredHolderKey) -> buck2_error::Result<()> {
         self.0
             .sender
             .send(DetailedAggregatedMetricsEvent::AnalysisStarted(key.dupe()))
-            .expect(
-                "DetailedAggregagatedMetrics event handler should never exit while sender lives",
-            );
+            .map_err(|_| {
+                internal_error!("DetailedAggregatedMetrics event handler exited while sender lives")
+            })?;
+        Ok(())
     }
 
-    pub fn analysis_complete(&self, key: &DeferredHolderKey, result: &DeferredHolder) {
+    pub fn analysis_complete(
+        &self,
+        key: &DeferredHolderKey,
+        result: &DeferredHolder,
+    ) -> buck2_error::Result<()> {
         self.0
             .sender
             .send(DetailedAggregatedMetricsEvent::AnalysisComplete(
                 key.dupe(),
                 result.dupe(),
             ))
-            .expect(
-                "DetailedAggregagatedMetrics event handler should never exit while sender lives",
-            );
+            .map_err(|_| {
+                internal_error!("DetailedAggregatedMetrics event handler exited while sender lives")
+            })?;
+        Ok(())
     }
 
     pub(crate) async fn compute_metrics(
@@ -96,6 +108,21 @@ impl DetailedAggregatedMetricsEventHandler {
         self.0
             .sender
             .send(DetailedAggregatedMetricsEvent::ComputeMetrics(events, tx))
+            .map_err(|_| internal_error!("detailed metrics state tracker is gone"))?;
+        rx.await?
+    }
+
+    pub(crate) async fn compute_action_graph_sketch(
+        &self,
+        top_level_targets: Vec<TopLevelTargetSpec>,
+    ) -> buck2_error::Result<ActionGraphSketchResult> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.0
+            .sender
+            .send(DetailedAggregatedMetricsEvent::ComputeActionGraphSketch(
+                top_level_targets,
+                tx,
+            ))
             .map_err(|_| internal_error!("detailed metrics state tracker is gone"))?;
         rx.await?
     }
@@ -148,8 +175,4 @@ impl DetailedAggregatedMetricsPerBuildEventsHolder {
 
         Ok(events)
     }
-}
-pub enum ActionGraph {
-    ActionExecuted(ActionExecutionMetrics),
-    TopLevelTarget(TopLevelTargetSpec),
 }

@@ -8,7 +8,6 @@
  * above-listed licenses.
  */
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use allocative::Allocative;
@@ -17,6 +16,7 @@ use buck2_common::legacy_configs::configs::LegacyBuckConfig;
 use buck2_common::legacy_configs::key::BuckconfigKeyRef;
 use buck2_core::rollout_percentage::RolloutPercentage;
 use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_events::daemon_id::DaemonId;
 use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::execute::blocking::BlockingExecutor;
@@ -28,9 +28,11 @@ use buck2_execute_impl::sqlite::incremental_state_db::IncrementalStateSqliteDb;
 use buck2_execute_impl::sqlite::materializer_db::MATERIALIZER_DB_SCHEMA_VERSION;
 use buck2_execute_impl::sqlite::materializer_db::MaterializerState;
 use buck2_execute_impl::sqlite::materializer_db::MaterializerStateSqliteDb;
+use buck2_fs::error::IoResultExt;
 use buck2_fs::fs_util;
 use buck2_fs::paths::abs_norm_path::AbsNormPath;
 use buck2_fs::paths::file_name::FileName;
+use buck2_hash::StdBuckHashMap;
 
 use crate::daemon::server::BuckdServerInitPreferences;
 
@@ -68,10 +70,13 @@ fn sqlite_db_setup_metadata_and_versions(
     version_config: &str,
     deferred_materializer_config: Option<&DeferredMaterializerConfigs>,
     daemon_id: &DaemonId,
-) -> buck2_error::Result<(HashMap<String, String>, HashMap<String, String>)> {
-    let metadata = buck2_events::metadata::collect(&daemon_id);
+) -> buck2_error::Result<(
+    StdBuckHashMap<String, String>,
+    StdBuckHashMap<String, String>,
+)> {
+    let metadata = buck2_events::metadata::collect(daemon_id);
 
-    let mut versions = HashMap::from([("schema_version".to_owned(), schema_version)]);
+    let mut versions = StdBuckHashMap::from([("schema_version".to_owned(), schema_version)]);
 
     if let Some(config) = deferred_materializer_config {
         versions.insert(
@@ -109,6 +114,7 @@ pub(crate) async fn maybe_initialize_materializer_sqlite_db(
         io_executor
             .execute_io_inline(|| {
                 fs_util::remove_all(paths.materializer_state_path())
+                    .categorize_internal()
                     .map_err(buck2_error::Error::from)
             })
             .await?;
@@ -162,6 +168,7 @@ pub(crate) async fn maybe_initialize_incremental_sqlite_db(
         io_executor
             .execute_io_inline(|| {
                 fs_util::remove_all(paths.incremental_state_path())
+                    .categorize_internal()
                     .map_err(buck2_error::Error::from)
             })
             .await?;
@@ -212,17 +219,17 @@ pub(crate) fn delete_unknown_disk_state(
 ) -> buck2_error::Result<()> {
     let res: buck2_error::Result<()> = try {
         if cache_dir_path.exists() {
-            for entry in fs_util::read_dir(cache_dir_path)? {
-                let entry = entry?;
+            for entry in fs_util::read_dir(cache_dir_path).categorize_internal()? {
+                let entry = entry.map_err(buck2_error::Error::from)?;
                 let filename = entry.file_name();
                 let filename = filename
                     .to_str()
-                    .buck_error_context("Filename is not UTF-8")
+                    .ok_or_else(|| internal_error!("Filename is not UTF-8"))
                     .and_then(FileName::new)?;
 
                 // known_dir_names is always small, so this contains isn't expensive
                 if !known_dir_names.contains(&filename) || !entry.path().is_dir() {
-                    fs_util::remove_all(cache_dir_path.join(filename))?;
+                    fs_util::remove_all(cache_dir_path.join(filename)).categorize_internal()?;
                 }
             }
         }
@@ -240,6 +247,7 @@ pub(crate) fn delete_unknown_disk_state(
 mod tests {
     use buck2_core::fs::project::ProjectRootTemp;
     use buck2_core::fs::project_rel_path::ProjectRelativePath;
+    use buck2_fs::fs_util::uncategorized as fs_util;
     use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
 
     use super::*;

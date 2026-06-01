@@ -26,7 +26,6 @@ from buck2.tests.e2e_util.buck_workspace import (
     get_mode_from_platform,
     is_deployed_buck2,
 )
-from buck2.tests.e2e_util.helper.utils import read_invocation_record
 
 MAC_AND_WINDOWS = ["darwin", "windows"]
 
@@ -48,7 +47,7 @@ async def test_sh_test(buck: Buck) -> None:
         buck.test(
             "fbcode//buck2/tests/targets/rules/sh_test:test_fail",
         ),
-        stderr_regex=r"1 TESTS FAILED\n(\s)+✗ fbcode\/\/buck2\/tests\/targets\/rules\/sh_test:test_fail - main",
+        stderr_regex=r"1 TESTS FAILED\n(\s)+✗ fbcode\/\/buck2\/tests\/targets\/rules\/sh_test:test_fail - unmanaged",
     )
 
 
@@ -116,6 +115,32 @@ async def test_cpp_test(buck: Buck) -> None:
         ),
         stderr_regex=r"The desired execution strategy \(.RemoteOnly.\) is incompatible with the executor config that was selected",
     )
+
+
+@buck_test(inplace=True, skip_for_os=["windows"])
+async def test_cpp_stress_runs(buck: Buck) -> None:
+    mode = get_mode_from_platform()
+    res = await buck.test(
+        "fbcode//buck2/tests/targets/rules/cxx:cpp_test_pass",
+        mode,
+        "--",
+        "--stress-runs=10",
+    )
+
+    assert "Pass 10" in res.stderr, "Expected stress runs to be run"
+
+
+@buck_test(inplace=True, skip_for_os=["windows"])
+async def test_cpp_stress_runs_deterministic_paths(buck: Buck) -> None:
+    mode = get_mode_from_platform()
+    res = await buck.test(
+        "fbcode//buck2/tests/targets/rules/cxx:cpp_test_pass",
+        mode,
+        "--",
+        "--stress-runs=10",
+    )
+
+    assert "Pass 10" in res.stderr, "Expected stress runs to be run"
 
 
 @buck_test(inplace=True, skip_for_os=["darwin"])
@@ -735,7 +760,7 @@ async def test_cancellation_on_re(buck: Buck) -> None:
 
 @buck_test(inplace=True, skip_for_os=["windows"])
 async def test_timeout_local(buck: Buck) -> None:
-    await expect_failure(
+    result = await expect_failure(
         buck.test(
             "fbcode//buck2/tests/targets/rules/python/test:timeout",
             "--local-only",
@@ -747,11 +772,12 @@ async def test_timeout_local(buck: Buck) -> None:
         ),
         stderr_regex="Timeout: fbcode//buck2/tests/targets/rules/python/test:timeout",
     )
+    assert "1 TESTS TIMED OUT" in result.stderr
 
 
 @buck_test(inplace=True, skip_for_os=["windows"])
 async def test_timeout_re(buck: Buck) -> None:
-    await expect_failure(
+    result = await expect_failure(
         buck.test(
             "fbcode//buck2/tests/targets/rules/python/test:timeout",
             "--unstable-allow-all-tests-on-re",
@@ -763,6 +789,28 @@ async def test_timeout_re(buck: Buck) -> None:
             "--timeout=5",
         ),
         stderr_regex="Timeout: fbcode//buck2/tests/targets/rules/python/test:timeout",
+    )
+    assert "1 TESTS TIMED OUT" in result.stderr
+
+
+@buck_test(inplace=True, skip_for_os=["windows"])
+async def test_timeout_and_failure_local(buck: Buck) -> None:
+    result = await expect_failure(
+        buck.test(
+            "fbcode//buck2/tests/targets/rules/python/test:timeout_and_fail",
+            "--local-only",
+            "--no-remote-cache",
+            "--",
+            "--env",
+            "SLOW_DURATION=60",
+            "--timeout=5",
+        ),
+        stderr_regex="1 TESTS FAILED.*1 TESTS TIMED OUT",
+    )
+    stderr = remove_ansi_escape_sequences(result.stderr)
+    assert (
+        "Tests finished: Pass 0. Fail 1. Timeout 1. Fatal 0. Skip 0. Omit 0. Infra Failure 0. Build failure 0"
+        in stderr
     )
 
 
@@ -842,26 +890,23 @@ async def test_test_worker(buck: Buck) -> None:
     )
 
 
-@buck_test(inplace=True)
+@buck_test(inplace=True, write_invocation_record=True)
 @env("TEST_MAKE_IT_FAIL", "1")
-async def test_failed_tests_has_error_category(buck: Buck, tmp_path: Path) -> None:
-    record_path = tmp_path / "record.json"
-    await expect_failure(
+async def test_failed_tests_has_error_category(buck: Buck) -> None:
+    res = await expect_failure(
         buck.test(
             "fbcode//buck2/tests/targets/rules/python/test:test",
             get_mode_from_platform(),
-            "--unstable-write-invocation-record",
-            str(record_path),
             "--",
             "--env",
             "TEST_MAKE_IT_FAIL=1",
         ),
         stderr_regex="1 TESTS FAILED",
     )
-
-    record = read_invocation_record(record_path)
+    record = res.invocation_record()
     errors = record["errors"]
 
     assert len(errors) == 1
     assert errors[0]["category"] == "USER"
-    assert "TestExecutor" in errors[0]["category_key"]
+    if not is_deployed_buck2():
+        assert errors[0]["category_key"] == "TEST_FAILED"

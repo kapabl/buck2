@@ -13,10 +13,12 @@ use std::process::Stdio;
 use buck2_common::init::LogDownloadMethod;
 use buck2_common::temp_path::TempPath;
 use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_event_log::file_names::find_log_by_trace_id;
 use buck2_event_log::file_names::retrieve_nth_recent_log;
 use buck2_event_log::read::EventLogPathBuf;
 use buck2_event_log::utils::Encoding;
+use buck2_fs::error::IoResultExt;
 use buck2_fs::fs_util;
 use buck2_fs::paths::abs_path::AbsPathBuf;
 use buck2_fs::paths::file_name::FileName;
@@ -25,7 +27,6 @@ use buck2_util::indent::indent;
 use buck2_util::process::async_background_command;
 use buck2_wrapper_common::invocation_id::TraceId;
 use dupe::Dupe;
-use rand::Rng;
 
 use crate::client_ctx::ClientCommandContext;
 use crate::path_arg::PathArg;
@@ -90,7 +91,7 @@ impl EventLogOptions {
     fn random_string() -> String {
         let mut s = String::with_capacity(10);
         for _ in 0..10 {
-            s.push(rand::thread_rng().gen_range('a'..='z'));
+            s.push(rand::random_range('a'..='z'));
         }
         s
     }
@@ -136,7 +137,7 @@ impl EventLogOptions {
                         .path()
                         .as_os_str()
                         .to_str()
-                        .buck_error_context("temp_path is not valid UTF-8")?,
+                        .ok_or_else(|| internal_error!("temp_path is not valid UTF-8"))?,
                 ];
                 crate::eprintln!("Spawning: manifold {}", args.join(" "))?;
                 (
@@ -161,7 +162,7 @@ impl EventLogOptions {
                         .path()
                         .as_os_str()
                         .to_str()
-                        .buck_error_context("temp_path is not valid UTF-8")?,
+                        .ok_or_else(|| internal_error!("temp_path is not valid UTF-8"))?,
                 ];
                 crate::eprintln!("Spawning: curl {}", args.join(" "))?;
                 (
@@ -192,9 +193,9 @@ impl EventLogOptions {
         fs_util::create_dir_all(
             log_path
                 .parent()
-                .buck_error_context("Error identifying log dir")?,
+                .ok_or_else(|| internal_error!("Error identifying log dir"))?,
         )?;
-        fs_util::rename(temp_path.path(), &log_path)?;
+        fs_util::rename(temp_path.path(), &log_path).categorize_internal()?;
         crate::eprintln!("Downloaded event-log to `{}`", log_path.display())?;
 
         temp_path.close()?;

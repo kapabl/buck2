@@ -78,10 +78,10 @@ class AndroidInstall {
             cliOptions.adbServerPort,
             cliOptions.multiInstallMode,
             apkOptions.stagedInstallMode,
-            cliOptions.adbTimeout,
             cliOptions.ignoreMissingDevices,
             apkOptions.apexMode,
-            cliOptions.restartMode.name());
+            cliOptions.restartMode.name(),
+            cliOptions.waitForDeviceReady);
     LOG.info("adbOptions: " + adbOptions);
 
     TargetDeviceOptions targetDeviceOptions =

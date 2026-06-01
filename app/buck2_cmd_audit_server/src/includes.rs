@@ -19,10 +19,12 @@ use buck2_core::cells::CellResolver;
 use buck2_core::cells::cell_path::CellPath;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::package::PackageLabel;
+use buck2_fs::error::IoResultExt;
 use buck2_fs::fs_util;
 use buck2_fs::paths::abs_norm_path::AbsNormPath;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_fs::paths::file_name::FileNameBuf;
+use buck2_hash::buck_indexmap;
 use buck2_interpreter::file_loader::LoadedModule;
 use buck2_interpreter::load_module::InterpreterCalculation;
 use buck2_interpreter::paths::module::StarlarkModulePath;
@@ -44,7 +46,6 @@ use dupe::Dupe;
 use futures::StreamExt;
 use futures::stream::FuturesOrdered;
 use gazebo::prelude::*;
-use indexmap::indexmap;
 use itertools::Itertools;
 use ref_cast::RefCast;
 use serde::Serialize;
@@ -185,8 +186,8 @@ fn resolve_path(
     //
     // Note if the path is already absolute, this operation is a no-op.
     let path = current_cell_abs_path.as_abs_path().join(path);
-
-    let abs_path = fs_util::canonicalize(path)?;
+    // input path from `buck2 audit includes [BUILD_FILES]`
+    let abs_path = fs_util::canonicalize(path).categorize_input()?;
 
     let project_path = fs.relativize(&abs_path)?;
     Ok(cells.get_cell_path(&project_path))
@@ -258,12 +259,13 @@ impl ServerAuditSubcommand for AuditIncludesCommand {
                         let mut map = ser.serialize_map(Some(results.len()))?;
                         for (path, includes) in &results {
                             match includes {
-                                Ok(includes) => {
-                                    map.serialize_entry(path, &indexmap! {"includes" => &includes})?
-                                }
+                                Ok(includes) => map.serialize_entry(
+                                    path,
+                                    &buck_indexmap! {"includes" => &includes},
+                                )?,
                                 Err(e) => map.serialize_entry(
                                     path,
-                                    &indexmap! {"$error" => format!("{:#}", e)},
+                                    &buck_indexmap! {"$error" => format!("{:#}", e)},
                                 )?,
                             }
                         }

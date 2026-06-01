@@ -26,6 +26,7 @@ use std::ops::Deref;
 use allocative::Allocative;
 use display_container::fmt_container;
 use serde::Serialize;
+use starlark::register_avalue_simple_frozen;
 use starlark_map::Hashed;
 use starlark_map::small_set::SmallSet;
 
@@ -34,7 +35,6 @@ use crate as starlark;
 use crate::coerce::Coerce;
 use crate::coerce::coerce;
 use crate::environment::Methods;
-use crate::environment::MethodsStatic;
 use crate::typing::Ty;
 use crate::util::refcell::unleak_borrow;
 use crate::values::AllocValue;
@@ -44,6 +44,7 @@ use crate::values::Freezer;
 use crate::values::FrozenValue;
 use crate::values::Heap;
 use crate::values::ProvidesStaticType;
+use crate::values::StarlarkPagable;
 use crate::values::StarlarkValue;
 use crate::values::Trace;
 use crate::values::UnpackValue;
@@ -55,7 +56,15 @@ use crate::values::starlark_value;
 use crate::values::type_repr::SetType;
 use crate::values::type_repr::StarlarkTypeRepr;
 
-#[derive(Clone, Default, Trace, Debug, ProvidesStaticType, Allocative)]
+#[derive(
+    Clone,
+    Default,
+    Trace,
+    Debug,
+    ProvidesStaticType,
+    Allocative,
+    StarlarkPagable
+)]
 #[repr(transparent)]
 pub(crate) struct SetGen<T>(pub(crate) T);
 
@@ -102,11 +111,29 @@ impl<'v> SetData<'v> {
     }
 }
 
-#[derive(Clone, Default, Debug, ProvidesStaticType, Allocative)]
+#[derive(Clone, Default, Debug, ProvidesStaticType, Allocative, StarlarkPagable)]
 #[repr(transparent)]
 pub(crate) struct FrozenSetData {
     /// The data stored by the set. The values must all be hashable values.
     content: SmallSet<FrozenValue>,
+}
+
+#[cfg(all(test, feature = "pagable"))]
+impl FrozenSetData {
+    /// Construct a `FrozenSetData` from a pre-built set of frozen values.
+    pub(crate) fn new(content: SmallSet<FrozenValue>) -> Self {
+        Self { content }
+    }
+
+    /// Number of elements in the set.
+    pub(crate) fn len(&self) -> usize {
+        self.content.len()
+    }
+
+    /// Iterate over the frozen values in the set.
+    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = FrozenValue> + '_ {
+        self.content.iter().copied()
+    }
 }
 
 pub(crate) type MutableSet<'v> = SetGen<RefCell<SetData<'v>>>;
@@ -114,7 +141,7 @@ pub(crate) type MutableSet<'v> = SetGen<RefCell<SetData<'v>>>;
 pub(crate) type FrozenSet = SetGen<FrozenSetData>;
 
 impl<'v> AllocValue<'v> for SetData<'v> {
-    fn alloc_value(self, heap: &'v Heap) -> Value<'v> {
+    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
         heap.alloc_complex(SetGen(RefCell::new(self)))
     }
 }
@@ -136,11 +163,6 @@ impl<'v> Freeze for MutableSet<'v> {
         let content = self.0.into_inner().content.freeze(freezer)?;
         Ok(SetGen(FrozenSetData { content }))
     }
-}
-
-pub(crate) fn set_methods() -> Option<&'static Methods> {
-    static RES: MethodsStatic = MethodsStatic::new();
-    RES.methods(methods::set_methods)
 }
 
 trait SetLike<'v>: Debug + Allocative {
@@ -207,6 +229,11 @@ impl<'v> SetLike<'v> for FrozenSetData {
     }
 }
 
+// Register vtable for FrozenSet (special type not handled by #[starlark_value] macro, because V is not ValueLike).
+register_avalue_simple_frozen!(FrozenSet);
+
+starlark::methods_static!(SET_METHODS = methods::set_methods);
+
 #[starlark_value(type = "set")]
 impl<'v, T: SetLike<'v> + 'v> StarlarkValue<'v> for SetGen<T>
 where
@@ -234,10 +261,10 @@ where
     }
 
     fn get_methods() -> Option<&'static Methods> {
-        set_methods()
+        Some(SET_METHODS.methods())
     }
 
-    unsafe fn iterate(&self, me: Value<'v>, _heap: &'v Heap) -> crate::Result<Value<'v>> {
+    unsafe fn iterate(&self, me: Value<'v>, _heap: Heap<'v>) -> crate::Result<Value<'v>> {
         unsafe {
             self.0.iter_start();
             Ok(me)
@@ -250,7 +277,7 @@ where
         (rem, Some(rem))
     }
 
-    unsafe fn iter_next(&self, index: usize, _heap: &'v Heap) -> Option<Value<'v>> {
+    unsafe fn iter_next(&self, index: usize, _heap: Heap<'v>) -> Option<Value<'v>> {
         unsafe { self.0.content_unchecked().iter().nth(index).copied() }
     }
 
@@ -265,7 +292,7 @@ where
     }
 
     // Set union
-    fn bit_or(&self, rhs: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    fn bit_or(&self, rhs: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         // Unlike in `union` it is not possible to `|` `set` and iterable. This is due python semantics.
         let rhs = SetRef::unpack_value_opt(rhs)
             .map_or_else(|| ValueError::unsupported_with(self, "|", rhs), Ok)?;
@@ -280,7 +307,7 @@ where
     }
 
     // Set intersection
-    fn bit_and(&self, rhs: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    fn bit_and(&self, rhs: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         let rhs = SetRef::unpack_value_opt(rhs)
             .map_or_else(|| ValueError::unsupported_with(self, "&", rhs), Ok)?;
 
@@ -299,7 +326,7 @@ where
     }
 
     // Set symmetric difference
-    fn bit_xor(&self, rhs: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    fn bit_xor(&self, rhs: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         let rhs = SetRef::unpack_value_opt(rhs)
             .map_or_else(|| ValueError::unsupported_with(self, "^", rhs), Ok)?;
         if rhs.aref.content.is_empty() {
@@ -324,7 +351,7 @@ where
 
     // Set difference
     //TODO(romanp) implement difference on small_set level and reuse it here and in difference function
-    fn sub(&self, rhs: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    fn sub(&self, rhs: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         let rhs = SetRef::unpack_value_opt(rhs)
             .map_or_else(|| ValueError::unsupported_with(self, "-", rhs), Ok)?;
 

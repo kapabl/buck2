@@ -23,11 +23,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_fs::fs_util;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_fs::paths::abs_path::AbsPath;
 use buck2_resource_control::ActionFreezeEventReceiver;
-use buck2_resource_control::action_cgroups::ActionCgroupResult;
+use buck2_resource_control::OrphanProcessInfo;
+use buck2_resource_control::action_scene::ActionCgroupResult;
 use buck2_resource_control::path::CgroupPathBuf;
 use bytes::Bytes;
 use futures::future::Future;
@@ -97,7 +99,7 @@ impl From<DecodedStatus> for GatherOutputStatus {
 pub enum CommandEvent {
     Stdout(Bytes),
     Stderr(Bytes),
-    Exit(GatherOutputStatus),
+    Exit(GatherOutputStatus, Vec<OrphanProcessInfo>),
 }
 
 enum StdioEvent {
@@ -126,7 +128,7 @@ pub struct StdRedirectPaths {
 /// Before sending any events, it will send the cgroup path if cgroup pools are enabled.
 #[pin_project]
 struct CommandEventStream<Status, Stdio> {
-    exit: Option<buck2_error::Result<GatherOutputStatus>>,
+    exit: Option<buck2_error::Result<(GatherOutputStatus, Vec<OrphanProcessInfo>)>>,
 
     done: bool,
 
@@ -154,7 +156,7 @@ where
 
 impl<Status, Stdio> Stream for CommandEventStream<Status, Stdio>
 where
-    Status: Future<Output = buck2_error::Result<GatherOutputStatus>>,
+    Status: Future<Output = buck2_error::Result<(GatherOutputStatus, Vec<OrphanProcessInfo>)>>,
     Stdio: Stream<Item = buck2_error::Result<StdioEvent>> + InterruptNotifiable,
 {
     type Item = buck2_error::Result<CommandEvent>;
@@ -183,7 +185,9 @@ where
         // we report we're pending, because we'll have polled it already earlier.
         if let Some(exit) = this.exit.take() {
             *this.done = true;
-            return Poll::Ready(Some(exit.map(CommandEvent::Exit)));
+            return Poll::Ready(Some(
+                exit.map(|(status, orphans)| CommandEvent::Exit(status, orphans)),
+            ));
         }
 
         Poll::Pending
@@ -226,7 +230,7 @@ where
         cmd.stderr(Stdio::piped());
     }
 
-    let cmd = ProcessCommand::new(cmd, cgroup_path)?;
+    let cmd = ProcessCommand::new(cmd, cgroup_path).await?;
 
     // Note: Process spawning is a fundamentally asynchronous operation that legitimately might
     // block for a non-zero amount of time. Typically, that would mean that we should
@@ -246,9 +250,10 @@ where
     let mut process_group = match process_details {
         Ok(process_group) => process_group,
         Err(e) => {
-            let event = Ok(CommandEvent::Exit(GatherOutputStatus::SpawnFailed(
-                e.to_string(),
-            )));
+            let event = Ok(CommandEvent::Exit(
+                GatherOutputStatus::SpawnFailed(e.to_string()),
+                Vec::new(),
+            ));
             return Ok(futures::stream::once(futures::future::ready(event)).left_stream());
         }
     };
@@ -256,10 +261,10 @@ where
     let stdio = if std_redirects.is_none() {
         let stdout = process_group
             .take_stdout()
-            .buck_error_context("Child stdout is not piped")?;
+            .ok_or_else(|| internal_error!("Child stdout is not piped"))?;
         let stderr = process_group
             .take_stderr()
-            .buck_error_context("Child stderr is not piped")?;
+            .ok_or_else(|| internal_error!("Child stderr is not piped"))?;
 
         #[cfg(unix)]
         type Drainer<R> = self::interruptible_async_read::UnixNonBlockingDrainer<R>;
@@ -283,7 +288,7 @@ where
 
     let status = async move {
         enum Outcome {
-            Finished(ExitStatus),
+            Finished(ExitStatus, Vec<OrphanProcessInfo>),
             Cancelled(GatherOutputStatus),
         }
 
@@ -295,13 +300,18 @@ where
             futures::pin_mut!(cancellation);
 
             buck2_error::Ok(match futures::future::select(status, cancellation).await {
-                futures::future::Either::Left((status, _)) => Outcome::Finished(status?),
+                futures::future::Either::Left((result, _)) => {
+                    let (status, orphans) = result?;
+                    Outcome::Finished(status, orphans)
+                }
                 futures::future::Either::Right((res, _)) => Outcome::Cancelled(res?),
             })
         };
 
-        Ok(match execute.await? {
-            Outcome::Finished(status) => decoder.decode_status(status).await?.into(),
+        let (gather_output_status, orphans) = match execute.await? {
+            Outcome::Finished(status, orphans) => {
+                (decoder.decode_status(status).await?.into(), orphans)
+            }
             Outcome::Cancelled(res) => {
                 kill_process
                     .kill(&mut process_group)
@@ -315,14 +325,16 @@ where
 
                 // We just killed the child, so this should finish immediately. We should still call
                 // this to release any process.
-                process_group
+                let (_status, orphans) = process_group
                     .wait(futures::stream::pending())
                     .await
                     .buck_error_context("Failed to await child after kill")?;
 
-                res
+                (res, orphans)
             }
-        })
+        };
+
+        Ok((gather_output_status, orphans))
     };
 
     Ok(CommandEventStream::new(status, stdio).right_stream())
@@ -333,6 +345,7 @@ pub struct CommandResult {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub cgroup_result: Option<ActionCgroupResult>,
+    pub orphan_processes: Vec<OrphanProcessInfo>,
 }
 
 pub async fn decode_command_event_stream<S>(stream: S) -> buck2_error::Result<CommandResult>
@@ -348,13 +361,14 @@ where
         match event {
             CommandEvent::Stdout(bytes) => stdout.extend(&bytes),
             CommandEvent::Stderr(bytes) => stderr.extend(&bytes),
-            CommandEvent::Exit(exit) => {
+            CommandEvent::Exit(exit, orphan_processes) => {
                 return Ok(CommandResult {
                     status: exit,
                     stdout,
                     stderr,
                     // Filled in later
                     cgroup_result: None,
+                    orphan_processes,
                 });
             }
         }
@@ -526,15 +540,14 @@ mod tests {
     async fn test_gather_does_not_wait_for_children() -> buck2_error::Result<()> {
         // If we wait for sleep, this will time out.
         let mut cmd = if cfg!(windows) {
-            background_command("powershell")
+            // Use cmd.exe rather than PowerShell — PowerShell's Start-Job is
+            // heavyweight and can exceed the timeout on slow CI machines.
+            background_command("cmd")
         } else {
             background_command("sh")
         };
         if cfg!(windows) {
-            cmd.args([
-                "-c",
-                "Start-Job -ScriptBlock {sleep 10} | Out-Null; echo hello",
-            ]);
+            cmd.args(["/c", "start /b timeout 10 >nul & echo hello"]);
         } else {
             cmd.args(["-c", "(sleep 10 &) && echo hello"]);
         }
@@ -609,7 +622,7 @@ mod tests {
         file.write_all(b"#!/usr/bin/env bash\ntrue\n").await?;
 
         let cmd = background_command(&bin);
-        let cmd = ProcessCommand::new(cmd, None)?;
+        let cmd = ProcessCommand::new(cmd, None).await?;
         let mut process_group = spawn_retry_txt_busy(cmd, {
             let mut file = Some(file);
             move || {
@@ -619,7 +632,7 @@ mod tests {
         })
         .await?;
 
-        let status = process_group.wait(futures::stream::pending()).await?;
+        let (status, _orphans) = process_group.wait(futures::stream::pending()).await?;
         assert_eq!(status.code(), Some(0));
 
         Ok(())
@@ -631,7 +644,7 @@ mod tests {
         let bin = tempdir.path().join("bin"); // Does not actually exist
 
         let cmd = background_command(&bin);
-        let cmd = ProcessCommand::new(cmd, None)?;
+        let cmd = ProcessCommand::new(cmd, None).await?;
         let res = spawn_retry_txt_busy(cmd, || async { panic!("Should not be called!") }).await;
         assert!(res.is_err());
 
@@ -664,8 +677,12 @@ mod tests {
             gather_output(cmd, Some(Duration::from_secs(timeout))).await?;
         let out = str::from_utf8(&stdout)?;
         let pids: Vec<&str> = out.split('\n').collect();
-        let ppid = Pid::from_str(pids.first().buck_error_context("no ppid")?.trim())?;
-        let pid = Pid::from_str(pids.get(1).buck_error_context("no pid")?.trim())?;
+        let ppid = Pid::from_str(
+            pids.first()
+                .ok_or_else(|| internal_error!("no ppid"))?
+                .trim(),
+        )?;
+        let pid = Pid::from_str(pids.get(1).ok_or_else(|| internal_error!("no pid"))?.trim())?;
         let sys = System::new_all();
 
         // we want to check if existed process doesn't have the same parent because of pid reuse

@@ -25,13 +25,15 @@ def _use_some_memory_args(buck: Buck) -> list[str]:
         "-c",
         f"test.cache_buster={random_string()}",
         "-c",
-        f"use_some_memory.path={os.environ["USE_SOME_MEMORY_BIN"]}",
+        f"use_some_memory.path={os.environ['USE_SOME_MEMORY_BIN']}",
     ]
 
 
-@buck_test(skip_for_os=["windows", "darwin"])
+@buck_test(skip_for_os=["windows", "darwin"], disable_daemon_cgroup=False)
 async def test_memory_reporting_disabled(buck: Buck) -> None:
-    env = {"BUCK2_TEST_RESOURCE_CONTROL_CONFIG": '{"status":"Off"}'}
+    env = {
+        "BUCK2_TEST_RESOURCE_CONTROL_CONFIG": '{"status":"Off","init":"Systemd","memory_max":null,"memory_high":null,"memory_max_per_action":null,"memory_high_per_action":null,"memory_high_actions":null,"memory_max_actions":null,"enable_suspension":false,"preferred_action_suspend_strategy":"KillAndRetry"}'
+    }
 
     await buck.build(
         *_use_some_memory_args(buck),
@@ -68,7 +70,7 @@ async def get_matching_details(buck: Buck) -> Dict[str, Any]:
     raise AssertionError("did not find the expected target")
 
 
-@buck_test(skip_for_os=["windows", "darwin"])
+@buck_test(skip_for_os=["windows", "darwin"], disable_daemon_cgroup=False)
 async def test_memory_reporting(buck: Buck) -> None:
     await buck.build(
         *_use_some_memory_args(buck),
@@ -82,7 +84,7 @@ async def test_memory_reporting(buck: Buck) -> None:
     assert memory_peak < 15000000
 
 
-@buck_test(skip_for_os=["windows", "darwin"])
+@buck_test(skip_for_os=["windows", "darwin"], disable_daemon_cgroup=False)
 async def test_memory_reporting_in_test(buck: Buck) -> None:
     await buck.test(
         *_use_some_memory_args(buck),
@@ -94,7 +96,7 @@ async def test_memory_reporting_in_test(buck: Buck) -> None:
         "data",
         "SpanEnd",
         "data",
-        "TestEnd",
+        "TestRun",
     )
     assert len(events) == 1
     details = events[0]["command_report"]["details"]

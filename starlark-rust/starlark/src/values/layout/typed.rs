@@ -39,6 +39,7 @@ use crate::cast;
 use crate::cast::transmute;
 use crate::coerce::Coerce;
 use crate::coerce::CoerceKey;
+use crate::register_starlark_any;
 use crate::typing::Ty;
 use crate::values::AllocFrozenValue;
 use crate::values::AllocValue;
@@ -46,7 +47,6 @@ use crate::values::Freeze;
 use crate::values::FreezeResult;
 use crate::values::Freezer;
 use crate::values::FrozenHeap;
-use crate::values::FrozenRef;
 use crate::values::FrozenStringValue;
 use crate::values::FrozenValue;
 use crate::values::FrozenValueOfUnchecked;
@@ -73,7 +73,7 @@ use crate::values::type_repr::StarlarkTypeRepr;
 /// [`Value`] wrapper which asserts contained value is of type `<T>`.
 #[derive(Copy_, Clone_, Dupe_, ProvidesStaticType, Allocative)]
 #[allocative(skip)] // Heap owns the value.
-pub struct ValueTyped<'v, T: StarlarkValue<'v>>(Value<'v>, marker::PhantomData<&'v T>);
+pub struct ValueTyped<'v, T: StarlarkValue<'v>>(Value<'v>, marker::PhantomData<T>);
 /// [`FrozenValue`] wrapper which asserts contained value is of type `<T>`.
 #[derive(Copy_, Clone_, Dupe_, ProvidesStaticType, Allocative)]
 #[allocative(skip)] // Heap owns the value.
@@ -318,11 +318,6 @@ impl<'v, T: StarlarkValue<'v>> FrozenValueTyped<'v, T> {
         }
     }
 
-    #[inline]
-    pub(crate) fn as_frozen_ref(self) -> FrozenRef<'v, T> {
-        FrozenRef::new(self.as_ref())
-    }
-
     /// Convert to another `FrozenValue` wrapper.
     #[inline]
     pub fn to_value_of_unchecked(self) -> FrozenValueOfUnchecked<'v, T> {
@@ -389,7 +384,7 @@ impl<'v, T: StarlarkValue<'v>> UnpackValue<'v> for ValueTyped<'v, T> {
 }
 
 impl<'v, T: StarlarkValue<'v>> AllocValue<'v> for ValueTyped<'v, T> {
-    fn alloc_value(self, _heap: &'v Heap) -> Value<'v> {
+    fn alloc_value(self, _heap: Heap<'v>) -> Value<'v> {
         self.0
     }
 }
@@ -409,7 +404,7 @@ where
 }
 
 impl<'v> AllocStringValue<'v> for StringValue<'v> {
-    fn alloc_string_value(self, _heap: &'v Heap) -> StringValue<'v> {
+    fn alloc_string_value(self, _heap: Heap<'v>) -> StringValue<'v> {
         self
     }
 }
@@ -449,13 +444,13 @@ impl<'v, T: StarlarkValue<'v>> UnpackValue<'v> for FrozenValueTyped<'v, T> {
 }
 
 impl<'v, 'f, T: StarlarkValue<'f>> AllocValue<'v> for FrozenValueTyped<'f, T> {
-    fn alloc_value(self, _heap: &'v Heap) -> Value<'v> {
+    fn alloc_value(self, _heap: Heap<'v>) -> Value<'v> {
         self.0.to_value()
     }
 }
 
 impl<'v> AllocStringValue<'v> for FrozenStringValue {
-    fn alloc_string_value(self, _heap: &'v Heap) -> StringValue<'v> {
+    fn alloc_string_value(self, _heap: Heap<'v>) -> StringValue<'v> {
         self.to_string_value()
     }
 }
@@ -466,11 +461,34 @@ impl<'v, T: StarlarkValue<'v>> AllocFrozenValue for FrozenValueTyped<'v, T> {
     }
 }
 
+impl<'v, T: StarlarkValue<'v>> crate::pagable::StarlarkSerialize for FrozenValueTyped<'v, T> {
+    fn starlark_serialize(
+        &self,
+        ctx: &mut dyn crate::pagable::starlark_serialize::StarlarkSerializeContext,
+    ) -> crate::Result<()> {
+        self.0.starlark_serialize(ctx)
+    }
+}
+
+impl<'v, T: StarlarkValue<'v>> crate::pagable::StarlarkDeserialize for FrozenValueTyped<'v, T> {
+    fn starlark_deserialize(
+        ctx: &mut dyn crate::pagable::starlark_deserialize::StarlarkDeserializeContext<'_>,
+    ) -> crate::Result<Self> {
+        let fv = FrozenValue::starlark_deserialize(ctx)?;
+        // SAFETY: pagable deserializes this field through the same Rust type
+        // that serialized it.
+        Ok(unsafe { FrozenValueTyped::new_unchecked(fv) })
+    }
+}
+
 impl AllocFrozenStringValue for FrozenStringValue {
     fn alloc_frozen_string_value(self, _heap: &FrozenHeap) -> FrozenStringValue {
         self
     }
 }
+
+// Register FrozenValueTyped<StarlarkStr> for use with alloc_any_slice in pagable mode.
+register_starlark_any!(FrozenValueTyped<'static, StarlarkStr>);
 
 #[cfg(test)]
 mod tests {

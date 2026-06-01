@@ -26,13 +26,14 @@ use serde::Serialize;
 use starlark::__derive_refs::serde::Serializer;
 use starlark::any::ProvidesStaticType;
 use starlark::const_frozen_string;
+use starlark::environment::GlobalsBuilder;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
-use starlark::environment::MethodsStatic;
 use starlark::starlark_module;
 use starlark::starlark_simple_value;
 use starlark::values::FrozenStringValue;
 use starlark::values::Heap;
+use starlark::values::StarlarkPagable;
 use starlark::values::StarlarkValue;
 use starlark::values::Trace;
 use starlark::values::UnpackValue;
@@ -45,9 +46,19 @@ use crate::bxl::unconfigured_attribute::CoercedAttrExt;
 
 type SelectDictKey = Either<StarlarkProvidersLabel, FrozenStringValue>;
 
-#[derive(ProvidesStaticType, Derivative, Trace, Allocative, Clone, Debug)]
+#[derive(
+    ProvidesStaticType,
+    Derivative,
+    Trace,
+    Allocative,
+    Clone,
+    Debug,
+    StarlarkPagable
+)]
 pub struct StarlarkSelectDict {
+    #[starlark_pagable(pagable)]
     selector: CoercedSelector,
+    #[starlark_pagable(pagable)]
     pkg: PackageLabel,
 }
 
@@ -90,7 +101,7 @@ impl StarlarkSelectDict {
     fn get<'v>(
         &self,
         key: SelectDictKeyArg<'v>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> buck2_error::Result<NoneOr<Value<'v>>> {
         match key {
             SelectDictKeyArg::Label(label) => {
@@ -118,11 +129,12 @@ impl StarlarkSelectDict {
 
 starlark_simple_value!(StarlarkSelectDict);
 
+starlark::methods_static!(SELECT_DICT_METHODS = select_dict_methods);
+
 #[starlark_value(type = "bxl.SelectDict")]
 impl<'v> StarlarkValue<'v> for StarlarkSelectDict {
     fn get_methods() -> Option<&'static Methods> {
-        static RES: MethodsStatic = MethodsStatic::new();
-        RES.methods(select_dict_methods)
+        Some(SELECT_DICT_METHODS.methods())
     }
 }
 
@@ -169,7 +181,7 @@ fn select_dict_methods(builder: &mut MethodsBuilder) {
     /// ```
     fn select_items<'v>(
         this: &'v StarlarkSelectDict,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> starlark::Result<Vec<(SelectDictKey, Value<'v>)>> {
         let items: Vec<(SelectDictKey, Value)> = this
             .selector
@@ -217,15 +229,25 @@ fn select_dict_methods(builder: &mut MethodsBuilder) {
     fn get_select_entry<'v>(
         this: &'v StarlarkSelectDict,
         #[starlark(require = pos)] key: SelectDictKeyArg<'v>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> starlark::Result<NoneOr<Value<'v>>> {
         Ok(this.get(key, heap)?)
     }
 }
 
-#[derive(ProvidesStaticType, Derivative, Trace, Allocative, Clone, Debug)]
+#[derive(
+    ProvidesStaticType,
+    Derivative,
+    Trace,
+    Allocative,
+    Clone,
+    Debug,
+    StarlarkPagable
+)]
 pub struct StarlarkSelectConcat {
+    #[starlark_pagable(pagable)]
     concat: CoercedConcat,
+    #[starlark_pagable(pagable)]
     pkg: PackageLabel,
 }
 
@@ -260,11 +282,12 @@ impl Display for StarlarkSelectConcat {
 
 starlark_simple_value!(StarlarkSelectConcat);
 
+starlark::methods_static!(SELECT_CONCAT_METHODS = select_concat_methods);
+
 #[starlark_value(type = "bxl.SelectConcat")]
 impl<'v> StarlarkValue<'v> for StarlarkSelectConcat {
     fn get_methods() -> Option<&'static Methods> {
-        static RES: MethodsStatic = MethodsStatic::new();
-        RES.methods(select_concat_methods)
+        Some(SELECT_CONCAT_METHODS.methods())
     }
 
     fn length(&self) -> starlark::Result<i32> {
@@ -316,7 +339,7 @@ fn select_concat_methods(builder: &mut MethodsBuilder) {
     /// ```
     fn select_iter<'v>(
         this: &'v StarlarkSelectConcat,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> starlark::Result<Vec<Value<'v>>> {
         let list = this
             .concat
@@ -336,3 +359,10 @@ fn select_concat_methods(builder: &mut MethodsBuilder) {
         Ok(this.concat.0.len() as i32)
     }
 }
+
+#[starlark_module]
+#[starlark_types(
+    StarlarkSelectDict as SelectDict,
+    StarlarkSelectConcat as SelectConcat
+)]
+pub fn register_select_types(globals: &mut GlobalsBuilder) {}

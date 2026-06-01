@@ -40,7 +40,6 @@ use starlark::any::ProvidesStaticType;
 use starlark::collections::SmallMap;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
-use starlark::environment::MethodsStatic;
 use starlark::eval::Evaluator;
 use starlark::starlark_module;
 use starlark::starlark_simple_value;
@@ -107,7 +106,7 @@ enum LazyResult {
 impl LazyResult {
     fn into_value<'v>(
         self,
-        heap: &'v Heap,
+        heap: Heap<'v>,
         bxl_eval_extra: &BxlEvalExtra,
     ) -> buck2_error::Result<Value<'v>> {
         match self {
@@ -261,7 +260,8 @@ impl LazyOperation {
     NoSerialize,
     Allocative,
     Clone,
-    Dupe
+    Dupe,
+    starlark::StarlarkPagablePanic // okay("bxl")
 )]
 #[derivative(Debug)]
 #[display("{:?}", self)]
@@ -285,7 +285,7 @@ impl StarlarkLazy {
         Self {
             lazy: Arc::new(LazyOperation::ConfiguredTargetNode {
                 arg,
-                global_cfg_options: global_cfg_options.map_err(buck2_error::Error::from),
+                global_cfg_options,
             }),
         }
     }
@@ -335,11 +335,12 @@ impl StarlarkLazy {
     }
 }
 
+starlark::methods_static!(LAZY_OPERATION_METHODS = lazy_operation_methods);
+
 #[starlark_value(type = "bxl.Lazy")]
 impl<'v> StarlarkValue<'v> for StarlarkLazy {
     fn get_methods() -> Option<&'static Methods> {
-        static RES: MethodsStatic = MethodsStatic::new();
-        RES.methods(lazy_operation_methods)
+        Some(LAZY_OPERATION_METHODS.methods())
     }
 }
 

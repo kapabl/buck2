@@ -15,8 +15,10 @@ use std::time::Duration;
 
 use buck2_common::kill_util::try_terminate_process_gracefully;
 use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_resource_control::ActionFreezeEvent;
 use buck2_resource_control::ActionFreezeEventReceiver;
+use buck2_resource_control::OrphanProcessInfo;
 use buck2_resource_control::cgroup::Cgroup;
 use buck2_resource_control::cgroup::CgroupKindLeaf;
 use buck2_resource_control::cgroup::CgroupMinimal;
@@ -27,7 +29,6 @@ use futures::pin_mut;
 use nix::sys::signal;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
-use tokio::io;
 use tokio::pin;
 use tokio::process::Child;
 use tokio::process::ChildStderr;
@@ -42,14 +43,17 @@ pub(crate) struct ProcessCommandImpl {
 }
 
 impl ProcessCommandImpl {
-    pub(crate) fn new(
+    pub(crate) async fn new(
         mut cmd: StdCommand,
         cgroup: Option<CgroupPathBuf>,
     ) -> buck2_error::Result<Self> {
         cmd.process_group(0);
 
         let cgroup = if let Some(cgroup) = cgroup {
-            let cgroup = CgroupMinimal::try_from_path(cgroup.clone())?.into_leaf()?;
+            let cgroup = CgroupMinimal::try_from_path(cgroup.clone())
+                .await?
+                .into_leaf()
+                .await?;
             cgroup.setup_command(&mut cmd);
             Some(cgroup)
         } else {
@@ -98,7 +102,7 @@ impl ProcessGroupImpl {
     pub(crate) async fn wait(
         &mut self,
         freeze_rx: impl ActionFreezeEventReceiver,
-    ) -> io::Result<ExitStatus> {
+    ) -> buck2_error::Result<(ExitStatus, Vec<OrphanProcessInfo>)> {
         let child = self.inner.wait();
         pin!(child);
         pin_mut!(freeze_rx);
@@ -106,7 +110,13 @@ impl ProcessGroupImpl {
         loop {
             tokio::select! {
                 res = &mut child => {
-                    break res;
+                    // Kill any remaining PIDs in the cgroup that outlived the main process.
+                    let orphans = if let Some(cgroup) = self.cgroup.as_ref() {
+                        cgroup.kill_remaining_pids().await?
+                    } else {
+                        Vec::new()
+                    };
+                    break Ok((res?, orphans));
                 },
                 Some(freeze_op) = freeze_rx.next() => {
                     match freeze_op {
@@ -115,7 +125,7 @@ impl ProcessGroupImpl {
                         }
                         ActionFreezeEvent::Freeze => {
                             if let Some(cgroup) = self.cgroup.as_ref() {
-                                freeze_guard = cgroup.freeze().ok();
+                                freeze_guard = cgroup.freeze().await.ok();
                             }
                         }
                     }
@@ -128,7 +138,8 @@ impl ProcessGroupImpl {
         self.inner.id()
     }
 
-    // On unix we use killpg to kill the whole process tree
+    // Kill the process tree. Uses process-group-based signaling (killpg or
+    // graceful SIGTERM+SIGKILL).
     pub(crate) async fn kill(
         &self,
         graceful_shutdown_timeout_s: Option<u32>,
@@ -137,18 +148,21 @@ impl ProcessGroupImpl {
             .inner
             .id()
             .and_then(|id| id.try_into().ok())
-            .buck_error_context("PID does not fit a i32")?;
+            .ok_or_else(|| internal_error!("PID does not fit a i32"))?;
 
+        // Always use process-group-based signaling first.
         if let Some(graceful_shutdown_timeout_s) = graceful_shutdown_timeout_s {
             try_terminate_process_gracefully(
                 pid,
                 Duration::from_secs(graceful_shutdown_timeout_s as u64),
             )
             .await
-            .with_buck_error_context(|| format!("Failed to terminate process {pid} gracefully"))
+            .with_buck_error_context(|| format!("Failed to terminate process {pid} gracefully"))?;
         } else {
             signal::killpg(Pid::from_raw(pid), Signal::SIGKILL)
-                .with_buck_error_context(|| format!("Failed to kill process {pid}"))
+                .with_buck_error_context(|| format!("Failed to kill process {pid}"))?;
         }
+
+        Ok(())
     }
 }

@@ -8,7 +8,6 @@
  * above-listed licenses.
  */
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use allocative::Allocative;
@@ -21,9 +20,10 @@ use buck2_core::cells::CellResolver;
 use buck2_core::cells::name::CellName;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::rollout_percentage::RolloutPercentage;
-use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_events::dispatch::span_async;
 use buck2_fs::paths::abs_norm_path::AbsNormPath;
+use buck2_hash::StdBuckHashMap;
 use buck2_util::process::async_background_command;
 use dice::DiceTransactionUpdater;
 use tracing::debug;
@@ -47,7 +47,7 @@ struct WatchmanQueryProcessor {
     // `tests/e2e/cells/test_file_watcher_resolution:test_changing_cell_location_bug` for a repro of
     // a bug.
     cells: CellResolver,
-    ignore_specs: HashMap<CellName, IgnoreSet>,
+    ignore_specs: StdBuckHashMap<CellName, IgnoreSet>,
     empty_on_fresh_instance: bool,
     report_global_rev: bool,
     last_mergebase: Option<String>,
@@ -84,8 +84,11 @@ impl WatchmanQueryProcessor {
                     // If we error out here then we might miss other changes. This seems like
                     // it shouldn't happen, since the empty path should always be a valid path.
                     let path = find_first_valid_parent(&ev.path)
-                        .with_buck_error_context(|| {
-                            format!("Invalid path had no valid parent: `{}`", ev.path.display())
+                        .ok_or_else(|| {
+                            internal_error!(
+                                "Invalid path had no valid parent: `{}`",
+                                ev.path.display()
+                            )
                         })
                         .unwrap();
 
@@ -109,6 +112,12 @@ impl WatchmanQueryProcessor {
         handler: &mut FileChangeTracker,
         stats: &mut FileWatcherStats,
     ) -> buck2_error::Result<()> {
+        // Watchman cookie files are synchronization markers, not real source changes.
+        if crate::is_watchman_cookie(path) {
+            stats.add_ignored(1);
+            return Ok(());
+        }
+
         let cell_path = self.cells.get_cell_path(path);
 
         let ignore = self
@@ -347,7 +356,7 @@ impl WatchmanFileWatcher {
         project_root: &AbsNormPath,
         root_config: &LegacyBuckConfig,
         cells: CellResolver,
-        ignore_specs: HashMap<CellName, IgnoreSet>,
+        ignore_specs: StdBuckHashMap<CellName, IgnoreSet>,
     ) -> buck2_error::Result<Self> {
         let watchman_merge_base = root_config
             .get(BuckconfigKeyRef {
@@ -381,6 +390,9 @@ impl WatchmanFileWatcher {
             })?
             .unwrap_or(false);
 
+        let dice_clear_on_mergebase_change =
+            crate::file_watcher::dice_clear_on_mergebase_change(root_config)?;
+
         let query = SyncableQuery::new(
             Connector::new(),
             project_root,
@@ -400,6 +412,7 @@ impl WatchmanFileWatcher {
             }),
             watchman_merge_base,
             empty_on_fresh_instance,
+            dice_clear_on_mergebase_change,
         )?;
 
         Ok(Self { query })

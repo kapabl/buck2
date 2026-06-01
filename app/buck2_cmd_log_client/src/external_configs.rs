@@ -34,13 +34,7 @@ const CLI: &str = "cli";
 pub struct ExternalConfigsCommand {
     #[clap(flatten)]
     event_log: EventLogOptions,
-    #[clap(
-        long,
-        help = "Which output format to use for this command",
-        default_value = "tabulated",
-        ignore_case = true,
-        value_enum
-    )]
+    #[clap(flatten)]
     format: LogCommandOutputFormat,
 }
 
@@ -64,17 +58,12 @@ impl BuckSubcommand for ExternalConfigsCommand {
         )?;
 
         while let Some(event) = events.try_next().await? {
-            match event {
-                StreamValue::Event(event) => match event.data {
-                    Some(buck2_data::buck_event::Data::Instant(instant)) => match instant.data {
-                        Some(buck2_data::instant_event::Data::BuckconfigInputValues(configs)) => {
-                            log_external_configs(&configs.components, format.clone()).await?;
-                        }
-                        _ => {}
-                    },
-                    _ => {}
-                },
-                _ => {}
+            if let StreamValue::Event(event) = event
+                && let Some(buck2_data::buck_event::Data::Instant(instant)) = event.data
+                && let Some(buck2_data::instant_event::Data::BuckconfigInputValues(configs)) =
+                    instant.data
+            {
+                log_external_configs(&configs.components, format.clone()).await?;
             }
         }
 
@@ -113,7 +102,8 @@ fn write_config_value<'a>(
     };
 
     match &mut log_writer {
-        LogCommandOutputFormatWithWriter::Tabulated(writer) => {
+        LogCommandOutputFormatWithWriter::Readable(writer)
+        | LogCommandOutputFormatWithWriter::Tabulated(writer) => {
             writeln!(
                 writer,
                 "{}.{} = {}\t{}\t{}",
@@ -141,7 +131,7 @@ fn write_config_value<'a>(
 
 fn write_config_values(
     global_external_config: &GlobalExternalConfig,
-    mut log_writer: &mut LogCommandOutputFormatWithWriter,
+    log_writer: &mut LogCommandOutputFormatWithWriter,
 ) -> buck2_error::Result<()> {
     global_external_config
         .values
@@ -150,7 +140,7 @@ fn write_config_values(
             write_config_value(
                 config_value,
                 &global_external_config.origin_path,
-                &mut log_writer,
+                log_writer,
             )
         })
 }
@@ -162,7 +152,8 @@ fn write_config_file(
     let origin = "config-file";
     let config_file = ExternalConfigFileEntry { path, origin };
     match &mut log_writer {
-        LogCommandOutputFormatWithWriter::Tabulated(writer) => {
+        LogCommandOutputFormatWithWriter::Readable(writer)
+        | LogCommandOutputFormatWithWriter::Tabulated(writer) => {
             writeln!(writer, "{path}\t\t{origin}")?;
         }
         LogCommandOutputFormatWithWriter::Json(writer) => {
@@ -201,7 +192,7 @@ async fn log_external_configs(
                     .as_ref()
                     .into_iter()
                     .try_for_each(|data| match data {
-                        CData::ProjectRelativePath(p) => write_config_file(&p, &mut log_writer),
+                        CData::ProjectRelativePath(p) => write_config_file(p, &mut log_writer),
                         CData::GlobalExternalConfig(external_config_values) => {
                             write_config_values(external_config_values, &mut log_writer)
                         }

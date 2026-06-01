@@ -13,23 +13,27 @@ use std::time::Instant;
 
 use buck2_artifact::actions::key::ActionKey;
 use buck2_core::deferred::key::DeferredHolderKey;
+use buck2_core::soft_error;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
 use buck2_error::internal_error;
+use buck2_hash::BuckHashSet;
 use dupe::Dupe;
-use fxhash::FxHashSet;
 
 use crate::build::detailed_aggregated_metrics::FxMultiMap;
+use crate::build::detailed_aggregated_metrics::buck2_sketches::compute_action_graph_sketch;
 use crate::build::detailed_aggregated_metrics::events::DetailedAggregatedMetricsEvent;
 use crate::build::detailed_aggregated_metrics::events::DetailedAggregatedMetricsEventHandler;
 use crate::build::detailed_aggregated_metrics::implementation::traverse::traverse_partial_action_graph;
 use crate::build::detailed_aggregated_metrics::implementation::traverse::traverse_target_graph;
 use crate::build::detailed_aggregated_metrics::types::ActionExecutionMetrics;
+use crate::build::detailed_aggregated_metrics::types::ActionGraphSketchResult;
 use crate::build::detailed_aggregated_metrics::types::AllTargetsAggregatedData;
 use crate::build::detailed_aggregated_metrics::types::AnalysisMetrics;
 use crate::build::detailed_aggregated_metrics::types::BuiltWhen;
 use crate::build::detailed_aggregated_metrics::types::DetailedAggregatedMetrics;
 use crate::build::detailed_aggregated_metrics::types::PerBuildEvents;
 use crate::build::detailed_aggregated_metrics::types::TopLevelTargetAggregatedData;
+use crate::build::detailed_aggregated_metrics::types::TopLevelTargetSpec;
 use crate::deferred::calculation::DeferredHolder;
 
 /// Tracks the state required to compute aggregated metrics.
@@ -42,8 +46,8 @@ use crate::deferred::calculation::DeferredHolder;
 /// build it occurred in. We expect the user to track which executions are relevant to the current build,
 /// and use that later to compute metrics both over the whole graph and just specific to the current build.
 pub struct DetailedAggregatedMetricsStateTracker {
-    observed_executions: fxhash::FxHashMap<ActionKey, ActionExecutionMetrics>,
-    analysis_nodes: Arc<fxhash::FxHashMap<DeferredHolderKey, DeferredHolder>>,
+    observed_executions: buck2_hash::BuckHashMap<ActionKey, ActionExecutionMetrics>,
+    analysis_nodes: Arc<buck2_hash::BuckHashMap<DeferredHolderKey, DeferredHolder>>,
 }
 
 impl DetailedAggregatedMetricsStateTracker {
@@ -67,8 +71,8 @@ impl DetailedAggregatedMetricsStateTracker {
 
     fn new() -> Self {
         Self {
-            analysis_nodes: Arc::new(fxhash::FxHashMap::default()),
-            observed_executions: fxhash::FxHashMap::default(),
+            analysis_nodes: Arc::new(buck2_hash::BuckHashMap::default()),
+            observed_executions: buck2_hash::BuckHashMap::default(),
         }
     }
 
@@ -84,6 +88,9 @@ impl DetailedAggregatedMetricsStateTracker {
             }
             DetailedAggregatedMetricsEvent::ComputeMetrics(events, sender) => {
                 drop(sender.send(self.compute_metrics(events).await))
+            }
+            DetailedAggregatedMetricsEvent::ComputeActionGraphSketch(top_level_targets, sender) => {
+                drop(sender.send(self.compute_action_graph_sketch(&top_level_targets).await))
             }
             DetailedAggregatedMetricsEvent::ActionExecuted(metrics) => {
                 self.observed_executions.insert(metrics.key.dupe(), metrics);
@@ -103,8 +110,9 @@ impl DetailedAggregatedMetricsStateTracker {
             .enumerate()
             .map(|(idx, spec)| {
                 let analysis_nodes = self.analysis_nodes.dupe();
+                let rule_type_name = spec.target.rule_type().name().to_owned();
                 tokio::task::spawn_blocking(move || {
-                    let mut target_graph = FxHashSet::default();
+                    let mut target_graph = BuckHashSet::default();
                     traverse_target_graph(&spec.target, |target| {
                         target_graph.insert(target.dupe());
                     });
@@ -112,7 +120,14 @@ impl DetailedAggregatedMetricsStateTracker {
                         spec.outputs.iter().map(|(artifact, _)| artifact),
                         &analysis_nodes,
                     );
-                    (idx, spec.label, target_graph, action_graph_result)
+
+                    (
+                        idx,
+                        spec.label,
+                        rule_type_name,
+                        target_graph,
+                        action_graph_result,
+                    )
                 })
             });
 
@@ -123,13 +138,15 @@ impl DetailedAggregatedMetricsStateTracker {
         let mut all_complete = true;
         let mut agg_data = Vec::new();
 
-        for (idx, label, target_graph, action_graph_result) in results {
+        for (idx, label, rule_type_name, target_graph, action_graph_result) in results {
             for target in target_graph {
                 target_mappings.insert(target, idx);
             }
             let (action_graph_complete, action_graph) = action_graph_result?;
+
             agg_data.push(TopLevelTargetAggregatedData::new(
                 label,
+                rule_type_name,
                 if action_graph_complete {
                     Some(action_graph.len())
                 } else {
@@ -185,6 +202,40 @@ impl DetailedAggregatedMetricsStateTracker {
         Ok(DetailedAggregatedMetrics {
             all_targets_build_metrics: all_targets_data,
             top_level_target_metrics: agg_data,
+        })
+    }
+
+    async fn compute_action_graph_sketch(
+        &self,
+        top_level_targets: &[TopLevelTargetSpec],
+    ) -> buck2_error::Result<ActionGraphSketchResult> {
+        let futures = top_level_targets.iter().map(|spec| {
+            let analysis_nodes = self.analysis_nodes.dupe();
+            let label = spec.label.clone();
+            let outputs = spec.outputs.dupe();
+            tokio::task::spawn_blocking(move || {
+                match compute_action_graph_sketch(
+                    outputs.iter().map(|(artifact, _)| artifact),
+                    &analysis_nodes,
+                ) {
+                    Ok((_complete, sketch)) if !sketch.is_empty() => (label, Some(sketch)),
+                    Ok(_) => (label, None),
+                    Err(e) => {
+                        let _ignored = soft_error!(
+                            "action_graph_sketch_computation_error",
+                            e,
+                            quiet: true
+                        );
+                        (label, None)
+                    }
+                }
+            })
+        });
+
+        let results = buck2_util::future::try_join_all(futures).await?;
+
+        Ok(ActionGraphSketchResult {
+            per_target_sketches: results,
         })
     }
 }

@@ -8,7 +8,6 @@
  * above-listed licenses.
  */
 
-use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,7 +15,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use buck2_build_api::actions::artifact::get_artifact_fs::GetArtifactFs;
-use buck2_build_api::actions::calculation::get_target_rule_type_name;
 use buck2_build_api::analysis::calculation::RuleAnalysisCalculation;
 use buck2_build_api::build::AsyncBuildTargetResultBuilder;
 use buck2_build_api::build::BuildConfiguredLabelOptions;
@@ -28,7 +26,7 @@ use buck2_build_api::build::ConfiguredBuildEventVariant;
 use buck2_build_api::build::ProvidersToBuild;
 use buck2_build_api::build::build_configured_label;
 use buck2_build_api::build::build_report::build_report_opts;
-use buck2_build_api::build::build_report::generate_build_report;
+use buck2_build_api::build::build_report::write_build_report;
 use buck2_build_api::interpreter::rule_defs::provider::builtin::run_info::FrozenRunInfo;
 use buck2_build_api::interpreter::rule_defs::provider::collection::FrozenProviderCollectionValue;
 use buck2_build_api::interpreter::rule_defs::provider::test_provider::TestProvider;
@@ -50,7 +48,7 @@ use buck2_common::pattern::resolve::ResolveTargetPatterns;
 use buck2_common::pattern::resolve::ResolvedPattern;
 use buck2_core::cells::CellResolver;
 use buck2_core::cells::name::CellName;
-use buck2_core::configuration::compatibility::MaybeCompatible;
+use buck2_core::configuration::compatibility::ResultMaybeCompatible;
 use buck2_core::global_cfg_options::GlobalCfgOptions;
 use buck2_core::package::PackageLabelWithModifiers;
 use buck2_core::pattern::pattern::Modifiers;
@@ -66,10 +64,15 @@ use buck2_core::target::label::label::TargetLabel;
 use buck2_data::BuildResult;
 use buck2_error::BuckErrorContext;
 use buck2_error::ErrorTag;
+use buck2_error::internal_error;
 use buck2_events::dispatch::console_message;
+use buck2_events::dispatch::instant_event;
 use buck2_events::dispatch::with_dispatcher_async;
+use buck2_fs::error::IoResultExt;
 use buck2_fs::fs_util;
 use buck2_fs::paths::abs_path::AbsPathBuf;
+use buck2_hash::BuckIndexSet;
+use buck2_hash::StdBuckHashSet;
 use buck2_interpreter::extra::InterpreterHostPlatform;
 use buck2_interpreter_for_build::interpreter::context::HasInterpreterContext;
 use buck2_node::load_patterns::MissingTargetBehavior;
@@ -100,7 +103,6 @@ use futures::future::FutureExt;
 use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
-use indexmap::IndexSet;
 use itertools::Itertools;
 
 use crate::downward_api::BuckTestDownwardApi;
@@ -124,11 +126,10 @@ struct TestOutcome {
 }
 
 impl TestOutcome {
-    fn exit_code(&self) -> buck2_error::Result<Option<i32>> {
+    fn exit_code(&self) -> buck2_error::Result<i32> {
         self.executor_report
             .exit_code
-            .buck_error_context("Test executor did not provide an exit code")
-            .map(Some)
+            .ok_or_else(|| internal_error!("Test executor did not provide an exit code"))
     }
 }
 
@@ -170,7 +171,7 @@ impl CounterWithExamples {
         }
     }
 
-    fn to_cli_proto_counter(self) -> buck2_cli_proto::CounterWithExamples {
+    fn into_cli_proto_counter(self) -> buck2_cli_proto::CounterWithExamples {
         buck2_cli_proto::CounterWithExamples {
             count: self.count,
             max: self.max,
@@ -194,6 +195,7 @@ struct TestStatuses {
     skipped: CounterWithExamples,
     omitted: CounterWithExamples,
     failed: CounterWithExamples,
+    timed_out: CounterWithExamples,
     infra_failure: CounterWithExamples,
     fatals: CounterWithExamples,
     listing_success: CounterWithExamples,
@@ -207,7 +209,7 @@ impl TestStatuses {
             TestStatus::SKIP => self.skipped.add(&result.name),
             TestStatus::OMITTED => self.omitted.add(&result.name),
             TestStatus::FATAL => self.fatals.add(&result.name),
-            TestStatus::TIMEOUT => self.failed.add(&result.name),
+            TestStatus::TIMEOUT => self.timed_out.add(&result.name),
             TestStatus::INFRA_FAILURE => self.infra_failure.add(&result.name),
             TestStatus::UNKNOWN => {}
             TestStatus::RERUN => {}
@@ -215,27 +217,6 @@ impl TestStatuses {
             TestStatus::LISTING_FAILED => self.listing_failed.add(&result.name),
         }
     }
-}
-
-#[derive(Debug, buck2_error::Error)]
-#[buck2(tag = TestExecutor)]
-enum TestError {
-    #[error("Test execution completed but the tests failed")]
-    #[buck2(tag = Input)]
-    TestFailed,
-    #[error("Test execution completed but tests were skipped")]
-    #[buck2(tag = Input)]
-    TestSkipped,
-    #[error("Tests were filtered out and not run")]
-    #[buck2(tag = Input)]
-    TestOmitted,
-    #[error("Test listing failed")]
-    #[buck2(tag = Input)]
-    ListingFailed,
-    #[error("Fatal error encountered during test execution")]
-    Fatal,
-    #[error("Infra Failure error encountered during test execution")]
-    InfraFailure,
 }
 
 #[derive(Debug, buck2_error_derive::Error)]
@@ -318,7 +299,7 @@ async fn test(
         request
             .target_cfg
             .as_ref()
-            .internal_error("target_cfg must be set")?,
+            .ok_or_else(|| internal_error!("target_cfg must be set"))?,
         server_ctx,
         &mut ctx,
     )
@@ -397,7 +378,7 @@ async fn test(
     let options = request
         .session_options
         .as_ref()
-        .buck_error_context("Missing `options`")?;
+        .ok_or_else(|| internal_error!("Missing `options`"))?;
 
     let session = TestSession::new(TestSessionOptions {
         allow_re: options.allow_re,
@@ -408,7 +389,7 @@ async fn test(
     let build_opts = request
         .build_opts
         .as_ref()
-        .buck_error_context("should have build options")?;
+        .ok_or_else(|| internal_error!("should have build options"))?;
 
     let timeout = request
         .timeout
@@ -419,11 +400,21 @@ async fn test(
 
     let project_root = server_ctx.project_root();
     let tpx_experiments = get_tpx_experiments(ctx.dupe(), project_root).await?;
+
+    // Forward AI agent identity to TPX as run tags (e.g. ai_agent_id=claude_code).
+    #[allow(unused_mut)]
+    let mut extra_tpx_args: Vec<String> = Vec::new();
+    #[cfg(fbcode_build)]
+    extra_tpx_args.extend(ai_agent_tpx_args(&client_ctx.agent_context));
+
+    let mut test_executor_args = request.test_executor_args.clone();
+    test_executor_args.extend(extra_tpx_args);
+
     let test_outcome = test_targets(
         ctx.dupe(),
         resolved_pattern,
         global_cfg_options,
-        request.test_executor_args.clone(),
+        test_executor_args,
         Arc::new(TestLabelFiltering::new(
             request.included_labels.clone(),
             request.excluded_labels.clone(),
@@ -451,9 +442,7 @@ async fn test(
     );
 
     // TODO(bobyf) remap exit code for buck reserved exit code
-    let exit_code = test_outcome
-        .exit_code()
-        .buck_error_context("No exit code available")?;
+    let executor_exit_code = test_outcome.exit_code()?;
 
     // Filtering out individual types might not be best here. While we just have 1 non-build
     // error that seems OK, but if we add more we should reconsider (we could add a type on all
@@ -472,56 +461,63 @@ async fn test(
                 .executor_report
                 .statuses
                 .passed
-                .to_cli_proto_counter(),
+                .into_cli_proto_counter(),
         ),
         skipped: Some(
             test_outcome
                 .executor_report
                 .statuses
                 .skipped
-                .to_cli_proto_counter(),
+                .into_cli_proto_counter(),
         ),
         omitted: Some(
             test_outcome
                 .executor_report
                 .statuses
                 .omitted
-                .to_cli_proto_counter(),
+                .into_cli_proto_counter(),
         ),
         failed: Some(
             test_outcome
                 .executor_report
                 .statuses
                 .failed
-                .to_cli_proto_counter(),
+                .into_cli_proto_counter(),
         ),
         fatals: Some(
             test_outcome
                 .executor_report
                 .statuses
                 .fatals
-                .to_cli_proto_counter(),
+                .into_cli_proto_counter(),
         ),
         infra_failure: Some(
             test_outcome
                 .executor_report
                 .statuses
                 .infra_failure
-                .to_cli_proto_counter(),
+                .into_cli_proto_counter(),
         ),
         listing_success: Some(
             test_outcome
                 .executor_report
                 .statuses
                 .listing_success
-                .to_cli_proto_counter(),
+                .into_cli_proto_counter(),
         ),
         listing_failed: Some(
             test_outcome
                 .executor_report
                 .statuses
                 .listing_failed
-                .to_cli_proto_counter(),
+                .into_cli_proto_counter(),
+        ),
+        timed_out: Some(
+            test_outcome
+                .executor_report
+                .statuses
+                .timed_out
+                .into_cli_proto_counter(),
         ),
         build_errors: build_errors_count,
     };
@@ -531,7 +527,7 @@ async fn test(
         let build_report_opts =
             build_report_opts(&mut ctx, &cell_resolver, build_opts, Default::default()).await?;
 
-        generate_build_report(
+        write_build_report(
             build_report_opts,
             &artifact_fs,
             &cell_resolver,
@@ -544,83 +540,25 @@ async fn test(
                 .configured_to_pattern_modifiers,
             &test_outcome.build_target_result.other_errors,
             None,
+            None,
+            None,
         )?
     } else {
         None
     };
 
-    let mut target_rule_type_names: Vec<String> = Vec::new();
-    for configured in test_outcome.build_target_result.configured.keys() {
-        target_rule_type_names
-            .push(get_target_rule_type_name(&mut ctx, &configured.target()).await?);
-    }
-
-    let exit_code_overide = if test_outcome.errors.is_empty() {
-        exit_code
-    } else {
-        None
-    };
-
-    let mut errors = test_outcome.errors;
-    if let Some(failed) = &test_statuses.failed {
-        if failed.count > 0 {
-            errors.push(buck2_data::ErrorReport::from(&TestError::TestFailed.into()));
-        }
-    }
-    if let Some(infra_failure) = &test_statuses.infra_failure {
-        if infra_failure.count > 0 {
-            errors.push(buck2_data::ErrorReport::from(
-                &TestError::InfraFailure.into(),
-            ));
-        }
-    }
-    if let Some(fatal) = &test_statuses.fatals {
-        if fatal.count > 0 {
-            errors.push(buck2_data::ErrorReport::from(&TestError::Fatal.into()));
-        }
-    }
-    if let Some(listing_failed) = &test_statuses.listing_failed {
-        if listing_failed.count > 0 {
-            errors.push(buck2_data::ErrorReport::from(
-                &TestError::ListingFailed.into(),
-            ));
-        }
-    }
-    // If a test was skipped due to condition not being met a non-zero exit code will be returned,
-    // this doesn't seem quite right, but for now just tag it with TestSkipped to track occurrence.
-    if let Some(skipped) = &test_statuses.skipped {
-        if skipped.count > 0 && exit_code.is_none_or(|code| code != 0) {
-            errors.push(buck2_data::ErrorReport::from(
-                &TestError::TestSkipped.into(),
-            ));
-        }
-    }
-    if let Some(omitted) = &test_statuses.omitted {
-        if omitted.count > 0 {
-            errors.push(buck2_data::ErrorReport::from(
-                &TestError::TestOmitted.into(),
-            ));
-        }
-    }
-
-    if let Some(code) = exit_code {
-        if errors.is_empty() && code != 0 {
-            errors.push(buck2_data::ErrorReport::from(&buck2_error::buck2_error!(
-                buck2_error::ErrorTag::TestExecutor,
-                "Test Executor Failed with exit code {code}"
-            )))
-        }
-    }
-
     Ok(TestResponse {
-        exit_code: exit_code_overide,
-        errors,
+        executor_exit_code,
+        errors: test_outcome.errors,
         test_statuses: Some(test_statuses),
         executor_stdout: test_outcome.executor_stdout,
         executor_stderr: test_outcome.executor_stderr,
         executor_info_messages: test_outcome.executor_report.info_messages,
         serialized_build_report,
-        target_rule_type_names,
+        // Rule types are sourced from `TargetRuleTypeName` instant events
+        // emitted in `TestDriver::interpret_targets` and accumulated by the
+        // invocation recorder.
+        target_rule_type_names: Vec::new(),
     })
 }
 
@@ -640,7 +578,7 @@ async fn test_targets(
     ignore_tests_attribute: bool,
     build_default_info: bool,
     build_run_info: bool,
-    tpx_experiments: HashSet<String>,
+    tpx_experiments: StdBuckHashSet<String>,
 ) -> buck2_error::Result<TestOutcome> {
     let session = Arc::new(session);
 
@@ -783,7 +721,7 @@ async fn test_targets(
                     .buck_error_context("Failed to release local resources")?;
 
                 // Process the build errors we've collected.
-                let mut builder = BuildTargetResultBuilder::new(None);
+                let mut builder = BuildTargetResultBuilder::new(None, std::time::Instant::now());
                 for event in driver.error_events {
                     builder.event(event)?;
                 }
@@ -892,8 +830,8 @@ struct TestDriverState<'a, 'e> {
 struct TestDriver<'a, 'e> {
     state: TestDriverState<'a, 'e>,
     work: FuturesUnordered<BoxFuture<'a, ControlFlow<Vec<BuildEvent>, Vec<TestDriverTask>>>>,
-    labels_configured: HashSet<(ProvidersLabelWithModifiers, bool)>,
-    labels_tested: HashSet<ConfiguredProvidersLabel>,
+    labels_configured: StdBuckHashSet<(ProvidersLabelWithModifiers, bool)>,
+    labels_tested: StdBuckHashSet<ConfiguredProvidersLabel>,
     error_events: Vec<BuildEvent>,
     build_target_result: BuildTargetResult,
 }
@@ -903,8 +841,8 @@ impl<'a, 'e> TestDriver<'a, 'e> {
         Self {
             state,
             work: FuturesUnordered::new(),
-            labels_configured: HashSet::new(),
-            labels_tested: HashSet::new(),
+            labels_configured: StdBuckHashSet::default(),
+            labels_tested: StdBuckHashSet::default(),
             error_events: Vec::new(),
             build_target_result: BuildTargetResult::new(),
         }
@@ -1017,7 +955,7 @@ impl<'a, 'e> TestDriver<'a, 'e> {
                 {
                     Ok(res) => res,
                     Err(e) => {
-                        let e: buck2_error::Error = e.into();
+                        let e: buck2_error::Error = e;
                         let mut events = Vec::new();
                         // Try to associate the error to concrete targets, if possible
                         match spec {
@@ -1076,6 +1014,14 @@ impl<'a, 'e> TestDriver<'a, 'e> {
                     targets
                         .into_iter()
                         .map(|((target_name, providers_pattern), target_node)| {
+                            // Emit one rule-type event per CLI-resolved top-level target so the
+                            // invocation recorder can populate
+                            // `InvocationRecord.target_rule_type_names`. Covers every rule kind,
+                            // including non-test rules like `genrule`/`cxx_library` siblings that
+                            // tests get bundled with via macros.
+                            instant_event(buck2_data::TargetRuleTypeName {
+                                rule_type: target_node.rule_type().name().to_owned(),
+                            });
                             (
                                 providers_pattern.into_providers_label_with_modifiers(
                                     package.dupe(),
@@ -1141,7 +1087,7 @@ impl<'a, 'e> TestDriver<'a, 'e> {
                 Err(e) => {
                     return ControlFlow::Break(vec![BuildEvent::OtherError {
                         label: Some(providers_label),
-                        err: e.into(),
+                        err: e,
                     }]);
                 }
             };
@@ -1152,18 +1098,8 @@ impl<'a, 'e> TestDriver<'a, 'e> {
                 .get_configured_target_node(label.target())
                 .await
             {
-                Ok(node) => node,
-                Err(e) => {
-                    return ControlFlow::Break(create_and_map_configured_build_error(
-                        label,
-                        e.into(),
-                        modifiers,
-                    ));
-                }
-            };
-
-            let node = match node {
-                MaybeCompatible::Incompatible(reason) => {
+                ResultMaybeCompatible::Compatible(node) => node,
+                ResultMaybeCompatible::Incompatible(reason) => {
                     if skippable {
                         //TODO: add aggregated error message
                         tracing::debug!("{}", reason.skipping_message(label.target()));
@@ -1176,7 +1112,11 @@ impl<'a, 'e> TestDriver<'a, 'e> {
                         ));
                     }
                 }
-                MaybeCompatible::Compatible(node) => node,
+                ResultMaybeCompatible::Err(e) => {
+                    return ControlFlow::Break(create_and_map_configured_build_error(
+                        label, e, modifiers,
+                    ));
+                }
             };
 
             let oncall = node.oncall().map(|s| s.to_owned());
@@ -1250,7 +1190,7 @@ impl<'a, 'e> TestDriver<'a, 'e> {
                 .with_linear_recompute(|ctx| async move {
                     build_target_result(
                         &ctx,
-                        &state.label_filtering,
+                        state.label_filtering,
                         build_label,
                         modifiers_dupe,
                         state.build_default_info,
@@ -1355,20 +1295,19 @@ async fn build_target_result(
         if skip_build_based_on_labels {
             return Ok((BuildTargetResult::new(), providers));
         }
-    } else {
-        if !(build_default_info
-            || build_run_info
-                && providers
-                    .provider_collection()
-                    .builtin_provider::<FrozenRunInfo>()
-                    .is_some())
-        {
-            return Ok((BuildTargetResult::new(), providers));
-        }
+    } else if !(build_default_info
+        || build_run_info
+            && providers
+                .provider_collection()
+                .builtin_provider::<FrozenRunInfo>()
+                .is_some())
+    {
+        return Ok((BuildTargetResult::new(), providers));
     }
 
     let materialization_and_upload = MaterializationAndUploadContext::skip();
-    let (result_builder, consumer) = AsyncBuildTargetResultBuilder::new(None);
+    let (result_builder, consumer) =
+        AsyncBuildTargetResultBuilder::new(None, std::time::Instant::now());
     consumer.consume(BuildEvent::new_configured(
         label.dupe(),
         ConfiguredBuildEventVariant::MapModifiers { modifiers },
@@ -1378,8 +1317,8 @@ async fn build_target_result(
             false,
             build_configured_label(
                 &consumer,
-                &ctx,
-                &materialization_and_upload,
+                ctx,
+                materialization_and_upload,
                 label,
                 &ProvidersToBuild {
                     default: build_default_info,
@@ -1447,8 +1386,13 @@ fn convert_error(build_result: &BuildTargetResult) -> Vec<buck2_error::Error> {
     errors.extend(build_result.other_errors.values().flatten().duped());
 
     for v in build_result.configured.values().flatten() {
-        errors.extend(v.errors.iter().duped());
-        errors.extend(v.outputs.iter().filter_map(|x| x.as_ref().err()).duped());
+        errors.extend(v.errors.iter().map(|t| t.inner.dupe()));
+        errors.extend(
+            v.outputs
+                .iter()
+                .filter_map(|x| x.inner.as_ref().err())
+                .duped(),
+        );
     }
 
     errors
@@ -1512,9 +1456,9 @@ struct TestLabelFiltering {
     /// If positive include label filters are present, then this filter will ONLY match sets of
     /// labels that contains the label filter. Otherwise, if only exclusion filters are present, or
     /// no label filters are present, this will match any set of labels as long as its not excluded.
-    included_labels: IndexSet<String>,
+    included_labels: BuckIndexSet<String>,
     /// Additional excluded labels. These have order of precedence after `included_labels`.
-    excluded_labels: IndexSet<String>,
+    excluded_labels: BuckIndexSet<String>,
     /// If true, ignores order of precedence such that as long as an exclusion filter matches, we
     /// don't match the set of labels.
     always_exclude: bool,
@@ -1619,6 +1563,9 @@ fn generate_config_entry_args(
                         target_platforms.push_str(s);
                     }
                 }
+                representative_config_flag::Source::TargetUniverse(_) => {
+                    // Target universe is not passed to TPX
+                }
             }
         }
     }
@@ -1651,14 +1598,25 @@ fn post_process_test_executor(s: &str) -> buck2_error::Result<PathBuf> {
             let exe = AbsPathBuf::new(
                 std::env::current_exe().buck_error_context("Cannot get Buck2 executable")?,
             )?;
-            let exe = fs_util::canonicalize(&exe).buck_error_context(
-                "Failed to canonicalize path to Buck2 executable. Try running `buck2 kill`.",
-            )?;
+            // On Linux, /proc/self/exe appends " (deleted)" to the path when the
+            // binary has been removed from disk (e.g. after a buck2 upgrade).
+            if exe.as_path().to_string_lossy().ends_with(" (deleted)") {
+                return Err(buck2_error::buck2_error!(
+                    ErrorTag::BuckdExeDeleted,
+                    "The buck2 daemon's binary has been deleted from disk. \
+                     Run `buck2 kill` to restart the daemon with the current binary."
+                ));
+            }
+            let exe = fs_util::canonicalize(&exe)
+                .categorize_internal()
+                .buck_error_context(
+                    "Failed to canonicalize path to Buck2 executable. Try running `buck2 kill`.",
+                )?;
 
             let exe = exe.as_abs_path();
             let exe_dir = exe
                 .parent()
-                .buck_error_context("Buck2 executable directory has no parent")?;
+                .ok_or_else(|| internal_error!("Buck2 executable directory has no parent"))?;
 
             Ok(exe_dir.join(rest).to_path_buf())
         }
@@ -1671,12 +1629,50 @@ fn post_process_test_executor(s: &str) -> buck2_error::Result<PathBuf> {
     }
 }
 
+/// Generates `--tags` TPX args from agent context entries.
+/// Tags exceeding 80 chars are silently dropped to avoid TPX failures
+/// (testinfra MAXIMUM_TAG_LENGTH = 80).
+#[cfg(any(fbcode_build, test))]
+fn ai_agent_tpx_args(agent_context: &[buck2_data::AgentContextEntry]) -> Vec<String> {
+    use buck2_data::AgentContextEntry;
+
+    const MAX_TAG_LEN: usize = 80;
+
+    let find = |key: &str| agent_context.iter().find(|e| e.key == key);
+
+    let Some(id_entry) = find(AgentContextEntry::KEY_ID) else {
+        return Vec::new();
+    };
+
+    let mut args = Vec::new();
+    let mut push_tag = |tag: String| {
+        if tag.len() <= MAX_TAG_LEN {
+            args.extend(["--tags".to_owned(), tag]);
+        }
+    };
+
+    push_tag("ai-agent".to_owned());
+    push_tag(format!("ai_agent_id={}", &id_entry.value));
+
+    if let Some(inv) = find(AgentContextEntry::KEY_INVOCATION_ID) {
+        let inv_id = inv
+            .value
+            .rsplit_once("_invocation_")
+            .map_or(inv.value.as_str(), |(_, uuid)| uuid);
+        push_tag(format!("ai_inv_id={}", inv_id));
+    }
+
+    args
+}
+
 #[cfg(test)]
 mod tests {
     use buck2_cli_proto::RepresentativeConfigFlag;
     use buck2_cli_proto::representative_config_flag;
+    use buck2_data::AgentContextEntry;
 
     use crate::command::TestLabelFiltering;
+    use crate::command::ai_agent_tpx_args;
     use crate::command::generate_config_entry_args;
 
     #[test]
@@ -1823,10 +1819,17 @@ mod tests {
                     "platform1".to_owned(),
                 )),
             },
+            RepresentativeConfigFlag {
+                source: Some(representative_config_flag::Source::TargetUniverse(
+                    "//uni:target".to_owned(),
+                )),
+            },
         ];
 
         generate_config_entry_args(&mut args, &config_flags);
 
+        // TargetUniverse is intentionally not passed to TPX, so the output
+        // should contain all other types but no entry for target_universe.
         let expected = vec![
             "--config-entry",
             "config=config_key=config_value",
@@ -1894,5 +1897,82 @@ mod tests {
         generate_config_entry_args(&mut args, &config_flags);
 
         assert_eq!(args, vec!["--config-entry", "config=key=value"]);
+    }
+
+    fn agent_entry(key: &str, value: &str) -> AgentContextEntry {
+        AgentContextEntry {
+            key: key.to_owned(),
+            value: value.to_owned(),
+        }
+    }
+
+    #[test]
+    fn test_ai_agent_tpx_args_claude_code() {
+        let ctx = vec![
+            agent_entry("id", "claude_code"),
+            agent_entry(
+                "invocation_id",
+                "claude_code_invocation_c9e892fa-148a-4494-8466-c1f44f1647d3",
+            ),
+        ];
+        assert_eq!(
+            ai_agent_tpx_args(&ctx),
+            vec![
+                "--tags",
+                "ai-agent",
+                "--tags",
+                "ai_agent_id=claude_code",
+                "--tags",
+                "ai_inv_id=c9e892fa-148a-4494-8466-c1f44f1647d3",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ai_agent_tpx_args_devmate() {
+        let ctx = vec![
+            agent_entry("id", "devmate_vscode"),
+            agent_entry(
+                "invocation_id",
+                "agent--38920caa-4558-45dd-bc90-b6abff501f8a",
+            ),
+        ];
+        let args = ai_agent_tpx_args(&ctx);
+        assert_eq!(
+            args,
+            vec![
+                "--tags",
+                "ai-agent",
+                "--tags",
+                "ai_agent_id=devmate_vscode",
+                "--tags",
+                "ai_inv_id=agent--38920caa-4558-45dd-bc90-b6abff501f8a",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ai_agent_tpx_args_no_invocation_id() {
+        let ctx = vec![agent_entry("id", "some_agent")];
+        assert_eq!(
+            ai_agent_tpx_args(&ctx),
+            vec!["--tags", "ai-agent", "--tags", "ai_agent_id=some_agent"]
+        );
+    }
+
+    #[test]
+    fn test_ai_agent_tpx_args_no_agent() {
+        let ctx = vec![agent_entry("intent", "build")];
+        let args = ai_agent_tpx_args(&ctx);
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_ai_agent_tpx_args_tag_too_long() {
+        let long_name = "a".repeat(80); // ai_agent_id= is 14 chars + 80 = 94 > 80
+        let ctx = vec![agent_entry("id", &long_name)];
+        let args = ai_agent_tpx_args(&ctx);
+        // ai-agent (8 chars) is kept, ai_agent_id=aaa... (94 chars) is dropped
+        assert_eq!(args, vec!["--tags", "ai-agent"]);
     }
 }

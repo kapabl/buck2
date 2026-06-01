@@ -12,6 +12,7 @@ use allocative::Allocative;
 use buck2_core::cells::name::CellName;
 use buck2_core::cells::nested::NestedCells;
 use buck2_core::cells::unchecked_cell_rel_path::UncheckedCellRelativePath;
+use pagable::Pagable;
 
 use crate::ignores::ignore_set::IgnoreSet;
 
@@ -70,15 +71,12 @@ impl FileIgnoreResult {
 
     /// Returns true if the file is ignored, false otherwise.
     pub fn is_ignored(&self) -> bool {
-        match self {
-            FileIgnoreResult::Ok => false,
-            _ => true,
-        }
+        !matches!(self, FileIgnoreResult::Ok)
     }
 }
 
 /// Ignores files based on configured ignore patterns and cell paths.
-#[derive(PartialEq, Eq, Allocative, Debug)]
+#[derive(PartialEq, Eq, Allocative, Debug, Pagable)]
 pub struct CellFileIgnores {
     ignores: IgnoreSet,
     cell_ignores: NestedCells,
@@ -153,8 +151,7 @@ mod tests {
             true,
         )?;
 
-        assert_eq!(
-            true,
+        assert!(
             ignores
                 .check(UncheckedCellRelativePath::unchecked_new(
                     "some/long/path/Class.java"
@@ -162,15 +159,13 @@ mod tests {
                 .is_ignored()
         );
 
-        assert_eq!(
-            true,
+        assert!(
             ignores
                 .check(UncheckedCellRelativePath::unchecked_new("other_cell"))
                 .is_ignored()
         );
 
-        assert_eq!(
-            true,
+        assert!(
             ignores
                 .check(UncheckedCellRelativePath::unchecked_new(
                     "other_cell/some/lib"
@@ -178,22 +173,19 @@ mod tests {
                 .is_ignored()
         );
 
-        assert_eq!(
-            false,
-            ignores
+        assert!(
+            !ignores
                 .check(UncheckedCellRelativePath::unchecked_new("third"))
                 .is_ignored()
         );
 
-        assert_eq!(
-            false,
-            ignores
+        assert!(
+            !ignores
                 .check(UncheckedCellRelativePath::unchecked_new("one/two/three"))
                 .is_ignored()
         );
 
-        assert_eq!(
-            true,
+        assert!(
             ignores
                 .check(UncheckedCellRelativePath::unchecked_new(
                     "recursive/two/three"
@@ -201,8 +193,7 @@ mod tests {
                 .is_ignored()
         );
 
-        assert_eq!(
-            true,
+        assert!(
             ignores
                 .check(UncheckedCellRelativePath::unchecked_new(
                     "trailing_slash/BUCK"

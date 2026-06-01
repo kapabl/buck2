@@ -118,6 +118,10 @@ impl<P: ArcStrLenStrategy> ArcStrBase<P> {
         }
     }
 
+    pub(crate) fn addr(&self) -> usize {
+        self.data.addr().get()
+    }
+
     #[inline]
     fn len(&self) -> usize {
         P::unpack_len((self.inner().allocated_payload, self.value_payload)) as usize
@@ -163,7 +167,7 @@ impl<P: ArcStrLenStrategy> StrongHash for ArcStrBase<P> {
 impl<P: ArcStrLenStrategy> PartialOrd for ArcStrBase<P> {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.as_str().partial_cmp(other.as_str())
+        Some(self.cmp(other))
     }
 }
 

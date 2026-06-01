@@ -14,11 +14,12 @@ use std::sync::Arc;
 
 use allocative::Allocative;
 use buck2_core::bzl::ImportPath;
-use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_interpreter::build_context::starlark_path_from_build_context;
 use buck2_interpreter::paths::path::StarlarkPath;
 use derive_more::Display;
 use dupe::Dupe;
+use pagable::Pagable;
 use serde::Serialize;
 use serde::Serializer;
 use starlark::any::ProvidesStaticType;
@@ -39,6 +40,8 @@ use starlark::values::FreezeResult;
 use starlark::values::Freezer;
 use starlark::values::FrozenValue;
 use starlark::values::Heap;
+use starlark::values::StarlarkPagable;
+use starlark::values::StarlarkPagableViaPagable;
 use starlark::values::StarlarkValue;
 use starlark::values::Trace;
 use starlark::values::Value;
@@ -62,7 +65,18 @@ enum TransitiveSetDefinitionError {
     TransitiveSetOnlyInBzl,
 }
 
-#[derive(Debug, Clone, Dupe, Copy, Trace, Freeze, PartialEq, Allocative)]
+#[derive(
+    Debug,
+    Clone,
+    Dupe,
+    Copy,
+    Trace,
+    Freeze,
+    PartialEq,
+    Allocative,
+    Pagable,
+    StarlarkPagable
+)]
 pub enum TransitiveSetProjectionKind {
     Args,
     Json,
@@ -85,7 +99,7 @@ impl TransitiveSetProjectionKind {
 }
 
 // The Coerce derivation doesn't work if this is just a tuple in the SmallMap value.
-#[derive(Debug, Clone, Trace, Coerce, Freeze, Allocative)]
+#[derive(Debug, Clone, Trace, Coerce, Freeze, Allocative, StarlarkPagable)]
 #[repr(C)]
 pub struct TransitiveSetProjectionSpec<V: ValueLifetimeless> {
     pub kind: TransitiveSetProjectionKind,
@@ -93,14 +107,14 @@ pub struct TransitiveSetProjectionSpec<V: ValueLifetimeless> {
 }
 
 /// A unique identity for a given [`TransitiveSetDefinition`].
-#[derive(Debug, Clone, Display, Allocative, Hash)]
+#[derive(Debug, Clone, Display, Allocative, Hash, Pagable)]
 #[display("{}", name)]
 struct TransitiveSetId {
     module_id: ImportPath,
     name: String,
 }
 
-#[derive(Debug, Allocative)]
+#[derive(Debug, Allocative, Pagable, StarlarkPagableViaPagable)]
 pub(crate) struct TransitiveSetDefinitionExported {
     /// The name of this transitive set. This is filed in by `export_as` when it's assigned to a
     /// top-level variable. This must be set before this is used.
@@ -121,7 +135,7 @@ pub struct TransitiveSetDefinition<'v> {
     operations: TransitiveSetOperationsGen<Value<'v>>,
 }
 
-#[derive(Debug, Clone, Trace, Coerce, Freeze, Allocative)]
+#[derive(Debug, Clone, Trace, Coerce, Freeze, Allocative, StarlarkPagable)]
 #[repr(C)]
 pub struct TransitiveSetOperationsGen<V: ValueLifetimeless> {
     /// Callables that will project the values contained in transitive sets of this type to
@@ -220,7 +234,7 @@ impl<'v> TransitiveSetDefinition<'v> {
 }
 
 impl<'v> AllocValue<'v> for TransitiveSetDefinition<'v> {
-    fn alloc_value(self, heap: &'v Heap) -> Value<'v> {
+    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
         heap.alloc_complex(self)
     }
 }
@@ -266,11 +280,11 @@ impl<'v> StarlarkValue<'v> for TransitiveSetDefinition<'v> {
         vec!["type".to_owned()]
     }
 
-    fn has_attr(&self, attribute: &str, _heap: &'v Heap) -> bool {
+    fn has_attr(&self, attribute: &str, _heap: Heap<'v>) -> bool {
         attribute == "type"
     }
 
-    fn get_attr(&self, attribute: &str, heap: &'v Heap) -> Option<Value<'v>> {
+    fn get_attr(&self, attribute: &str, heap: Heap<'v>) -> Option<Value<'v>> {
         if attribute == "type" {
             let typ = self
                 .exported
@@ -288,7 +302,7 @@ impl<'v> StarlarkValue<'v> for TransitiveSetDefinition<'v> {
         let exported = self
             .exported
             .get()
-            .buck_error_context("cannot hash a transitive_set_definition without id")?;
+            .ok_or_else(|| internal_error!("cannot hash a transitive_set_definition without id"))?;
         exported.id.hash(hasher);
         Ok(())
     }
@@ -298,7 +312,7 @@ impl<'v> StarlarkValue<'v> for TransitiveSetDefinition<'v> {
     }
 }
 
-#[derive(Display, ProvidesStaticType, Allocative)]
+#[derive(Display, ProvidesStaticType, Allocative, StarlarkPagable)]
 #[display("{}", exported.id)]
 pub struct FrozenTransitiveSetDefinition {
     pub(crate) exported: TransitiveSetDefinitionExported,
@@ -333,11 +347,11 @@ impl<'v> StarlarkValue<'v> for FrozenTransitiveSetDefinition {
         vec!["type".to_owned()]
     }
 
-    fn has_attr(&self, attribute: &str, _heap: &'v Heap) -> bool {
+    fn has_attr(&self, attribute: &str, _heap: Heap<'v>) -> bool {
         attribute == "type"
     }
 
-    fn get_attr(&self, attribute: &str, heap: &'v Heap) -> Option<Value<'v>> {
+    fn get_attr(&self, attribute: &str, heap: Heap<'v>) -> Option<Value<'v>> {
         if attribute == "type" {
             let typ = self.exported.id.name.as_str();
             Some(heap.alloc(typ))

@@ -26,6 +26,18 @@ use std::ops::Index;
 use allocative::Allocative;
 use hashbrown::HashTable;
 use hashbrown::hash_table;
+#[cfg(feature = "pagable_dep")]
+use pagable::PagableDeserialize;
+#[cfg(feature = "pagable_dep")]
+use pagable::PagableDeserializer;
+#[cfg(feature = "pagable_dep")]
+use pagable::PagableSerialize;
+#[cfg(feature = "pagable_dep")]
+use pagable::PagableSerializer;
+#[cfg(feature = "pagable_dep")]
+use serde::Deserialize;
+#[cfg(feature = "pagable_dep")]
+use serde::Serialize;
 
 use crate::Equivalent;
 use crate::Hashed;
@@ -231,7 +243,7 @@ impl<K, V> UnorderedMap<K, V> {
         K: Ord,
     {
         let mut entries = Vec::from_iter(self.entries_unordered());
-        entries.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
+        entries.sort_by_key(|(k1, _)| *k1);
         entries
     }
 
@@ -304,6 +316,39 @@ impl<K: Eq + Hash, V> FromIterator<(K, V)> for UnorderedMap<K, V> {
             map.insert(k, v);
         }
         map
+    }
+}
+
+#[cfg(feature = "pagable_dep")]
+impl<K: PagableSerialize, V: PagableSerialize> PagableSerialize for UnorderedMap<K, V> {
+    fn pagable_serialize(&self, serializer: &mut dyn PagableSerializer) -> pagable::Result<()> {
+        usize::serialize(&self.len(), serializer.serde())?;
+        for (k, v) in self.entries_unordered() {
+            k.pagable_serialize(serializer)?;
+            v.pagable_serialize(serializer)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "pagable_dep")]
+impl<'de, K, V> PagableDeserialize<'de> for UnorderedMap<K, V>
+where
+    K: PagableDeserialize<'de> + Eq + Hash,
+    V: PagableDeserialize<'de>,
+{
+    fn pagable_deserialize<D: PagableDeserializer<'de> + ?Sized>(
+        deserializer: &mut D,
+    ) -> pagable::Result<Self> {
+        let len = usize::deserialize(deserializer.serde())?;
+        let mut table = HashTable::with_capacity(len);
+        for _ in 0..len {
+            let k = K::pagable_deserialize(deserializer)?;
+            let v = V::pagable_deserialize(deserializer)?;
+            let hash = StarlarkHashValue::new(&k).promote();
+            table.insert_unique(hash, (k, v), |(k, _v)| StarlarkHashValue::new(k).promote());
+        }
+        Ok(UnorderedMap(table))
     }
 }
 

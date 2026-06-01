@@ -8,6 +8,7 @@
 ## anon\_rule
 ## dedupe
 ## dynamic\_actions
+## enforce\_visibility\_intersection
 ## get\_base\_path
 ## get\_cell\_name
 ## get\_parent\_modifiers
@@ -30,6 +31,12 @@
 ## rule
 ## rule\_exists
 ## select
+## select\_fail
+# Example
+# Fail with a custom message if the build is configured for iOS but the feature is not supported
+## select\_incompatible
+# Example
+# Mark the target as incompatible when building for iOS
 ## select\_map
 ## select\_test
 ## set\_cfg\_constructor
@@ -41,5 +48,6 @@
 ## test\_config\_unification\_rollout
 ## transition
 ## transitive\_set
+## validate\_soft\_error\_category
 ## warning
 ## write\_package\_value

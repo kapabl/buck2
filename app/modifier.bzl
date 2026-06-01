@@ -45,7 +45,7 @@ def buck2_modifiers():
                         "DEFAULT": "ovr_config//build_mode/constraints:static",
                         "ovr_config//build_mode:dev": "ovr_config//build_mode/constraints:shared",
                     }),
-                    "ovr_config//build_mode:asan": "ovr_config//build_mode/constraints:static_pic",
+                    "ovr_config//build_mode:sanitizer_type[asan]": "ovr_config//build_mode/constraints:static_pic",
                 }),
             }),
         }),
@@ -61,9 +61,7 @@ def buck2_modifiers():
         }),
         modifiers.conditional({
             "DEFAULT": None,
-            "ovr_config//build_mode/default_opt_cxx:enabled": (
-                "ovr_config//build_mode:sanitizer_type[no-san]"
-            ),
+            "ovr_config//build_mode/default_opt_cxx:enabled": ("ovr_config//build_mode:sanitizer_type[no-san]"),
         }),
         modifiers.conditional({
             "DEFAULT": None,

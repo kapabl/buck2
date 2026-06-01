@@ -7,29 +7,26 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
-# pyre-unsafe
+# pyre-strict
 
 import os
 import uuid
 from asyncio import subprocess
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 from buck2.tests.e2e_util.api.buck_result import (
     AuditConfigResult,
     BuckException,
-    BuckExceptionType,
     BuckResult,
-    BuckResultType,
     BuildResult,
-    BxlResult,
     TargetsResult,
     TestResult,
 )
 from buck2.tests.e2e_util.api.executable import Executable
 from buck2.tests.e2e_util.api.lsp import LspClient
 from buck2.tests.e2e_util.api.process import Process
-from buck2.tests.e2e_util.api.result import E, R, Result
+from buck2.tests.e2e_util.api.result import R, Result
 from buck2.tests.e2e_util.api.subscribe import SubscribeClient
 
 
@@ -43,10 +40,12 @@ class Buck(Executable):
         env: Dict[str, str],
         cwd: Optional[Path] = None,
         isolation_prefix: Optional[str] = None,
+        write_invocation_record: bool = False,
     ) -> None:
         super().__init__(path_to_executable, encoding, env, cwd)
         self.set_buckd(False)
         self.isolation_prefix = isolation_prefix
+        self.write_invocation_record = write_invocation_record
 
     def set_buckd(self, toggle: bool) -> None:
         """
@@ -95,10 +94,7 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=lambda proc, stdout, stderr, buck_build_id: BuildResult(
-                proc, stdout, stderr, buck_build_id, *args
-            ),
-            exception_type=BuckException,
+            result_type=BuildResult,
             stdin=stdin,
         )
 
@@ -125,8 +121,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     def help(
@@ -142,8 +136,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     def help_env(
@@ -159,8 +151,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     def run(
@@ -185,8 +175,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     def clean(
@@ -211,8 +199,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     def root(
@@ -237,8 +223,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     def kill(
@@ -260,8 +244,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     def test(
@@ -313,10 +295,8 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=lambda proc, stdout, stderr, buck_build_id: TestResult(
-                proc, stdout, stderr, buck_build_id, self.cwd / test_output_file
-            ),
-            exception_type=BuckException,
+            result_type=TestResult,
+            result_kwargs={"test_output_file": self.cwd / test_output_file},
         )
 
     def targets(
@@ -338,23 +318,18 @@ class Buck(Executable):
         TODO: Add a TargetsResult with structured output.
         """
 
-        args = list(argv)
-
         return self._run_buck_command(
             "targets",
             *argv,
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=lambda proc, stdout, stderr, buck_build_id: TargetsResult(
-                proc, stdout, stderr, buck_build_id, *args
-            ),
-            exception_type=BuckException,
+            result_type=TargetsResult,
         )
 
     def ctargets(
         self,
-        *argv,
+        *argv: str,
         input: Optional[bytes] = None,
         rel_cwd: Optional[Path] = None,
         env: Optional[Dict[str, str]] = None,
@@ -365,8 +340,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     def complete(
@@ -395,8 +368,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=my_env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     def completion(
@@ -421,8 +392,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     def audit_config(
@@ -448,10 +417,7 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=lambda proc, stdout, stderr, buck_build_id: AuditConfigResult(
-                proc, stdout, stderr, buck_build_id, *args
-            ),
-            exception_type=BuckException,
+            result_type=AuditConfigResult,
         )
 
     def audit_configurations(
@@ -469,8 +435,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     def audit_dep_files(
@@ -488,8 +452,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     def audit_visibility(
@@ -507,8 +469,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     def audit(
@@ -525,8 +485,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     def audit_output(
@@ -544,8 +502,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     def query(
@@ -609,8 +565,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     def bxl(
@@ -619,7 +573,7 @@ class Buck(Executable):
         input: Optional[bytes] = None,
         rel_cwd: Optional[Path] = None,
         env: Optional[Dict[str, str]] = None,
-    ) -> Process[BxlResult, BuckException]:
+    ) -> Process[BuckResult, BuckException]:
         args = list(argv)
         return self._run_buck_command(
             "bxl",
@@ -627,10 +581,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=lambda proc, stdout, stderr, buck_build_id: BxlResult(
-                proc, stdout, stderr, buck_build_id, *args
-            ),
-            exception_type=BuckException,
         )
 
     def docs(
@@ -646,8 +596,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     def profile(
@@ -672,8 +620,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     def debug(
@@ -693,8 +639,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     def starlark(
@@ -714,8 +658,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     def install(
@@ -731,8 +673,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     def log(
@@ -748,8 +688,7 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
+            can_write_invocation_record=False,
         )
 
     def status(
@@ -765,8 +704,7 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
+            can_write_invocation_record=False,
         )
 
     def server(
@@ -782,8 +720,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     def expand_external_cell(
@@ -799,8 +735,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     async def lsp(
@@ -816,8 +750,6 @@ class Buck(Executable):
             stdin=subprocess.PIPE,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
             intercept_stderr=False,
         ).start()
         cwd = self._get_cwd(rel_cwd)
@@ -837,8 +769,6 @@ class Buck(Executable):
             stdin=subprocess.PIPE,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
             intercept_stderr=False,
         )
         client = await SubscribeClient.create(process)
@@ -871,11 +801,12 @@ class Buck(Executable):
         input: Optional[bytes],
         rel_cwd: Optional[Path],
         env: Optional[Dict[str, str]],
-        result_type: BuckResultType[R],
-        exception_type: BuckExceptionType[E],
+        result_type: type[R] = BuckResult,
+        result_kwargs: Optional[Dict[str, Any]] = None,
         stdin: Optional[int] = None,
         intercept_stderr: bool = True,
-    ) -> Process[R, E]:
+        can_write_invocation_record: bool = True,
+    ) -> Process[R, BuckException]:
         """
         Returns a process created from the execuable path,
         command and any additional arguments
@@ -885,28 +816,73 @@ class Buck(Executable):
         if "BUCK_WRAPPER_UUID" not in command_env:
             command_env["BUCK_WRAPPER_UUID"] = buck_build_id
 
-        cmd_to_run = self.construct_buck_command(cmd, *argv)
+        cwd = self._get_cwd(rel_cwd)
+
+        args = list(argv)
+        invocation_record_path = None
+        if self.write_invocation_record and can_write_invocation_record:
+            invocation_record_dir = cwd / "buck-out" / "tmp"
+            invocation_record_dir.mkdir(parents=True, exist_ok=True)
+            invocation_record_path = invocation_record_dir / (buck_build_id + ".json")
+            separator_idx = args.index("--") if "--" in args else len(args)
+            args[separator_idx:separator_idx] = [
+                "--unstable-write-invocation-record",
+                str(invocation_record_path),
+            ]
+
+        cmd_to_run = self.construct_buck_command(cmd, *args)
+
+        args_tuple: Tuple[str, ...] = argv
+        result_kwargs = result_kwargs or {}
+        _buck_build_id: str = buck_build_id
+        _invocation_record_path: Optional[Path] = invocation_record_path
+
+        def make_result(proc: subprocess.Process, stdout: str, stderr: str) -> R:
+            base = BuckResult(
+                proc,
+                stdout,
+                stderr,
+                _buck_build_id,
+                _invocation_record_path,
+                buck_args=" ".join(args_tuple),
+            )
+            if result_type is BuckResult:
+                return base  # type: ignore[return-value]
+            return result_type(base, **result_kwargs)  # type: ignore[return-value]
+
+        _buck_build_id2: str = buck_build_id
+        _invocation_record_path2: Optional[Path] = invocation_record_path
+
+        def make_exception(
+            cmd_to_run: str,
+            working_dir: Path,
+            env: Dict[str, str],
+            proc: subprocess.Process,
+            stdout: str,
+            stderr: str,
+        ) -> BuckException:
+            return BuckException(
+                cmd_to_run,
+                working_dir,
+                env,
+                proc,
+                stdout,
+                stderr,
+                _buck_build_id2,
+                _invocation_record_path2,
+            )
 
         stderr = subprocess.PIPE if intercept_stderr else None
         return Process(
             cmd_to_run=cmd_to_run,
-            working_dir=self._get_cwd(rel_cwd),
+            working_dir=cwd,
             env=command_env,
             input=input,
             stdin=stdin,
             stdout=subprocess.PIPE,
             stderr=stderr,
-            result_type=lambda proc, stdout, stderr: result_type(
-                proc, stdout, stderr, buck_build_id
-            ),
-            exception_type=lambda cmd_to_run,
-            working_dir,
-            env,
-            proc,
-            stdout,
-            stderr: exception_type(
-                cmd_to_run, working_dir, env, proc, stdout, stderr, buck_build_id
-            ),
+            result_type=make_result,
+            exception_type=make_exception,
             encoding=self.encoding,
         )
 
@@ -922,8 +898,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     def _create_xml_file(self, *argv: str) -> Tuple[Iterable[str], str]:
@@ -946,8 +920,8 @@ class Buck(Executable):
         env: Optional[Dict[str, str]] = None,
         input: Optional[bytes] = None,
         stdin: Optional[int] = None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout: int = subprocess.PIPE,
+        stderr: int = subprocess.PIPE,
     ) -> Process[Result, Exception]:
         raise NotImplementedError("Buck does not use execute.")
 
@@ -964,8 +938,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     def explain(
@@ -981,8 +953,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     def init(
@@ -998,8 +968,6 @@ class Buck(Executable):
             input=input,
             rel_cwd=rel_cwd,
             env=env,
-            result_type=BuckResult,
-            exception_type=BuckException,
         )
 
     async def get_daemon_dir(self) -> Path:

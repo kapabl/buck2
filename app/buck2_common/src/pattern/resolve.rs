@@ -19,27 +19,20 @@ use buck2_core::pattern::pattern_type::ConfiguredProvidersPatternExtra;
 use buck2_core::pattern::pattern_type::PatternType;
 use buck2_core::target::name::TargetName;
 use buck2_error::BuckErrorContext;
+use buck2_hash::BuckIndexMap;
 use dice::DiceComputations;
 use dupe::Dupe;
 use gazebo::prelude::VecExt;
-use indexmap::IndexMap;
 
 use crate::file_ops::trait_::DiceFileOps;
 use crate::file_ops::trait_::FileOps;
 use crate::pattern::package_roots::find_package_roots;
 
-#[derive(Debug, buck2_error::Error)]
-#[buck2(tag = Input)]
-enum ResolvedPatternError {
-    #[error("Expecting {0} pattern, got `{1}`")]
-    InvalidPattern(&'static str, String),
-}
-
 /// Pattern where `foo/...` is expanded to matching packages.
 /// Targets are not validated yet, and `:` is not yet expanded.
 #[derive(Debug)]
 pub struct ResolvedPattern<T: PatternType> {
-    pub specs: IndexMap<PackageLabelWithModifiers, PackageSpec<T>>,
+    pub specs: BuckIndexMap<PackageLabelWithModifiers, PackageSpec<T>>,
 }
 
 impl<T> ResolvedPattern<T>
@@ -48,7 +41,7 @@ where
 {
     pub fn new() -> Self {
         Self {
-            specs: IndexMap::new(),
+            specs: BuckIndexMap::default(),
         }
     }
 
@@ -84,21 +77,23 @@ where
 
 impl ResolvedPattern<ConfiguredProvidersPatternExtra> {
     pub fn convert_pattern<U: PatternType>(self) -> buck2_error::Result<ResolvedPattern<U>> {
-        let mut specs = IndexMap::with_capacity(self.specs.len());
+        let mut specs = BuckIndexMap::with_capacity(self.specs.len());
         for (package_with_modifiers, spec) in self.specs {
             let spec = match spec {
                 PackageSpec::Targets(targets) => {
                     PackageSpec::Targets(targets.into_try_map(|(target_name, extra)| {
                         let extra = U::from_configured_providers(extra.clone())
-                            .buck_error_context(ResolvedPatternError::InvalidPattern(
-                                U::NAME,
-                                display_precise_pattern(
-                                    &package_with_modifiers.package,
-                                    target_name.as_ref(),
-                                    &extra,
+                            .with_buck_error_context(|| {
+                                format!(
+                                    "Expecting {} pattern, got `{}`",
+                                    U::NAME,
+                                    display_precise_pattern(
+                                        &package_with_modifiers.package,
+                                        target_name.as_ref(),
+                                        &extra,
+                                    ),
                                 )
-                                .to_string(),
-                            ))?;
+                            })?;
                         buck2_error::Ok((target_name, extra))
                     })?)
                 }
@@ -280,7 +275,7 @@ mod tests {
                     p,
                     CellName::testing_new("root"),
                     &self.resolver,
-                    &self.resolver.root_cell_cell_alias_resolver(),
+                    self.resolver.root_cell_cell_alias_resolver(),
                 )
                 .unwrap()
             });
@@ -302,7 +297,7 @@ mod tests {
                         pattern_str,
                         CellName::testing_new("root"),
                         &self.resolver,
-                        &self.resolver.root_cell_cell_alias_resolver(),
+                        self.resolver.root_cell_cell_alias_resolver(),
                     )
                     .unwrap()
                 })

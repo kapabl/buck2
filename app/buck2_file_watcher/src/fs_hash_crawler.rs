@@ -8,7 +8,6 @@
  * above-listed licenses.
  */
 
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::mem;
@@ -31,10 +30,13 @@ use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_data::FileWatcherEventType;
 use buck2_data::FileWatcherKind;
 use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_events::dispatch::span_async;
+use buck2_fs::error::IoResultExt;
 use buck2_fs::fs_util;
 use buck2_fs::paths::abs_norm_path::AbsNormPath;
 use buck2_fs::paths::file_name::FileNameBuf;
+use buck2_hash::StdBuckHashMap;
 use compact_str::CompactString;
 use dice::DiceTransactionUpdater;
 use dupe::Dupe;
@@ -50,7 +52,7 @@ use crate::stats::FileWatcherStats;
 pub struct FsHashCrawler {
     root: ProjectRoot,
     cells: CellResolver,
-    ignore_specs: HashMap<CellName, IgnoreSet>,
+    ignore_specs: StdBuckHashMap<CellName, IgnoreSet>,
     snapshot: Arc<Mutex<FsSnapshot>>,
 }
 
@@ -58,7 +60,7 @@ impl FsHashCrawler {
     pub fn new(
         root: &ProjectRoot,
         cells: CellResolver,
-        ignore_specs: HashMap<CellName, IgnoreSet>,
+        ignore_specs: StdBuckHashMap<CellName, IgnoreSet>,
     ) -> buck2_error::Result<Self> {
         let snapshot = Arc::new(Mutex::new(FsSnapshot::build(root, &cells)?));
         Ok(Self {
@@ -136,11 +138,11 @@ impl EntryInfo {
 }
 
 #[derive(Allocative)]
-struct FsSnapshot(HashMap<CellPath, EntryInfo>);
+struct FsSnapshot(StdBuckHashMap<CellPath, EntryInfo>);
 
 impl FsSnapshot {
     fn build(root: &ProjectRoot, cells: &CellResolver) -> buck2_error::Result<Self> {
-        let mut snapshot = FsSnapshot(HashMap::new());
+        let mut snapshot = FsSnapshot(StdBuckHashMap::default());
         snapshot.build_fs_snapshot(root, cells, root.root())?;
         Ok(snapshot)
     }
@@ -204,7 +206,7 @@ impl FsSnapshot {
     fn get_updates_for_dice(
         &self,
         new_snapshot: &FsSnapshot,
-        ignore_specs: &HashMap<CellName, IgnoreSet>,
+        ignore_specs: &StdBuckHashMap<CellName, IgnoreSet>,
     ) -> buck2_error::Result<(buck2_data::FileWatcherStats, FileChangeTracker)> {
         let events = self.get_updates(new_snapshot)?;
         let mut changed = FileChangeTracker::new();
@@ -262,7 +264,7 @@ impl FsSnapshot {
         cells: &CellResolver,
         disk_path: &AbsNormPath,
     ) -> buck2_error::Result<()> {
-        for file in fs_util::read_dir(disk_path)? {
+        for file in fs_util::read_dir(disk_path).categorize_internal()? {
             let file = file?;
             let filetype = file.file_type()?;
             let filename = file.file_name();
@@ -270,7 +272,7 @@ impl FsSnapshot {
             let filename = FileNameBuf::try_from(CompactString::new(
                 filename
                     .to_str()
-                    .buck_error_context("Filename is not UTF-8")?,
+                    .ok_or_else(|| internal_error!("Filename is not UTF-8"))?,
             ))
             .with_buck_error_context(|| format!("Invalid filename: {}", disk_path.display()))?;
 
@@ -333,7 +335,7 @@ mod tests {
     use buck2_core::fs::project_rel_path::ProjectRelativePath;
     use buck2_data::FileWatcherEventType;
     use buck2_data::FileWatcherKind;
-    use buck2_fs::fs_util;
+    use buck2_fs::fs_util::uncategorized as fs_util;
     use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
     use buck2_fs::paths::abs_path::AbsPathBuf;
 

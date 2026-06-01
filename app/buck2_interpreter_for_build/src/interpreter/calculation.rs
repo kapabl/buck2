@@ -41,10 +41,14 @@ use buck2_util::time_span::TimeSpan;
 use derive_more::Display;
 use dice::DiceComputations;
 use dice::Key;
+use dice::OkPagableValueSerialize;
+use dice::ValueSerialize;
 use dice_futures::cancellation::CancellationContext;
 use dupe::Dupe;
 use futures::FutureExt;
 use futures::future::BoxFuture;
+use pagable::Pagable;
+use pagable::pagable_typetag;
 use smallvec::SmallVec;
 use starlark::environment::Globals;
 use starlark_map::small_map::SmallMap;
@@ -55,7 +59,8 @@ use crate::interpreter::global_interpreter_state::HasGlobalInterpreterState;
 use crate::interpreter::package_file_calculation::EvalPackageFile;
 
 // Key for 'InterpreterCalculation::get_interpreter_results'
-#[derive(Clone, Dupe, Display, Debug, Eq, Hash, PartialEq, Allocative)]
+#[derive(Clone, Dupe, Display, Debug, Eq, Hash, PartialEq, Allocative, Pagable)]
+#[pagable_typetag(dice::DiceKeyDyn)]
 pub struct InterpreterResultsKey(pub PackageLabel);
 
 struct TargetGraphCalculationInstance;
@@ -94,6 +99,10 @@ impl Key for InterpreterResultsKey {
     fn validity(x: &Self::Value) -> bool {
         x.is_ok()
     }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        OkPagableValueSerialize::<Self::Value>::new()
+    }
 }
 
 #[async_trait]
@@ -115,7 +124,7 @@ impl TargetGraphCalculationImpl for TargetGraphCalculationInstance {
                     .eval_build_file(package.dupe(), cancellation)
                     .await
             }
-            Err(e) => (TimeSpan::empty_now(), Err(e.into())),
+            Err(e) => (TimeSpan::empty_now(), Err(e)),
         }
     }
 
@@ -125,7 +134,7 @@ impl TargetGraphCalculationImpl for TargetGraphCalculationInstance {
         package: PackageLabel,
     ) -> BoxFuture<'a, buck2_error::Result<Arc<EvaluationResult>>> {
         ctx.compute(&InterpreterResultsKey(package.dupe()))
-            .map(|v| v?.map_err(buck2_error::Error::from))
+            .map(|v| v?)
             .boxed()
     }
 }
@@ -165,6 +174,10 @@ impl Key for EvalImportKey {
 
     fn validity(x: &Self::Value) -> bool {
         x.is_ok()
+    }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        OkPagableValueSerialize::<Self::Value>::new()
     }
 }
 

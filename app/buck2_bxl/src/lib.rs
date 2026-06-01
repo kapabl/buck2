@@ -12,6 +12,7 @@
 #![feature(trait_alias)]
 #![feature(try_blocks)]
 #![feature(never_type)]
+#![feature(mapped_lock_guards)]
 
 use std::sync::Once;
 
@@ -33,7 +34,7 @@ pub fn init_late_bindings() {
 
 #[test]
 fn init_late_bindings_for_test() {
-    #[ctor::ctor]
+    #[ctor::ctor(unsafe)]
     fn init() {
         init_late_bindings();
     }

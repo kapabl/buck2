@@ -21,18 +21,11 @@ use buck2_client_ctx::subscribers::stdout_stderr_forwarder::StdoutStderrForwarde
 use buck2_common::argv::Argv;
 use buck2_common::argv::SanitizedArgv;
 use buck2_common::daemon_dir::DaemonDir;
-use buck2_error::BuckErrorContext;
 use buck2_error::conversion::from_any_with_tag;
+use buck2_error::internal_error;
 use chrono::DateTime;
 use humantime::format_duration;
 use walkdir::WalkDir;
-
-#[derive(Debug, buck2_error::Error)]
-#[buck2(tag = Input)]
-enum StatusError {
-    #[error("Incorrect seconds/nanos argument")]
-    NativeDateTime,
-}
 
 #[derive(Debug, clap::Parser)]
 #[clap(about = "Buckd status")]
@@ -131,7 +124,7 @@ impl StatusCommand {
 
 fn timestamp_to_string(seconds: u64, nanos: u32) -> buck2_error::Result<String> {
     Ok(DateTime::from_timestamp(seconds as i64, nanos)
-        .buck_error_context(StatusError::NativeDateTime)?
+        .ok_or_else(|| internal_error!("Incorrect seconds/nanos argument"))?
         .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string())
 }
@@ -166,6 +159,7 @@ fn process_status(status: StatusResponse) -> buck2_error::Result<serde_json::Val
         "supports_vpnless": status.supports_vpnless.unwrap_or_default(),
         "http2": status.http2,
         "io_provider": status.io_provider,
+        "allprocs_cgroup_path": status.allprocs_cgroup_path,
     });
 
     if let Some(tokio_runtime_metrics) = status.tokio_runtime_metrics {

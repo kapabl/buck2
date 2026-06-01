@@ -25,6 +25,7 @@
 
 use std::cmp;
 
+use starlark_derive::StarlarkPagable;
 use starlark_derive::VisitSpanMut;
 use starlark_syntax::slice_vec_ext::SliceExt;
 use starlark_syntax::syntax::ast::AssignOp;
@@ -35,6 +36,7 @@ use starlark_syntax::syntax::ast::ForP;
 use starlark_syntax::syntax::ast::StmtP;
 use thiserror::Error;
 
+use crate as starlark;
 use crate::codemap::Span;
 use crate::codemap::Spanned;
 use crate::environment::FrozenModuleData;
@@ -71,7 +73,7 @@ use crate::values::dict::DictRef;
 use crate::values::types::list::value::ListData;
 use crate::values::typing::type_compiled::compiled::TypeCompiled;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, StarlarkPagable)]
 pub(crate) enum AssignModifyLhs {
     Dot(IrSpanned<ExprCompiled>, String),
     Array(IrSpanned<ExprCompiled>, IrSpanned<ExprCompiled>),
@@ -80,7 +82,7 @@ pub(crate) enum AssignModifyLhs {
     Module(IrSpanned<ModuleSlotId>),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, StarlarkPagable)]
 pub(crate) enum StmtCompiled {
     PossibleGc,
     Return(IrSpanned<ExprCompiled>),
@@ -103,7 +105,7 @@ pub(crate) enum StmtCompiled {
     Continue,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, StarlarkPagable)]
 pub(crate) struct StmtCompileContext {
     /// Current function has return type.
     pub(crate) has_return_type: bool,
@@ -114,7 +116,7 @@ pub(crate) struct OptimizeOnFreezeContext<'v, 'a> {
     /// Nothing useful should be left in the heap after the freeze,
     /// but having a heap is useful to allocate objects temporarily
     /// (when invoking operations which require heap).
-    pub(crate) heap: &'v Heap,
+    pub(crate) heap: Heap<'v>,
     pub(crate) frozen_heap: &'a FrozenHeap,
 }
 
@@ -182,7 +184,7 @@ impl IrSpanned<StmtCompiled> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, StarlarkPagable)]
 pub(crate) struct StmtsCompiled(SmallVec1<IrSpanned<StmtCompiled>>);
 
 impl StmtsCompiled {
@@ -347,7 +349,7 @@ pub(crate) enum AssignError {
     IncorrectNumberOfValueToUnpack(i32, i32),
 }
 
-#[derive(Clone, Debug, VisitSpanMut)]
+#[derive(Clone, Debug, VisitSpanMut, starlark_derive::StarlarkPagable)]
 pub(crate) enum AssignCompiledValue {
     Dot(IrSpanned<ExprCompiled>, String),
     Index(IrSpanned<ExprCompiled>, IrSpanned<ExprCompiled>),
@@ -560,7 +562,7 @@ pub(crate) fn possible_gc(eval: &mut Evaluator) {
 pub(crate) fn bit_or_assign<'v>(
     lhs: Value<'v>,
     rhs: Value<'v>,
-    heap: &'v Heap,
+    heap: Heap<'v>,
 ) -> crate::Result<Value<'v>> {
     // The Starlark spec says dict |= mutates, while nothing else does.
     // When mutating, be careful if they alias, so we don't have `lhs`
@@ -599,7 +601,7 @@ pub(crate) fn bit_or_assign<'v>(
 pub(crate) fn add_assign<'v>(
     lhs: Value<'v>,
     rhs: Value<'v>,
-    heap: &'v Heap,
+    heap: Heap<'v>,
 ) -> crate::Result<Value<'v>> {
     // Checking whether a value is an integer or a string is cheap (no virtual call),
     // and `Value::add` has optimizations for these types, so check them first

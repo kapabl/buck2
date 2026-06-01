@@ -12,6 +12,7 @@ use allocative::Allocative;
 use buck2_build_api::query::oneshot::QUERY_FRONTEND;
 use buck2_node::nodes::unconfigured::TargetNode;
 use buck2_query::query::syntax::simple::eval::values::QueryEvaluationResult;
+use buck2_query::query::syntax::simple::eval::values::QueryValueDepth;
 use buck2_query::query::syntax::simple::functions::helpers::CapturedExpr;
 use dice::DiceComputations;
 use gazebo::prelude::OptionExt;
@@ -56,13 +57,13 @@ pub(crate) enum LazyUqueryOperation {
     },
     Deps {
         universe: OwnedTargetListExprArg,
-        depth: Option<i32>,
+        depth: QueryValueDepth,
         filter: Option<String>,
     },
     Rdeps {
         universe: OwnedTargetListExprArg,
         from: OwnedTargetListExprArg,
-        depth: Option<i32>,
+        depth: QueryValueDepth,
         filter: Option<String>,
     },
     Filter {
@@ -100,7 +101,7 @@ pub(crate) enum LazyUqueryResult {
 }
 
 impl LazyUqueryResult {
-    pub(crate) fn into_value<'v>(self, heap: &'v Heap) -> buck2_error::Result<Value<'v>> {
+    pub(crate) fn into_value<'v>(self, heap: Heap<'v>) -> buck2_error::Result<Value<'v>> {
         match self {
             LazyUqueryResult::TestsOf(target_set) => Ok(heap.alloc(target_set)),
             LazyUqueryResult::AllPaths(target_set) => Ok(heap.alloc(target_set)),

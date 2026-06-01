@@ -13,13 +13,14 @@ use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
+use buck2_build_signals::env::WaitingData;
 use buck2_common::liveliness_observer::CancelledLivelinessGuard;
 use buck2_common::liveliness_observer::LivelinessGuard;
 use buck2_common::liveliness_observer::LivelinessObserver;
 use buck2_common::liveliness_observer::LivelinessObserverExt;
 use buck2_core::execution_types::executor_config::HybridExecutionLevel;
 use buck2_data::SchedulingMode;
-use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_events::dispatch::EventDispatcher;
 use buck2_execute::execute::claim::Claim;
 use buck2_execute::execute::claim::ClaimManager;
@@ -72,9 +73,10 @@ where
         events: EventDispatcher,
         liveliness_observer: Arc<dyn LivelinessObserver>,
         cancellations: &CancellationContext,
+        waiting_data: WaitingData,
     ) -> CommandExecutionResult {
         let local_manager =
-            CommandExecutionManager::new(claim_manager, events, liveliness_observer);
+            CommandExecutionManager::new(claim_manager, events, liveliness_observer, waiting_data);
         self.local
             .exec_cmd(command, local_manager, cancellations)
             .await
@@ -171,6 +173,7 @@ where
                     .and(local_execution_liveliness_observer.dupe()),
             ),
             cancellations,
+            manager.inner.waiting_data.clone(),
         );
 
         let remote_manager = CommandExecutionManager::new(
@@ -181,6 +184,7 @@ where
             )),
             manager.inner.events.dupe(),
             manager.inner.liveliness_observer.dupe(),
+            manager.inner.waiting_data.clone(),
         )
         .with_intend_to_fallback_on_failure(fallback_on_failure);
         let was_result_delayed = remote_manager.inner.was_result_delayed.dupe();
@@ -373,6 +377,10 @@ where
             HybridExecutionLevel::Fallback { .. } | HybridExecutionLevel::Full { .. } => true,
         }
     }
+
+    fn is_full_hybrid_enabled(&self) -> bool {
+        matches!(self.level, HybridExecutionLevel::Full { .. })
+    }
 }
 
 struct ReClaimManager {
@@ -470,7 +478,7 @@ impl Claim for ReClaim {
         // An error here should only occur if local execution had started without the claim.
         self.released_liveliness_guard
             .restore()
-            .buck_error_context("Unable to restore CancelledLivelinessGuard!")?
+            .ok_or_else(|| internal_error!("Unable to restore CancelledLivelinessGuard!"))?
             .forget();
 
         self.claim.release()?;

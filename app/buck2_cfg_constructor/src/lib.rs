@@ -45,6 +45,8 @@ use calculation::CfgConstructorCalculationInstance;
 use dice::DiceComputations;
 use dice_futures::cancellation::CancellationContext;
 use futures::FutureExt;
+use pagable::Pagable;
+use pagable::pagable_typetag;
 use starlark::collections::SmallMap;
 use starlark::values::OwnedFrozenValue;
 use starlark::values::UnpackValue;
@@ -63,7 +65,7 @@ enum CfgConstructorError {
     PostConstraintAnalysisRefsMustBeConfigurationRules(String),
 }
 
-#[derive(Allocative, Debug)]
+#[derive(Allocative, Debug, Pagable)]
 pub(crate) struct CfgConstructor {
     pub(crate) cfg_constructor_pre_constraint_analysis: OwnedFrozenValue,
     pub(crate) cfg_constructor_post_constraint_analysis: OwnedFrozenValue,
@@ -80,8 +82,9 @@ async fn eval_pre_constraint_analysis<'v, 'a>(
     target_cfg_modifiers: Option<&MetadataValue>,
     cli_modifiers: &[String],
     rule_type: &RuleType,
-    aliases: Option<&'v OwnedFrozenValue>,
-    extra_data: Option<&'v OwnedFrozenValue>,
+    aliases: Option<Value<'v>>,
+    extra_data: Option<Value<'v>>,
+    configuring_exec_dep: bool,
     print: &'a EventDispatcherPrintHandler,
 ) -> buck2_error::Result<(Vec<String>, Value<'v>)> {
     reentrant_eval.with_evaluator(|eval| {
@@ -106,13 +109,14 @@ async fn eval_pre_constraint_analysis<'v, 'a>(
         let cli_modifiers = eval.heap().alloc(cli_modifiers);
         let rule_name = eval.heap().alloc(rule_type.name());
         let aliases = match aliases {
-            Some(v) => v.value(),
+            Some(v) => v,
             None => Value::new_none(),
         };
         let extra_data = match extra_data {
-            Some(v) => v.value(),
+            Some(v) => v,
             None => Value::new_none(),
         };
+        let configuring_exec_dep = eval.heap().alloc(configuring_exec_dep);
 
         // TODO: should eventually accept cli modifiers and target modifiers (T163570597)
         let pre_constraint_analysis_args = vec![
@@ -123,6 +127,7 @@ async fn eval_pre_constraint_analysis<'v, 'a>(
             ("rule_name", rule_name),
             ("aliases", aliases),
             ("extra_data", extra_data),
+            ("configuring_exec_dep", configuring_exec_dep),
         ];
 
         // Type check + unpack
@@ -183,6 +188,7 @@ fn eval_post_constraint_analysis<'v>(
     params: Value<'v>,
     eval: &mut ReentrantStarlarkEvaluator<'v, '_, '_>,
     refs_providers_map: SmallMap<String, FrozenProviderCollectionValue>,
+    is_marked_as_exec_platform: bool,
 ) -> buck2_error::Result<ConfigurationData> {
     eval.with_evaluator(|eval| -> buck2_error::Result<ConfigurationData> {
         let post_constraint_analysis_args = vec![
@@ -192,7 +198,12 @@ fn eval_post_constraint_analysis<'v>(
                     refs_providers_map
                         .into_iter()
                         .map(|(label, providers)| {
-                            (label, providers.value().owned_value(eval.frozen_heap()))
+                            (
+                                label,
+                                eval.heap()
+                                    .access_owned_frozen_value_typed(providers.value())
+                                    .to_value(),
+                            )
                         })
                         .collect::<SmallMap<String, Value<'_>>>(),
                 ),
@@ -207,7 +218,8 @@ fn eval_post_constraint_analysis<'v>(
         )?;
 
         // Type check + unpack
-        <&PlatformInfo>::unpack_value_err(post_constraint_analysis_result)?.to_configuration()
+        <&PlatformInfo>::unpack_value_err(post_constraint_analysis_result)?
+            .to_configuration(is_marked_as_exec_platform)
     })
 }
 
@@ -219,6 +231,7 @@ async fn eval_underlying(
     target_cfg_modifiers: Option<&MetadataValue>,
     cli_modifiers: &[String],
     rule_type: &RuleType,
+    configuring_exec_dep: bool,
     cancellation: &CancellationContext,
 ) -> buck2_error::Result<ConfigurationData> {
     let print = EventDispatcherPrintHandler(get_dispatcher());
@@ -226,23 +239,36 @@ async fn eval_underlying(
     let eval_kind = StarlarkEvalKind::Unknown("constraint-analysis invocation".into());
     let provider = StarlarkEvaluatorProvider::new(ctx, eval_kind).await?;
 
-    BuckStarlarkModule::with_profiling_async(|env_provider| async move {
-        let module = env_provider.make();
+    BuckStarlarkModule::with_profiling_async(async move |module| {
         let mut reentrant_eval = provider.make_reentrant_evaluator(&module, cancellation.into())?;
+
+        let cfg_constructor_pre_constraint_analysis = module
+            .heap()
+            .access_owned_frozen_value(&cfg_constructor.cfg_constructor_pre_constraint_analysis);
+        let cfg_constructor_post_constraint_analysis = module
+            .heap()
+            .access_owned_frozen_value(&cfg_constructor.cfg_constructor_post_constraint_analysis);
+        let aliases = cfg_constructor
+            .aliases
+            .as_ref()
+            .map(|v| module.heap().access_owned_frozen_value(v));
+        let extra_data = cfg_constructor
+            .extra_data
+            .as_ref()
+            .map(|v| module.heap().access_owned_frozen_value(v));
 
         // Pre constraint-analysis
         let (refs, params) = eval_pre_constraint_analysis(
-            cfg_constructor
-                .cfg_constructor_pre_constraint_analysis
-                .value(),
+            cfg_constructor_pre_constraint_analysis,
             &mut reentrant_eval,
             cfg,
             package_cfg_modifiers,
             target_cfg_modifiers,
             cli_modifiers,
             rule_type,
-            cfg_constructor.aliases.as_ref(),
-            cfg_constructor.extra_data.as_ref(),
+            aliases,
+            extra_data,
+            configuring_exec_dep,
             &print,
         )
         .await?;
@@ -252,22 +278,22 @@ async fn eval_underlying(
 
         // Post constraint-analysis
         let res = eval_post_constraint_analysis(
-            cfg_constructor
-                .cfg_constructor_post_constraint_analysis
-                .value(),
+            cfg_constructor_post_constraint_analysis,
             params,
             &mut reentrant_eval,
             refs_providers_map,
+            cfg.is_marked_as_exec_platform(),
         )?;
 
         let finished_eval = reentrant_eval.finish_evaluation();
-        let (token, _) = finished_eval.finish(None)?;
+        let (token, _) = finished_eval.finish()?;
 
         Ok((token, res))
     })
     .await
 }
 
+#[pagable_typetag]
 #[async_trait]
 impl CfgConstructorImpl for CfgConstructor {
     fn eval<'a>(
@@ -278,6 +304,7 @@ impl CfgConstructorImpl for CfgConstructor {
         target_cfg_modifiers: Option<&'a MetadataValue>,
         cli_modifiers: &'a [String],
         rule_type: &'a RuleType,
+        configuring_exec_dep: bool,
         cancellation: &'a CancellationContext,
     ) -> Pin<Box<dyn Future<Output = buck2_error::Result<ConfigurationData>> + Send + 'a>> {
         // Get around issue of Evaluator not being send by wrapping future in UnsafeSendFuture
@@ -290,6 +317,7 @@ impl CfgConstructorImpl for CfgConstructor {
                 target_cfg_modifiers,
                 cli_modifiers,
                 rule_type,
+                configuring_exec_dep,
                 cancellation,
             )
             .await

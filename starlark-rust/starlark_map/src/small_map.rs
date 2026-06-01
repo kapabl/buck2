@@ -30,6 +30,12 @@ use std::mem;
 use allocative::Allocative;
 use equivalent::Equivalent;
 use hashbrown::HashTable;
+#[cfg(feature = "pagable_dep")]
+use pagable::Pagable;
+#[cfg(feature = "pagable_dep")]
+use pagable::PagableDeserialize;
+#[cfg(feature = "pagable_dep")]
+use pagable::PagableSerialize;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -1046,6 +1052,32 @@ macro_rules! smallmap {
     };
 }
 
+#[cfg(feature = "pagable_dep")]
+impl<K: Pagable, V: Pagable> PagableSerialize for SmallMap<K, V> {
+    fn pagable_serialize(
+        &self,
+        serializer: &mut dyn pagable::PagableSerializer,
+    ) -> pagable::__internal::anyhow::Result<()> {
+        self.entries.pagable_serialize(serializer)
+    }
+}
+
+#[cfg(feature = "pagable_dep")]
+impl<'de, K: Pagable, V: Pagable> PagableDeserialize<'de> for SmallMap<K, V> {
+    fn pagable_deserialize<D: pagable::PagableDeserializer<'de> + ?Sized>(
+        deserializer: &mut D,
+    ) -> pagable::Result<Self> {
+        let entries =
+            <VecMap<K, V> as pagable::PagableDeserialize>::pagable_deserialize(deserializer)?;
+        let mut this = Self {
+            entries,
+            index: None,
+        };
+        this.create_index(this.entries.len());
+        Ok(this)
+    }
+}
+
 impl<K: Serialize, V: Serialize> Serialize for SmallMap<K, V> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -1110,7 +1142,7 @@ mod tests {
     #[test]
     fn empty_map() {
         let m = SmallMap::<i8, &str>::new();
-        assert_eq!(m.is_empty(), true);
+        assert!(m.is_empty());
         assert_eq!(m.len(), 0);
         assert_eq!(m.iter().next(), None);
     }
@@ -1123,16 +1155,16 @@ mod tests {
 
         let entries2 = [(1, 'b'), (0, 'a')];
         let m2 = entries2.iter().copied().collect::<SmallMap<_, _>>();
-        assert_eq!(m1.is_empty(), false);
+        assert!(!m1.is_empty());
         assert_eq!(m1.len(), 2);
-        assert_eq!(m2.is_empty(), false);
+        assert!(!m2.is_empty());
         assert_eq!(m2.len(), 2);
 
-        assert_eq!(m1.iter().eq(entries1.iter().map(|(k, v)| (k, v))), true);
-        assert_eq!(m2.iter().eq(entries2.iter().map(|(k, v)| (k, v))), true);
-        assert_eq!(m1.iter().eq(m2.iter()), false);
-        assert_eq!(m1.eq(&m1), true);
-        assert_eq!(m2.eq(&m2), true);
+        assert!(m1.iter().eq(entries1.iter().map(|(k, v)| (k, v))));
+        assert!(m2.iter().eq(entries2.iter().map(|(k, v)| (k, v))));
+        assert!(!m1.iter().eq(m2.iter()));
+        assert!(m1.eq(&m1));
+        assert!(m2.eq(&m2));
         assert_eq!(m1, m2);
 
         assert_eq!(m1.get(&0), Some(&'a'));
@@ -1163,16 +1195,16 @@ mod tests {
         let letters = ('a'..='z').rev();
         let entries2 = numbers.zip(letters);
         let m2 = entries2.clone().collect::<SmallMap<_, _>>();
-        assert_eq!(m1.is_empty(), false);
+        assert!(!m1.is_empty());
         assert_eq!(m1.len(), 26);
-        assert_eq!(m2.is_empty(), false);
+        assert!(!m2.is_empty());
         assert_eq!(m2.len(), 26);
 
-        assert_eq!(m1.clone().into_iter().eq(entries1), true);
-        assert_eq!(m2.clone().into_iter().eq(entries2), true);
-        assert_eq!(m1.iter().eq(m2.iter()), false);
-        assert_eq!(m1.eq(&m1), true);
-        assert_eq!(m2.eq(&m2), true);
+        assert!(m1.clone().into_iter().eq(entries1));
+        assert!(m2.clone().into_iter().eq(entries2));
+        assert!(!m1.iter().eq(m2.iter()));
+        assert!(m1.eq(&m1));
+        assert!(m2.eq(&m2));
         assert_eq!(m1, m2);
 
         assert_eq!(m1.get(&1), Some(&'b'));

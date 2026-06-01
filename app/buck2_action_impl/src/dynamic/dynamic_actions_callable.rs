@@ -16,11 +16,11 @@ use allocative::Allocative;
 use buck2_build_api::interpreter::rule_defs::context::AnalysisActions;
 use buck2_build_api::interpreter::rule_defs::provider::ty::abstract_provider::AbstractProvider;
 use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use dupe::Dupe;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
-use starlark::environment::MethodsStatic;
 use starlark::eval::Arguments;
 use starlark::eval::Evaluator;
 use starlark::eval::ParametersSpec;
@@ -39,6 +39,7 @@ use starlark::values::FrozenValue;
 use starlark::values::FrozenValueTyped;
 use starlark::values::Heap;
 use starlark::values::NoSerialize;
+use starlark::values::StarlarkPagable;
 use starlark::values::StarlarkValue;
 use starlark::values::Trace;
 use starlark::values::Value;
@@ -58,12 +59,14 @@ use crate::dynamic::dynamic_actions::StarlarkDynamicActionsData;
 pub struct DynamicActionsCallbackParamSpec;
 
 pub struct DynamicActionsCallbackParam {
-    pub name: &'static str,
+    pub name: pagable::StaticStr,
     pub ty: LazyLock<Ty>,
 }
 
+pagable::static_str!(P_ACTIONS_NAME = "actions");
+
 pub(crate) static P_ACTIONS: DynamicActionsCallbackParam = DynamicActionsCallbackParam {
-    name: "actions",
+    name: P_ACTIONS_NAME,
     ty: LazyLock::new(AnalysisActions::starlark_type_repr),
 };
 
@@ -105,7 +108,7 @@ enum DynamicActionCallableError {
 )]
 #[display(
     "DynamicActionCallable[{}]",
-    self.name.get().map(|s| s.as_str()).unwrap_or("(unbound)")
+    self.name.get().map_or("(unbound)", |s| s.as_str())
 )]
 pub struct DynamicActionsCallable<'v> {
     pub(crate) self_ty: Ty,
@@ -120,10 +123,12 @@ pub struct DynamicActionsCallable<'v> {
     NoSerialize,
     ProvidesStaticType,
     Allocative,
-    derive_more::Display
+    derive_more::Display,
+    StarlarkPagable
 )]
 #[display("DynamicActionsCallable[{}]", name)]
 pub struct FrozenStarlarkDynamicActionsCallable {
+    #[starlark_pagable(pagable)]
     pub(crate) self_ty: Ty,
     pub(crate) implementation:
         FrozenStarlarkCallable<DynamicActionsCallbackParamSpec, DynamicActionsCallbackReturnType>,
@@ -131,6 +136,8 @@ pub struct FrozenStarlarkDynamicActionsCallable {
     name: String,
     signature: ParametersSpec<FrozenValue>,
 }
+
+starlark::methods_static!(DYNAMIC_ACTION_CALLABLE_METHODS = dynamic_action_callable_methods);
 
 #[starlark_value(type = "DynamicActionCallable")]
 impl<'v> StarlarkValue<'v> for DynamicActionsCallable<'v> {
@@ -152,9 +159,7 @@ impl<'v> StarlarkValue<'v> for DynamicActionsCallable<'v> {
         _args: &Arguments<'v, '_>,
         _eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
-        Err(starlark::Error::new_other(buck2_error::Error::from(
-            DynamicActionCallableError::NotFrozen,
-        )))
+        Err(buck2_error::Error::from(DynamicActionCallableError::NotFrozen).into())
     }
 
     fn typechecker_ty(&self) -> Option<Ty> {
@@ -163,8 +168,7 @@ impl<'v> StarlarkValue<'v> for DynamicActionsCallable<'v> {
 
     // used for docs of `DynamicActionCallable`
     fn get_methods() -> Option<&'static Methods> {
-        static RES: MethodsStatic = MethodsStatic::new();
-        RES.methods(dynamic_action_callable_methods)
+        Some(DYNAMIC_ACTION_CALLABLE_METHODS.methods())
     }
 }
 
@@ -178,7 +182,9 @@ impl<'v> StarlarkValue<'v> for FrozenStarlarkDynamicActionsCallable {
         args: &Arguments<'v, '_>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
-        let me = me.unpack_frozen().internal_error("me must be frozen")?;
+        let me = me
+            .unpack_frozen()
+            .ok_or_else(|| internal_error!("me must be frozen"))?;
         let me = FrozenValueTyped::new_err(me)?;
         let attr_values: DynamicAttrValues<Value<'v>> =
             self.signature.parser(args, eval, |parser, _eval| {
@@ -207,7 +213,7 @@ impl<'v> StarlarkValue<'v> for FrozenStarlarkDynamicActionsCallable {
 }
 
 impl<'v> AllocValue<'v> for DynamicActionsCallable<'v> {
-    fn alloc_value(self, heap: &'v Heap) -> Value<'v> {
+    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
         heap.alloc_complex(self)
     }
 }
@@ -225,7 +231,7 @@ impl<'v> Freeze for DynamicActionsCallable<'v> {
 
         let name = name
             .into_inner()
-            .buck_error_context(DynamicActionCallableError::NotExported)
+            .ok_or(DynamicActionCallableError::NotExported)
             .map_err(|e| FreezeError::new(e.to_string()))?;
 
         let signature = ParametersSpec::new_named_only(

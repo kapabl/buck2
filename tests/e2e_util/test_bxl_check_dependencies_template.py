@@ -56,6 +56,16 @@ if FLAVOR == "check_dependencies_test":  # noqa: C901
             *blocklist_args,
             "--target_deps",
             os.environ["TARGET_DEPS"],
+            *(
+                ["--deps_filter_pattern", os.environ["DEPS_FILTER_PATTERN"]]
+                if os.environ.get("DEPS_FILTER_PATTERN")
+                else []
+            ),
+            *(
+                ["--deps_exclude_pattern", os.environ["DEPS_EXCLUDE_PATTERN"]]
+                if os.environ.get("DEPS_EXCLUDE_PATTERN")
+                else []
+            ),
             env={
                 "BUCK2_TEST_DISABLE_LOG_UPLOAD": "false",
                 "BUCK2_RUNTIME_THREADS": "8",
@@ -128,8 +138,17 @@ elif FLAVOR == "check_mutually_exclusive_dependencies_test":
     @buck_test(inplace=True)
     async def test_check_mutually_exclusive_dependencies_bxl(buck) -> None:
         expect_failure_msg = os.environ["EXPECT_FAILURE_MSG"]
+
+        # Build mode argfile is passed directly to buck2 as an argfile
+        # e.g., "@fbsource//arvr/mode/android/linux/opt"
+        build_mode_argfile = os.environ.get("BUILD_MODE_ARGFILE", "")
+        additional_args = []
+        if build_mode_argfile:
+            additional_args.append(build_mode_argfile)
+
         bxl_call = buck.bxl(
             os.environ["BXL_MAIN"],
+            *additional_args,
             "--",
             "--target",
             os.environ["TARGET"],

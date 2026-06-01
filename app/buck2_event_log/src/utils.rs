@@ -30,6 +30,9 @@ pub(crate) enum EventLogErrors {
     #[error("No event log available for {idx}th last command (have latest {num_logfiles})")]
     #[buck2(tag = EventLogIndexOutOfBounds)]
     RecentIndexOutOfBounds { idx: usize, num_logfiles: usize },
+    #[buck2(tag = Input)]
+    #[error("Can't parse a timestamp from `{0}`")]
+    InvalidTimestamp(String),
 }
 
 #[derive(Copy, Clone, Dupe, Debug)]
@@ -43,6 +46,12 @@ pub struct Encoding {
 }
 
 impl Encoding {
+    /// Two encodings are equivalent if they would produce the same bytes for the same logical
+    /// stream of events. The `extensions` list does not participate.
+    pub(crate) fn equivalent_to(&self, other: &Encoding) -> bool {
+        self.mode == other.mode && self.compression == other.compression
+    }
+
     pub(crate) const JSON: Encoding = Encoding {
         mode: LogMode::Json,
         compression: Compression::None,
@@ -124,7 +133,7 @@ pub(crate) enum LogMode {
     Protobuf,
 }
 
-#[derive(Copy, Clone, Dupe, Debug)]
+#[derive(Copy, Clone, Dupe, Debug, PartialEq, Eq)]
 pub(crate) enum Compression {
     None,
     Gzip,
@@ -181,6 +190,56 @@ impl Invocation {
                 .and_then(|s| TraceId::from_str(&s).ok())
                 .unwrap_or(TraceId::null()),
             start_time: proto.start_time.and_then(|t| t.try_into().ok()),
+        }
+    }
+}
+
+pub mod timestamp {
+    use chrono::DateTime;
+    use chrono::Utc;
+    use prost_types::Timestamp;
+
+    use super::EventLogErrors;
+
+    pub fn parse_as_unixtime_float(time: &str) -> Option<DateTime<Utc>> {
+        let (ipart, fpart) = time.split_once(".")?;
+
+        let ipart = ipart.parse::<i64>().ok()?;
+        // The fractional part needs to be truncated to 9 places or right-padded (*10^pad)
+        // to nine places to be nanoseconds.
+        let fpart = if fpart.len() > 9 { &fpart[..9] } else { fpart };
+        let fmult = 10u32.pow(0i64.max(9i64 - (fpart.len() as i64)) as u32);
+        let fpart = fpart.parse::<u32>().ok()?;
+
+        DateTime::from_timestamp(ipart, fpart * fmult)
+    }
+
+    pub fn parse_as_unixtime_seconds(time: &str) -> Option<DateTime<Utc>> {
+        let ipart = time.parse::<i64>().ok()?;
+        DateTime::from_timestamp(ipart, 0)
+    }
+
+    pub fn parse_as_unixtime_nanoseconds(time: &str) -> Option<DateTime<Utc>> {
+        // Perfetto lets you copy the "raw value" of timestamps as billions of nanoseconds
+        if time.len() < 19 {
+            return None;
+        }
+        let ipart = time[..time.len() - 9].parse::<i64>().ok()?;
+        let fpart = time[time.len() - 9..].parse::<u32>().ok()?;
+        DateTime::from_timestamp(ipart, fpart)
+    }
+
+    pub fn parse(time: &str) -> buck2_error::Result<DateTime<Utc>> {
+        parse_as_unixtime_float(time)
+            .or_else(|| parse_as_unixtime_seconds(time))
+            .or_else(|| parse_as_unixtime_nanoseconds(time))
+            .ok_or(EventLogErrors::InvalidTimestamp(time.to_owned()).into())
+    }
+
+    pub fn to_protobuf_timestamp(dt: DateTime<Utc>) -> Timestamp {
+        Timestamp {
+            seconds: dt.timestamp(),
+            nanos: dt.timestamp_subsec_nanos() as i32,
         }
     }
 }

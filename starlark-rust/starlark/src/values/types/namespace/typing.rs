@@ -21,16 +21,22 @@ use std::fmt::Formatter;
 
 use allocative::Allocative;
 use dupe::Dupe;
+use pagable::Pagable;
+use pagable::pagable_typetag;
+use starlark_derive::type_matcher;
 use starlark_map::sorted_map::SortedMap;
 
+use crate as starlark;
 use crate::codemap::Span;
 use crate::typing::ParamSpec;
 use crate::typing::Ty;
 use crate::typing::call_args::TyCallArgs;
 use crate::typing::callable::TyCallable;
+use crate::typing::custom::TyCustomDyn;
 use crate::typing::custom::TyCustomImpl;
 use crate::typing::error::TypingNoContextError;
 use crate::typing::error::TypingOrInternalError;
+use crate::typing::function::TyCustomFunction;
 use crate::typing::function::TyCustomFunctionImpl;
 use crate::typing::oracle::ctx::TypingOracleCtx;
 use crate::util::arc_str::ArcStr;
@@ -39,11 +45,25 @@ use crate::values::starlark_type_id::StarlarkTypeId;
 use crate::values::types::namespace::value::Namespace;
 use crate::values::typing::type_compiled::alloc::TypeMatcherAlloc;
 use crate::values::typing::type_compiled::matcher::TypeMatcher;
+use crate::values::typing::type_compiled::matcher::TypeMatcherDyn;
+
+#[derive(Allocative, Eq, PartialEq, Hash, Debug, Clone, Copy, Dupe, Pagable)]
+#[pagable_typetag(TypeMatcherDyn)]
+struct NamespaceMatcher;
+
+#[type_matcher]
+impl TypeMatcher for NamespaceMatcher {
+    fn matches(&self, value: Value) -> bool {
+        value.starlark_type_id() == StarlarkTypeId::of::<Namespace<'static>>()
+    }
+}
 
 #[derive(
-    Allocative, Clone, Copy, Dupe, Debug, Eq, PartialEq, Hash, Ord, PartialOrd
+    Allocative, Clone, Copy, Dupe, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Pagable
 )]
 pub(super) struct TyNamespaceFunction;
+
+pagable::register_typetag!(TyCustomFunction<TyNamespaceFunction> as dyn TyCustomDyn);
 
 impl TyCustomFunctionImpl for TyNamespaceFunction {
     fn as_callable(&self) -> TyCallable {
@@ -79,7 +99,10 @@ impl TyCustomFunctionImpl for TyNamespaceFunction {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Allocative)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Allocative, Pagable
+)]
+#[pagable_typetag(TyCustomDyn)]
 pub(super) struct TyNamespace {
     pub(super) fields: SortedMap<ArcStr, Ty>,
     /// [`true`] if there might be additional fields not captured above,
@@ -106,15 +129,6 @@ impl TyCustomImpl for TyNamespace {
     }
 
     fn matcher<T: TypeMatcherAlloc>(&self, factory: T) -> T::Result {
-        #[derive(Allocative, Eq, PartialEq, Hash, Debug, Clone, Copy, Dupe)]
-        struct NamespaceMatcher;
-
-        impl TypeMatcher for NamespaceMatcher {
-            fn matches(&self, value: Value) -> bool {
-                value.starlark_type_id() == StarlarkTypeId::of::<Namespace<'static>>()
-            }
-        }
-
         factory.alloc(NamespaceMatcher)
     }
 }

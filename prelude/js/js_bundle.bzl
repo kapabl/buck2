@@ -15,16 +15,10 @@ load("@prelude//utils:expect.bzl", "expect")
 load("@prelude//utils:utils.bzl", "map_idx")
 
 def _build_dependencies_file(
-        ctx: AnalysisContext,
-        transform_profile: str,
-        flavors: list[str],
-        transitive_js_library_outputs: TransitiveSetArgsProjection) -> Artifact:
-    dependencies_file = ctx.actions.declare_output("{}/dependencies_file", transform_profile)
+    ctx: AnalysisContext, transform_profile: str, flavors: list[str], transitive_js_library_outputs: TransitiveSetArgsProjection
+) -> Artifact:
+    dependencies_file = ctx.actions.declare_output("{}/dependencies_file", transform_profile, has_content_based_path = False)
 
-    # ctx.attrs.extra_json can contain attrs.arg().
-    #
-    # As a result, we need to pass extra_data_args as hidden arguments so that the rule
-    # it is referencing exists as an input.
     extra_data_args = cmd_args(
         ctx.attrs.extra_json if ctx.attrs.extra_json else "{}",
         delimiter = "",
@@ -35,13 +29,15 @@ def _build_dependencies_file(
         "extraData": extra_data_args,
         "flavors": flavors,
         "libraries": transitive_js_library_outputs,
-        "outputFilePath": dependencies_file,
+        "outputFilePath": dependencies_file.as_output(),
         "platform": ctx.attrs._platform,
         "release": ctx.attrs._is_release,
     }
     command_args_file = ctx.actions.write_json(
         "{}_dep_command_args".format(transform_profile),
         job_args,
+        with_inputs = True,
+        has_content_based_path = False,
     )
 
     run_worker_commands(
@@ -50,39 +46,31 @@ def _build_dependencies_file(
         command_args_files = [command_args_file],
         identifier = transform_profile,
         category = "dependencies",
-        hidden_artifacts = [cmd_args(
-            dependencies_file.as_output(),
-            extra_data_args,
-            transitive_js_library_outputs,
-        )],
     )
     return dependencies_file
 
 def _build_js_bundle(
-        ctx: AnalysisContext,
-        bundle_name: str,
-        transform_profile: str,
-        flavors: list[str],
-        transitive_js_library_outputs: TransitiveSetArgsProjection,
-        dependencies_file: Artifact) -> JsBundleInfo:
+    ctx: AnalysisContext,
+    bundle_name: str,
+    transform_profile: str,
+    flavors: list[str],
+    transitive_js_library_outputs: TransitiveSetArgsProjection,
+    dependencies_file: Artifact,
+) -> JsBundleInfo:
     base_dir = transform_profile
-    assets_dir = ctx.actions.declare_output("{}/assets_dir".format(base_dir))
-    bundle_dir_output = ctx.actions.declare_output("{}/js".format(base_dir), dir = True)
-    misc_dir_path = ctx.actions.declare_output("{}/misc_dir_path".format(base_dir))
-    source_map = ctx.actions.declare_output("{}/source_map".format(base_dir))
+    assets_dir = ctx.actions.declare_output("{}/assets_dir".format(base_dir), has_content_based_path = False)
+    bundle_dir_output = ctx.actions.declare_output("{}/js".format(base_dir), dir = True, has_content_based_path = False)
+    misc_dir_path = ctx.actions.declare_output("{}/misc_dir_path".format(base_dir), has_content_based_path = False)
+    source_map = ctx.actions.declare_output("{}/source_map".format(base_dir), has_content_based_path = False)
 
-    # ctx.attrs.extra_json can contain attrs.arg().
-    #
-    # As a result, we need to pass extra_data_args as hidden arguments so that the rule
-    # it is referencing exists as an input.
     extra_data_args = cmd_args(
         ctx.attrs.extra_json if ctx.attrs.extra_json else "{}",
         delimiter = "",
     )
     job_args = {
-        "assetsDirPath": assets_dir,
+        "assetsDirPath": assets_dir.as_output(),
         "bundlePath": cmd_args(
-            [bundle_dir_output, bundle_name],
+            [bundle_dir_output.as_output(), bundle_name],
             delimiter = "/",
         ),
         "command": "bundle",
@@ -90,15 +78,17 @@ def _build_js_bundle(
         "extraData": extra_data_args,
         "flavors": flavors,
         "libraries": transitive_js_library_outputs,
-        "miscDirPath": misc_dir_path,
+        "miscDirPath": misc_dir_path.as_output(),
         "platform": ctx.attrs._platform,
         "release": ctx.attrs._is_release,
-        "sourceMapPath": source_map,
+        "sourceMapPath": source_map.as_output(),
     }
 
     command_args_file = ctx.actions.write_json(
         "{}_bundle_command_args".format(base_dir),
         job_args,
+        with_inputs = True,
+        has_content_based_path = False,
     )
 
     run_worker_commands(
@@ -106,15 +96,7 @@ def _build_js_bundle(
         worker_tool = ctx.attrs.worker,
         command_args_files = [command_args_file],
         identifier = base_dir,
-        category = job_args["command"],
-        hidden_artifacts = [cmd_args(
-            bundle_dir_output.as_output(),
-            assets_dir.as_output(),
-            misc_dir_path.as_output(),
-            source_map.as_output(),
-            extra_data_args,
-            transitive_js_library_outputs,
-        )],
+        category = "bundle",
     )
 
     return JsBundleInfo(
@@ -131,7 +113,7 @@ def _get_fallback_transform_profile(ctx: AnalysisContext) -> str:
         return ctx.attrs.fallback_transform_profile
 
     if ctx.attrs.fallback_transform_profile == "default" or ctx.attrs.fallback_transform_profile == None:
-        return "transform-profile-default"
+        return "hermes-legacy"
 
     fail("Invalid fallback_transform_profile attribute {}!".format(ctx.attrs.fallback_transform_profile))
 
@@ -146,7 +128,7 @@ def _get_android_resource_info(ctx: AnalysisContext, js_bundle_info: JsBundleInf
         identifier = identifier,
     )
     expect(ctx.attrs.android_package != None, "Must provide android_package for android builds!")
-    r_dot_java_package = ctx.actions.write("{}_{}".format(identifier, JAVA_PACKAGE_FILENAME), ctx.attrs.android_package)
+    r_dot_java_package = ctx.actions.write("{}_{}".format(identifier, JAVA_PACKAGE_FILENAME), ctx.attrs.android_package, has_content_based_path = False)
     return AndroidResourceInfo(
         raw_target = ctx.label.raw_target(),
         aapt2_compile_output = aapt2_compile_output,

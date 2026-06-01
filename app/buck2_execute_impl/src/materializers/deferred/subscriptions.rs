@@ -10,16 +10,17 @@
 
 #![allow(unused)]
 
-use std::collections::HashMap;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_events::dispatch::EventDispatcher;
 use buck2_execute::materialize::materializer::DeferredMaterializerSubscription;
+use buck2_hash::StdBuckHashMap;
+use buck2_hash::StdBuckHashSet;
 use derivative::Derivative;
 use derive_more::Display;
 use dupe::Dupe;
@@ -38,14 +39,14 @@ use crate::materializers::deferred::MaterializerSender;
 /// notifications when those paths are materialized.
 pub(super) struct MaterializerSubscriptions {
     index: SubscriptionIndex,
-    active: HashMap<SubscriptionIndex, SubscriptionData>,
+    active: StdBuckHashMap<SubscriptionIndex, SubscriptionData>,
 }
 
 impl MaterializerSubscriptions {
     pub fn new() -> Self {
         Self {
             index: SubscriptionIndex(0),
-            active: HashMap::new(),
+            active: StdBuckHashMap::default(),
         }
     }
 
@@ -83,7 +84,7 @@ impl MaterializerSubscriptions {
     }
 
     pub(super) fn list_subscribed_paths(&self) -> impl Iterator<Item = &ProjectRelativePath> {
-        let mut seen = HashSet::new();
+        let mut seen = StdBuckHashSet::default();
 
         self.active
             .values()
@@ -94,14 +95,14 @@ impl MaterializerSubscriptions {
 }
 
 struct SubscriptionData {
-    paths: HashSet<ProjectRelativePathBuf>,
+    paths: StdBuckHashSet<ProjectRelativePathBuf>,
     sender: UnboundedSender<ProjectRelativePathBuf>,
 }
 
 impl SubscriptionData {
     fn new(sender: UnboundedSender<ProjectRelativePathBuf>) -> Self {
         Self {
-            paths: HashSet::new(),
+            paths: StdBuckHashSet::default(),
             sender,
         }
     }
@@ -187,7 +188,7 @@ where
                     .subscriptions
                     .active
                     .get_mut(&index)
-                    .with_buck_error_context(|| format!("Invalid subscription: {index}"))
+                    .ok_or_else(|| internal_error!("Invalid subscription: {index}"))
                     .unwrap();
 
                 for path in paths_to_report {
@@ -203,7 +204,7 @@ where
                     .subscriptions
                     .active
                     .get_mut(&index)
-                    .with_buck_error_context(|| format!("Invalid subscription: {index}"))
+                    .ok_or_else(|| internal_error!("Invalid subscription: {index}"))
                     .unwrap();
 
                 for path in &paths {

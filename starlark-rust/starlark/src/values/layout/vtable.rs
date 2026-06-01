@@ -25,6 +25,7 @@ use std::mem;
 use std::ptr;
 
 use allocative::Allocative;
+use allocative::Visitor;
 use dupe::Dupe;
 
 use crate::any::AnyLifetime;
@@ -37,6 +38,9 @@ use crate::docs::DocItem;
 use crate::environment::Methods;
 use crate::eval::Arguments;
 use crate::eval::Evaluator;
+use crate::pagable::DeserTypeId;
+use crate::pagable::starlark_deserialize::StarlarkDeserializeContext;
+use crate::pagable::starlark_serialize::StarlarkSerializeContext;
 use crate::private::Private;
 use crate::typing::Ty;
 use crate::values::FreezeResult;
@@ -68,7 +72,7 @@ use crate::values::traits::StarlarkValueVTableGet;
 pub(crate) struct StarlarkValueRawPtr {
     /// Points to the end of `AValueHeader`.
     /// May not be equal to to the start of `StarlarkValue` due to alignment.
-    ptr: *const (),
+    pub(crate) ptr: *const (),
 }
 
 impl StarlarkValueRawPtr {
@@ -108,7 +112,11 @@ impl StarlarkValueRawPtr {
     }
 }
 
-pub(crate) struct AValueVTable {
+/// VTable for `AValue` operations.
+///
+/// This struct contains function pointers for all operations on a Starlark value,
+/// allowing dynamic dispatch.
+pub struct AValueVTable {
     // Common `AValue` fields.
     pub(crate) static_type_of_value: ConstTypeId,
     pub(crate) starlark_type_id: StarlarkTypeId,
@@ -119,6 +127,10 @@ pub(crate) struct AValueVTable {
     // `StarlarkValue`
     pub(crate) starlark_value: StarlarkValueVTable,
 
+    /// Deserialization type identifier
+    /// Used for vtable lookup during deserialization.
+    pub(crate) deser_type_id: DeserTypeId,
+
     // `Drop`
     drop_in_place: fn(StarlarkValueRawPtr),
 
@@ -127,12 +139,20 @@ pub(crate) struct AValueVTable {
     memory_size: fn(StarlarkValueRawPtr) -> ValueAllocSize,
     heap_freeze: fn(StarlarkValueRawPtr, &Freezer) -> FreezeResult<FrozenValue>,
     heap_copy: for<'v> fn(StarlarkValueRawPtr, &Tracer<'v>) -> Value<'v>,
+    starlark_serialize:
+        fn(StarlarkValueRawPtr, &mut dyn StarlarkSerializeContext) -> crate::Result<()>,
+    pub(crate) starlark_deserialize: for<'de> fn(
+        StarlarkValueRawPtr,
+        &mut dyn StarlarkDeserializeContext<'de>,
+    ) -> crate::Result<()>,
 
     // `StarlarkValue` supertraits.
     display: unsafe fn(StarlarkValueRawPtr) -> *const dyn Display,
     debug: unsafe fn(StarlarkValueRawPtr) -> *const dyn Debug,
     erased_serde_serialize: unsafe fn(StarlarkValueRawPtr) -> *const dyn erased_serde::Serialize,
     allocative: unsafe fn(StarlarkValueRawPtr) -> *const dyn Allocative,
+    total_memory_for_profile: unsafe fn(StarlarkValueRawPtr) -> usize,
+    visit_extra_allocative: for<'a, 'b> unsafe fn(StarlarkValueRawPtr, &'a mut Visitor<'b>),
 }
 
 struct GetTypeId<'v, T: StarlarkValue<'v>>(PhantomData<&'v T>);
@@ -148,12 +168,74 @@ impl<'v, T: StarlarkValue<'v>> GetAllocativeKey<'v, T> {
     const ALLOCATIVE_KEY: allocative::Key = allocative::Key::new(T::TYPE);
 }
 
+/// Helper struct to compute [`DeserTypeId`] as an associated const
+/// for a generic `StarlarkValue` type parameter.
+/// Used in `AValueVTable::new()` which is a `const fn`.
+struct GetDeserTypeId<'v, T: StarlarkValue<'v>>(PhantomData<&'v T>);
+
+impl<'v, T: StarlarkValue<'v>> GetDeserTypeId<'v, T> {
+    const DESER_TYPE_ID: DeserTypeId = DeserTypeId::of::<T>();
+}
+
+/// Marker type for uninitialized deserialized values.
+/// All methods panic with a descriptive message.
+#[derive(Allocative)]
+struct UninitializedValue;
+
+impl Display for UninitializedValue {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "<uninitialized>")
+    }
+}
+
+impl Debug for UninitializedValue {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "<uninitialized>")
+    }
+}
+
 impl AValueVTable {
+    /// Sentinel vtable for values that have been allocated but not yet deserialized.
+    /// Every method panics with "accessing uninitialized deserialized value".
+    pub(crate) fn uninitialized_sentinel() -> &'static AValueVTable {
+        const UNINIT_ALLOCATIVE_KEY: allocative::Key = allocative::Key::new("UninitializedValue");
+        const UNINIT_TYPE_ID: ConstTypeId = ConstTypeId::of::<UninitializedValue>();
+        const UNINIT_STARLARK_TYPE_ID: StarlarkTypeId =
+            StarlarkTypeId::from_type_id(UNINIT_TYPE_ID);
+        const UNINIT_DESER_TYPE_ID: DeserTypeId = DeserTypeId::of::<UninitializedValue>();
+
+        const PANIC_MSG: &str = "accessing a frozen value that has not been deserialized yet";
+
+        &AValueVTable {
+            drop_in_place: |_| {},
+            is_str: false,
+            memory_size: |_| panic!("{}", PANIC_MSG),
+            static_type_of_value: UNINIT_TYPE_ID,
+            starlark_type_id: UNINIT_STARLARK_TYPE_ID,
+            heap_freeze: |_, _| panic!("{}", PANIC_MSG),
+            heap_copy: |_, _| panic!("{}", PANIC_MSG),
+            starlark_serialize: |_, _| panic!("{}", PANIC_MSG),
+            starlark_deserialize: |_, _| panic!("{}", PANIC_MSG),
+            type_name: "UninitializedValue",
+            type_as_allocative_key: UNINIT_ALLOCATIVE_KEY,
+            deser_type_id: UNINIT_DESER_TYPE_ID,
+            display: |_| panic!("{}", PANIC_MSG),
+            debug: |_| panic!("{}", PANIC_MSG),
+            erased_serde_serialize: |_| panic!("{}", PANIC_MSG),
+            allocative: |_| panic!("{}", PANIC_MSG),
+            total_memory_for_profile: |_| panic!("{}", PANIC_MSG),
+            visit_extra_allocative: |_, _| panic!("{}", PANIC_MSG),
+            starlark_value: StarlarkValueVTable::UNINITIALIZED_SENTINEL,
+        }
+    }
+
     pub(crate) fn new_black_hole() -> &'static AValueVTable {
         const BLACKHOLE_ALLOCATIVE_KEY: allocative::Key = allocative::Key::new("BlackHole");
         const BLACKHOLE_TYPE_ID: ConstTypeId = ConstTypeId::of::<BlackHole>();
         const BLACKHOLE_STARLARK_TYPE_ID: StarlarkTypeId =
             StarlarkTypeId::from_type_id(BLACKHOLE_TYPE_ID);
+        const BLACKHOLE_DESER_TYPE_ID: DeserTypeId = DeserTypeId::of::<BlackHole>();
+
         &AValueVTable {
             drop_in_place: |_| {},
 
@@ -164,8 +246,11 @@ impl AValueVTable {
 
             heap_freeze: |_, _| panic!("BlackHole"),
             heap_copy: |_, _| panic!("BlackHole"),
+            starlark_serialize: |_, _| panic!("BlackHole"),
+            starlark_deserialize: |_, _| panic!("BlackHole"),
             type_name: "BlackHole",
             type_as_allocative_key: BLACKHOLE_ALLOCATIVE_KEY,
+            deser_type_id: BLACKHOLE_DESER_TYPE_ID,
 
             display: |this| {
                 let this = unsafe { &*this.value_ptr::<BlackHole>() };
@@ -180,11 +265,19 @@ impl AValueVTable {
                 let this = unsafe { &*this.value_ptr::<BlackHole>() };
                 this as *const dyn Allocative
             },
+            total_memory_for_profile: |this| unsafe {
+                (*this.value_ptr::<BlackHole>()).0.bytes() as usize
+            },
+            visit_extra_allocative: |_, _| {},
             starlark_value: StarlarkValueVTable::BLACK_HOLE,
         }
     }
 
-    pub(crate) const fn new<'v, T: AValue<'v>>() -> &'static AValueVTable {
+    /// Public for use by `register_avalue_simple_frozen!` macro in doctests.
+    /// Hidden from docs and uses private `AValue` bound to prevent direct external use.
+    #[doc(hidden)]
+    #[allow(private_bounds)]
+    pub const fn new<'v, T: AValue<'v>>() -> &'static AValueVTable {
         &AValueVTable {
             drop_in_place: |p| unsafe {
                 ptr::drop_in_place(p.value_ptr::<T::StarlarkValue>());
@@ -203,10 +296,20 @@ impl AValueVTable {
                 let value = T::heap_copy(p, transmute!(&Tracer, &Tracer, tracer));
                 transmute!(Value, Value, value)
             },
+            starlark_serialize: |p, ctx| unsafe {
+                let p = AValueRepr::from_payload_ptr_mut(p.value_ptr::<T::StarlarkValue>())
+                    as *const AValueRepr<T::StarlarkValue>;
+                T::starlark_serialize(p, ctx)
+            },
+            starlark_deserialize: |p, ctx| unsafe {
+                let p = AValueRepr::from_payload_ptr_mut(p.value_ptr::<T::StarlarkValue>());
+                T::starlark_deserialize(p, ctx)
+            },
             static_type_of_value: GetTypeId::<T::StarlarkValue>::TYPE_ID,
             starlark_type_id: GetTypeId::<T::StarlarkValue>::STARLARK_TYPE_ID,
             type_name: T::StarlarkValue::TYPE,
             type_as_allocative_key: GetAllocativeKey::<T::StarlarkValue>::ALLOCATIVE_KEY,
+            deser_type_id: GetDeserTypeId::<T::StarlarkValue>::DESER_TYPE_ID,
             display: |this| unsafe {
                 let this = this.value_ptr::<T::StarlarkValue>();
                 let display = this as *const dyn Display;
@@ -230,6 +333,14 @@ impl AValueVTable {
                 let allocative = this as *const dyn Allocative;
                 // Drop lifetime.
                 mem::transmute(allocative)
+            },
+            total_memory_for_profile: |this| unsafe {
+                let p = &*this.value_ptr::<T::StarlarkValue>();
+                T::total_memory_for_profile(p)
+            },
+            visit_extra_allocative: |this, visitor| unsafe {
+                let p = &*this.value_ptr::<T::StarlarkValue>();
+                T::visit_extra_allocative(p, visitor)
             },
             starlark_value: StarlarkValueVTableGet::<'v, T::StarlarkValue>::VTABLE,
         }
@@ -257,7 +368,7 @@ impl AValueVTable {
 #[derive(Copy, Clone, Dupe)]
 #[repr(C)]
 pub(crate) struct AValueDyn<'v> {
-    value: StarlarkValueRawPtr,
+    pub(crate) value: StarlarkValueRawPtr,
     vtable: &'static AValueVTable,
     _marker: PhantomData<&'v ()>,
 }
@@ -295,9 +406,12 @@ impl<'v> AValueDyn<'v> {
         unsafe { &*(self.vtable.allocative)(self.value) }
     }
 
-    pub(crate) fn total_memory(self) -> usize {
-        (self.memory_size().bytes() as usize)
-            + allocative::size_of_unique_allocated_data(self.as_allocative())
+    pub(crate) fn total_memory_for_profile(self) -> usize {
+        unsafe { (self.vtable.total_memory_for_profile)(self.value) }
+    }
+
+    pub(crate) fn visit_extra_allocative<'a, 'b: 'a>(self, visitor: &'a mut Visitor<'b>) {
+        unsafe { (self.vtable.visit_extra_allocative)(self.value, visitor) }
     }
 
     #[inline]
@@ -308,6 +422,21 @@ impl<'v> AValueDyn<'v> {
     #[inline]
     pub(crate) unsafe fn heap_copy(self, tracer: &Tracer<'v>) -> Value<'v> {
         (self.vtable.heap_copy)(self.value, tracer)
+    }
+
+    pub(crate) fn starlark_serialize(
+        self,
+        ctx: &mut dyn StarlarkSerializeContext,
+    ) -> crate::Result<()> {
+        (self.vtable.starlark_serialize)(self.value, ctx)
+    }
+
+    #[expect(dead_code)]
+    pub(crate) fn starlark_deserialize(
+        self,
+        ctx: &mut dyn StarlarkDeserializeContext<'_>,
+    ) -> crate::Result<()> {
+        (self.vtable.starlark_deserialize)(self.value, ctx)
     }
 
     #[inline]
@@ -324,7 +453,7 @@ impl<'v> AValueDyn<'v> {
     }
 
     #[inline]
-    pub(crate) fn at(self, index: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub(crate) fn at(self, index: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         (self.vtable.starlark_value.at)(self.value, index, heap)
     }
 
@@ -332,7 +461,7 @@ impl<'v> AValueDyn<'v> {
         self,
         index0: Value<'v>,
         index1: Value<'v>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> crate::Result<Value<'v>> {
         (self.vtable.starlark_value.at2)(self.value, index0, index1, heap, Private)
     }
@@ -348,23 +477,23 @@ impl<'v> AValueDyn<'v> {
         start: Option<Value<'v>>,
         stop: Option<Value<'v>>,
         step: Option<Value<'v>>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> crate::Result<Value<'v>> {
         (self.vtable.starlark_value.slice)(self.value, start, stop, step, heap)
     }
 
     #[inline]
-    pub(crate) fn get_attr(self, name: &str, heap: &'v Heap) -> Option<Value<'v>> {
+    pub(crate) fn get_attr(self, name: &str, heap: Heap<'v>) -> Option<Value<'v>> {
         (self.vtable.starlark_value.get_attr)(self.value, name, heap)
     }
 
     #[inline]
-    pub(crate) fn get_attr_hashed(self, name: Hashed<&str>, heap: &'v Heap) -> Option<Value<'v>> {
+    pub(crate) fn get_attr_hashed(self, name: Hashed<&str>, heap: Heap<'v>) -> Option<Value<'v>> {
         (self.vtable.starlark_value.get_attr_hashed)(self.value, name, heap)
     }
 
     #[inline]
-    pub(crate) fn has_attr(self, name: &str, heap: &'v Heap) -> bool {
+    pub(crate) fn has_attr(self, name: &str, heap: Heap<'v>) -> bool {
         (self.vtable.starlark_value.has_attr)(self.value, name, heap)
     }
 
@@ -374,22 +503,22 @@ impl<'v> AValueDyn<'v> {
     }
 
     #[inline]
-    pub(crate) fn bit_and(self, other: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub(crate) fn bit_and(self, other: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         (self.vtable.starlark_value.bit_and)(self.value, other, heap)
     }
 
     #[inline]
-    pub(crate) fn bit_or(self, other: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub(crate) fn bit_or(self, other: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         (self.vtable.starlark_value.bit_or)(self.value, other, heap)
     }
 
     #[inline]
-    pub(crate) fn bit_xor(self, other: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub(crate) fn bit_xor(self, other: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         (self.vtable.starlark_value.bit_xor)(self.value, other, heap)
     }
 
     #[inline]
-    pub(crate) fn bit_not(self, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub(crate) fn bit_not(self, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         (self.vtable.starlark_value.bit_not)(self.value, heap)
     }
 
@@ -404,12 +533,12 @@ impl<'v> AValueDyn<'v> {
     }
 
     #[inline]
-    pub(crate) fn iterate(self, me: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub(crate) fn iterate(self, me: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         (self.vtable.starlark_value.iterate)(self.value, me, heap)
     }
 
     #[inline]
-    pub(crate) fn iter_next(self, index: usize, heap: &'v Heap) -> Option<Value<'v>> {
+    pub(crate) fn iter_next(self, index: usize, heap: Heap<'v>) -> Option<Value<'v>> {
         (self.vtable.starlark_value.iter_next)(self.value, index, heap)
     }
 
@@ -429,62 +558,62 @@ impl<'v> AValueDyn<'v> {
     }
 
     #[inline]
-    pub(crate) fn plus(self, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub(crate) fn plus(self, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         (self.vtable.starlark_value.plus)(self.value, heap)
     }
 
     #[inline]
-    pub(crate) fn minus(self, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub(crate) fn minus(self, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         (self.vtable.starlark_value.minus)(self.value, heap)
     }
 
     #[inline]
-    pub(crate) fn add(self, other: Value<'v>, heap: &'v Heap) -> Option<crate::Result<Value<'v>>> {
+    pub(crate) fn add(self, other: Value<'v>, heap: Heap<'v>) -> Option<crate::Result<Value<'v>>> {
         (self.vtable.starlark_value.add)(self.value, other, heap)
     }
 
     #[inline]
-    pub(crate) fn radd(self, other: Value<'v>, heap: &'v Heap) -> Option<crate::Result<Value<'v>>> {
+    pub(crate) fn radd(self, other: Value<'v>, heap: Heap<'v>) -> Option<crate::Result<Value<'v>>> {
         (self.vtable.starlark_value.radd)(self.value, other, heap)
     }
 
     #[inline]
-    pub(crate) fn sub(self, other: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub(crate) fn sub(self, other: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         (self.vtable.starlark_value.sub)(self.value, other, heap)
     }
 
     #[inline]
-    pub(crate) fn mul(self, other: Value<'v>, heap: &'v Heap) -> Option<crate::Result<Value<'v>>> {
+    pub(crate) fn mul(self, other: Value<'v>, heap: Heap<'v>) -> Option<crate::Result<Value<'v>>> {
         (self.vtable.starlark_value.mul)(self.value, other, heap)
     }
 
     #[inline]
-    pub(crate) fn rmul(self, other: Value<'v>, heap: &'v Heap) -> Option<crate::Result<Value<'v>>> {
+    pub(crate) fn rmul(self, other: Value<'v>, heap: Heap<'v>) -> Option<crate::Result<Value<'v>>> {
         (self.vtable.starlark_value.rmul)(self.value, other, heap)
     }
 
     #[inline]
-    pub(crate) fn div(self, other: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub(crate) fn div(self, other: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         (self.vtable.starlark_value.div)(self.value, other, heap)
     }
 
     #[inline]
-    pub(crate) fn floor_div(self, other: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub(crate) fn floor_div(self, other: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         (self.vtable.starlark_value.floor_div)(self.value, other, heap)
     }
 
     #[inline]
-    pub(crate) fn percent(self, other: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub(crate) fn percent(self, other: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         (self.vtable.starlark_value.percent)(self.value, other, heap)
     }
 
     #[inline]
-    pub(crate) fn left_shift(self, other: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub(crate) fn left_shift(self, other: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         (self.vtable.starlark_value.left_shift)(self.value, other, heap)
     }
 
     #[inline]
-    pub(crate) fn right_shift(self, other: Value<'v>, heap: &'v Heap) -> crate::Result<Value<'v>> {
+    pub(crate) fn right_shift(self, other: Value<'v>, heap: Heap<'v>) -> crate::Result<Value<'v>> {
         (self.vtable.starlark_value.right_shift)(self.value, other, heap)
     }
 
@@ -496,6 +625,11 @@ impl<'v> AValueDyn<'v> {
     #[inline]
     pub(crate) fn collect_repr_cycle(self, collector: &mut String) {
         (self.vtable.starlark_value.collect_repr_cycle)(self.value, collector)
+    }
+
+    #[inline]
+    pub(crate) fn collect_str(self, collector: &mut String) {
+        (self.vtable.starlark_value.collect_str)(self.value, collector)
     }
 
     #[inline]

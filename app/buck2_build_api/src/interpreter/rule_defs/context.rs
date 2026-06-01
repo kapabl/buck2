@@ -13,6 +13,7 @@ use std::cell::RefMut;
 use std::convert::Infallible;
 use std::fmt;
 use std::fmt::Formatter;
+use std::sync::OnceLock;
 
 use allocative::Allocative;
 use buck2_core::provider::label::ConfiguredProvidersLabel;
@@ -20,6 +21,7 @@ use buck2_core::provider::label::ProvidersName;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
 use buck2_error::BuckErrorContext;
 use buck2_error::conversion::from_any_with_tag;
+use buck2_error::internal_error;
 use buck2_execute::digest_config::DigestConfig;
 use buck2_interpreter::late_binding_ty::AnalysisContextReprLate;
 use buck2_interpreter::types::configured_providers_label::StarlarkConfiguredProvidersLabel;
@@ -31,7 +33,6 @@ use starlark::any::ProvidesStaticType;
 use starlark::environment::GlobalsBuilder;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
-use starlark::environment::MethodsStatic;
 use starlark::typing::Ty;
 use starlark::values::AllocValue;
 use starlark::values::Heap;
@@ -46,7 +47,6 @@ use starlark::values::ValueTyped;
 use starlark::values::ValueTypedComplex;
 use starlark::values::none::NoneOr;
 use starlark::values::starlark_value;
-use starlark::values::starlark_value_as_type::StarlarkValueAsType;
 use starlark::values::structs::StructRef;
 use starlark::values::type_repr::StarlarkTypeRepr;
 
@@ -54,6 +54,44 @@ use crate::analysis::anon_promises_dyn::RunAnonPromisesAccessor;
 use crate::analysis::registry::AnalysisRegistry;
 use crate::deferred::calculation::GET_PROMISED_ARTIFACT;
 use crate::interpreter::rule_defs::plugins::AnalysisPlugins;
+
+/// Whether `declare_output` defaults `has_content_based_path` to `true`.
+/// Controlled by `[buck2] declare_output_has_content_based_path_default` buckconfig.
+pub static DECLARE_OUTPUT_HAS_CONTENT_BASED_PATH_DEFAULT: OnceLock<bool> = OnceLock::new();
+
+pub fn init_declare_output_has_content_based_path_default(
+    value: Option<bool>,
+) -> buck2_error::Result<()> {
+    let value = value.unwrap_or(false);
+    DECLARE_OUTPUT_HAS_CONTENT_BASED_PATH_DEFAULT
+        .set(value)
+        .map_err(|_| {
+            buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Tier0,
+                "DECLARE_OUTPUT_HAS_CONTENT_BASED_PATH_DEFAULT is already initialized"
+            )
+        })?;
+    Ok(())
+}
+
+/// Whether artifact-creating actions default `has_content_based_path` to `true`
+/// when a string name is passed as the output (i.e., the action implicitly
+/// declares the output).
+/// Controlled by `[buck2] action_has_content_based_path_default` buckconfig.
+pub static ACTION_HAS_CONTENT_BASED_PATH_DEFAULT: OnceLock<bool> = OnceLock::new();
+
+pub fn init_action_has_content_based_path_default(value: Option<bool>) -> buck2_error::Result<()> {
+    let value = value.unwrap_or(false);
+    ACTION_HAS_CONTENT_BASED_PATH_DEFAULT
+        .set(value)
+        .map_err(|_| {
+            buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Tier0,
+                "ACTION_HAS_CONTENT_BASED_PATH_DEFAULT is already initialized"
+            )
+        })?;
+    Ok(())
+}
 
 /// Functions to allow users to interact with the Actions registry.
 ///
@@ -77,21 +115,26 @@ impl<'v> AnalysisActions<'v> {
             .state
             .try_borrow_mut()
             .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))
-            .internal_error("AnalysisActions.state is already borrowed")?;
+            .buck_error_context("AnalysisActions.state is already borrowed")?;
         RefMut::filter_map(state, |x| x.as_mut())
             .ok()
-            .internal_error("state to be present during execution")
+            .ok_or_else(|| internal_error!("state to be present during execution"))
     }
 
     pub async fn run_promises<'a, 'e: 'a>(
         &self,
         accessor: &mut dyn RunAnonPromisesAccessor<'v, 'a, 'e>,
-    ) -> buck2_error::Result<()> {
+    ) -> buck2_error::Result<bool>
+    where
+        'v: 'a,
+    {
         // We need to loop here because running the promises evaluates promise.map, which might produce more promises.
         // We keep going until there are no promises left.
+        let mut resolved_any = false;
         loop {
             let promises = self.state()?.take_promises();
             if let Some(promises) = promises {
+                resolved_any = true;
                 promises.run_promises(accessor).await?;
             } else {
                 break;
@@ -102,7 +145,7 @@ impl<'v> AnalysisActions<'v> {
             .with_dice(|dice| self.assert_short_paths_and_resolve(dice).boxed_local())
             .await?;
 
-        Ok(())
+        Ok(resolved_any)
     }
 
     // Called after `run_promises()` to assert short paths and resolve consumer's promise artifacts.
@@ -133,19 +176,22 @@ impl<'v> AnalysisActions<'v> {
     }
 }
 
+starlark::methods_static!(
+    ANALYSIS_ACTIONS_METHODS = |builder| {
+        (ANALYSIS_ACTIONS_METHODS_ACTIONS.get().unwrap())(builder);
+        (ANALYSIS_ACTIONS_METHODS_ANON_TARGET.get().unwrap())(builder);
+    }
+);
+
 #[starlark_value(type = "AnalysisActions", StarlarkTypeRepr, UnpackValue)]
 impl<'v> StarlarkValue<'v> for AnalysisActions<'v> {
     fn get_methods() -> Option<&'static Methods> {
-        static RES: MethodsStatic = MethodsStatic::new();
-        RES.methods(|builder| {
-            (ANALYSIS_ACTIONS_METHODS_ACTIONS.get().unwrap())(builder);
-            (ANALYSIS_ACTIONS_METHODS_ANON_TARGET.get().unwrap())(builder);
-        })
+        Some(ANALYSIS_ACTIONS_METHODS.methods())
     }
 }
 
 impl<'v> AllocValue<'v> for AnalysisActions<'v> {
-    fn alloc_value(self, heap: &'v Heap) -> Value<'v> {
+    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
         heap.alloc_complex_no_freeze(self)
     }
 }
@@ -197,7 +243,7 @@ impl<'v> Display for AnalysisContext<'v> {
 impl<'v> AnalysisContext<'v> {
     /// The context that is provided to users' UDR implementation functions. Comprised of things like attribute values, actions, etc
     fn new(
-        heap: &'v Heap,
+        heap: Heap<'v>,
         attrs: Option<ValueOfUnchecked<'v, StructRef<'static>>>,
         label: Option<ValueTyped<'v, StarlarkConfiguredProvidersLabel>>,
         plugins: Option<ValueTypedComplex<'v, AnalysisPlugins<'v>>>,
@@ -218,7 +264,7 @@ impl<'v> AnalysisContext<'v> {
     }
 
     pub fn prepare(
-        heap: &'v Heap,
+        heap: Heap<'v>,
         attrs: Option<ValueOfUnchecked<'v, StructRef<'static>>>,
         label: Option<ConfiguredTargetLabel>,
         plugins: Option<ValueTypedComplex<'v, AnalysisPlugins<'v>>>,
@@ -249,16 +295,17 @@ impl<'v> AnalysisContext<'v> {
     }
 }
 
+starlark::methods_static!(ANALYSIS_CONTEXT_METHODS = analysis_context_methods);
+
 #[starlark_value(type = "AnalysisContext")]
 impl<'v> StarlarkValue<'v> for AnalysisContext<'v> {
     fn get_methods() -> Option<&'static Methods> {
-        static RES: MethodsStatic = MethodsStatic::new();
-        RES.methods(analysis_context_methods)
+        Some(ANALYSIS_CONTEXT_METHODS.methods())
     }
 }
 
 impl<'v> AllocValue<'v> for AnalysisContext<'v> {
-    fn alloc_value(self, heap: &'v Heap) -> Value<'v> {
+    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
         heap.alloc_complex_no_freeze(self)
     }
 }
@@ -301,10 +348,9 @@ fn analysis_context_methods(builder: &mut MethodsBuilder) {
     fn attrs<'v>(
         this: RefAnalysisContext<'v>,
     ) -> starlark::Result<ValueOfUnchecked<'v, StructRef<'static>>> {
-        Ok(this
-            .0
-            .attrs
-            .buck_error_context("`attrs` is not available for `dynamic_output` or BXL")?)
+        Ok(this.0.attrs.ok_or_else(|| {
+            internal_error!("`attrs` is not available for `dynamic_output` or BXL")
+        })?)
     }
 
     /// Returns an `actions` value containing functions to define actual actions that are run.
@@ -332,18 +378,15 @@ fn analysis_context_methods(builder: &mut MethodsBuilder) {
     fn plugins<'v>(
         this: RefAnalysisContext<'v>,
     ) -> starlark::Result<ValueTypedComplex<'v, AnalysisPlugins<'v>>> {
-        Ok(this
-            .0
-            .plugins
-            .buck_error_context("`plugins` is not available for `dynamic_output` or BXL")?)
+        Ok(this.0.plugins.ok_or_else(|| {
+            internal_error!("`plugins` is not available for `dynamic_output` or BXL")
+        })?)
     }
 }
 
 #[starlark_module]
-pub(crate) fn register_analysis_context(builder: &mut GlobalsBuilder) {
-    const AnalysisContext: StarlarkValueAsType<AnalysisContext> = StarlarkValueAsType::new();
-    const AnalysisActions: StarlarkValueAsType<AnalysisActions> = StarlarkValueAsType::new();
-}
+#[starlark_types(AnalysisContext<'_> as AnalysisContext, AnalysisActions<'_> as AnalysisActions)]
+pub(crate) fn register_analysis_context(builder: &mut GlobalsBuilder) {}
 
 pub static ANALYSIS_ACTIONS_METHODS_ACTIONS: LateBinding<fn(&mut MethodsBuilder)> =
     LateBinding::new("ANALYSIS_ACTIONS_METHODS_ACTIONS");

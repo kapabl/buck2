@@ -6,6 +6,7 @@ repository = { workspace = true }
 version = "0.1.0"
 
 [dependencies]
+async-trait = { workspace = true }
 console = { workspace = true }
 crossbeam-channel = { workspace = true }
 derive_more = { workspace = true }
@@ -29,11 +30,12 @@ buck2_cli_proto = { workspace = true }
 buck2_core = { workspace = true }
 buck2_data = { workspace = true }
 buck2_error = { workspace = true }
+buck2_hash = { workspace = true }
 buck2_util = { workspace = true }
 buck2_wrapper_common = { workspace = true }
 
 [target."cfg(windows)".dependencies]
 winver = "1"
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fbcode_build)"] }
+[lints]
+workspace = true

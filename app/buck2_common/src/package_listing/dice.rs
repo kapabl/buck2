@@ -17,8 +17,12 @@ use buck2_events::span::SpanId;
 use buck2_util::time_span::TimeSpan;
 use dice::DiceComputations;
 use dice::Key;
+use dice::OkPagableValueSerialize;
+use dice::ValueSerialize;
 use dice_futures::cancellation::CancellationContext;
 use dupe::Dupe;
+use pagable::Pagable;
+use pagable::pagable_typetag;
 use smallvec::SmallVec;
 
 use crate::package_listing::interpreter::InterpreterPackageListingResolver;
@@ -33,8 +37,10 @@ use crate::package_listing::resolver::PackageListingResolver;
     Eq,
     Hash,
     PartialEq,
-    Allocative
+    Allocative,
+    Pagable
 )]
+#[pagable_typetag(dice::DiceKeyDyn)]
 pub struct PackageListingKey(pub PackageLabel);
 
 pub struct PackageListingKeyActivationData {
@@ -71,6 +77,10 @@ impl Key for PackageListingKey {
             _ => false,
         }
     }
+
+    fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+        OkPagableValueSerialize::<Self::Value>::new()
+    }
 }
 
 pub struct DicePackageListingResolver<'compute, 'dice>(pub &'compute mut DiceComputations<'dice>);
@@ -106,8 +116,6 @@ impl DicePackageListingResolver<'_, '_> {
         &mut self,
         package: PackageLabel,
     ) -> buck2_error::Result<PackageListing> {
-        self.resolve(package)
-            .await
-            .map_err(buck2_error::Error::from)
+        self.resolve(package).await
     }
 }

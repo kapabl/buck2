@@ -17,8 +17,11 @@ use starlark::any::ProvidesStaticType;
 use starlark::coerce::Coerce;
 use starlark::environment::GlobalsBuilder;
 use starlark::values::Freeze;
-use starlark::values::FrozenRef;
+use starlark::values::FrozenStringValue;
 use starlark::values::FrozenValue;
+use starlark::values::FrozenValueTyped;
+use starlark::values::StarlarkPagable;
+use starlark::values::StringValue;
 use starlark::values::Trace;
 use starlark::values::Value;
 use starlark::values::ValueLifetimeless;
@@ -49,20 +52,40 @@ enum ExecutionPlatformRegistrationTypeError {
 
 /// Provider that gives the list of all execution platforms available for this build.
 #[internal_provider(info_creator)]
-#[derive(Clone, Debug, Trace, Coerce, Freeze, ProvidesStaticType, Allocative)]
+#[derive(
+    Clone,
+    Debug,
+    Trace,
+    Coerce,
+    Freeze,
+    ProvidesStaticType,
+    Allocative,
+    StarlarkPagable
+)]
 #[repr(C)]
 pub struct ExecutionPlatformRegistrationInfoGen<V: ValueLifetimeless> {
+    /// The list of execution platforms that are available for the build.
     platforms: ValueOfUncheckedGeneric<V, Vec<FrozenExecutionPlatformInfo>>,
-    // OneOf<ExecutionPlatformInfo, \"error\", \"unspecified\", None>
+    /// Specifies the behavior when no compatible execution platform is found from the `platforms` list.
+    /// Can be one of:
+    /// - `None` or `"use_unspecified"`: Proceed with an unspecified execution platform.
+    ///   This allows the build to continue without explicitly matching an execution platform.
+    /// - `"error"`: Fail the build with an error message indicating no compatible platform was found.
+    /// - An `ExecutionPlatformInfo`: Use this specific platform as a fallback when no other
+    ///   platform from the `platforms` list matches.
     // TODO(nga): specify type more precisely.
     fallback: ValueOfUncheckedGeneric<V, FrozenValue>,
+    /// Optional marker constraint that identifies platforms as execution platforms.
+    /// If set, every execution platform in `platforms` will be marked with this constraint,
+    /// allowing to distinguish execution platforms from target platforms.
+    exec_marker_constraint: ValueOfUncheckedGeneric<V, Option<FrozenStringValue>>,
 }
 
 impl FrozenExecutionPlatformRegistrationInfo {
     // TODO(cjhopman): If we impl this on the non-frozen one, we can check validity when constructed rather than only when used.
     pub fn platforms(
         &self,
-    ) -> buck2_error::Result<Vec<FrozenRef<'static, FrozenExecutionPlatformInfo>>> {
+    ) -> buck2_error::Result<Vec<FrozenValueTyped<'static, FrozenExecutionPlatformInfo>>> {
         ListRef::from_frozen_value(self.platforms.get())
             .ok_or_else(|| {
                 ExecutionPlatformRegistrationTypeError::ExpectedListOfPlatforms(
@@ -72,16 +95,15 @@ impl FrozenExecutionPlatformRegistrationInfo {
             })?
             .iter()
             .map(|v| {
-                v.unpack_frozen()
-                    .expect("should be frozen")
-                    .downcast_frozen_ref::<FrozenExecutionPlatformInfo>()
-                    .ok_or_else(|| {
+                FrozenValueTyped::new(v.unpack_frozen().expect("should be frozen")).ok_or_else(
+                    || {
                         ExecutionPlatformRegistrationTypeError::NotAPlatform(
                             v.to_repr(),
                             v.get_type().to_owned(),
                         )
                         .into()
-                    })
+                    },
+                )
             })
             .collect::<buck2_error::Result<_>>()
     }
@@ -107,6 +129,15 @@ impl FrozenExecutionPlatformRegistrationInfo {
             .into()),
         }
     }
+
+    pub fn exec_marker_constraint(&self) -> Option<&str> {
+        let value = self.exec_marker_constraint.get().to_value();
+        if value.is_none() {
+            None
+        } else {
+            value.unpack_str()
+        }
+    }
 }
 
 #[starlark_module]
@@ -117,12 +148,19 @@ fn info_creator(globals: &mut GlobalsBuilder) {
             ListType<ValueTypedComplex<'v, ExecutionPlatformInfo<'v>>>,
         >,
         #[starlark(require = named, default = NoneOr::None)] fallback: NoneOr<Value<'v>>,
+        #[starlark(require = named, default = NoneOr::None)] exec_marker_constraint: NoneOr<
+            StringValue<'v>,
+        >,
     ) -> starlark::Result<ExecutionPlatformRegistrationInfo<'v>> {
         Ok(ExecutionPlatformRegistrationInfo {
             platforms: ValueOfUnchecked::new(platforms.value),
             fallback: ValueOfUnchecked::new(match fallback {
                 NoneOr::None => Value::new_none(),
                 NoneOr::Other(v) => v,
+            }),
+            exec_marker_constraint: ValueOfUnchecked::new(match exec_marker_constraint {
+                NoneOr::None => Value::new_none(),
+                NoneOr::Other(v) => v.to_value(),
             }),
         })
     }

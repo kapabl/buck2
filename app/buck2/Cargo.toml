@@ -19,6 +19,7 @@ tracing = { workspace = true }
 dupe = { workspace = true }
 gazebo = { workspace = true }
 host_sharing = { workspace = true }
+superconsole = { version = "0.2.0", path = "../../superconsole" }
 
 buck2_action_impl = { workspace = true }
 buck2_analysis = { workspace = true }
@@ -55,6 +56,7 @@ buck2_event_observer = { workspace = true }
 buck2_events = { workspace = true }
 buck2_external_cells = { workspace = true }
 buck2_fs = { workspace = true }
+buck2_hash = { workspace = true }
 buck2_interpreter_for_build = { workspace = true }
 buck2_query_impls = { workspace = true }
 buck2_server = { workspace = true }
@@ -79,7 +81,7 @@ buck2_forkserver = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 libc = { workspace = true }
 mimalloc = { workspace = true }
-winapi = { workspace = true }
+windows-sys = { workspace = true }
 
 [[bin]]
 name = "buck2"

@@ -9,7 +9,6 @@
  */
 
 use std::any::Any;
-use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -40,12 +39,16 @@ use buck2_core::target::label::label::TargetLabel;
 use buck2_data::ToProtoMessage;
 use buck2_data::action_key_owner::BaseDeferredKeyProto;
 use buck2_fs::paths::forward_rel_path::ForwardRelativePath;
+use buck2_hash::BuckHasher;
+use buck2_hash::StdBuckHashMap;
+use buck2_interpreter::dice::starlark_provider::DynEvalKindKey;
 use buck2_interpreter::dice::starlark_provider::StarlarkEvalKind;
 use buck2_node::rule_type::StarlarkRuleType;
 use buck2_util::strong_hasher::Blake3StrongHasher;
 use cmp_any::PartialEqAny;
 use dupe::Dupe;
-use fxhash::FxHasher;
+use pagable::Pagable;
+use pagable::pagable_typetag;
 use starlark::collections::SmallMap;
 use starlark::environment::Module;
 use starlark::eval::Evaluator;
@@ -61,7 +64,7 @@ use crate::anon_target_attr::AnonTargetAttr;
 use crate::anon_target_attr_resolve::AnonTargetAttrResolution;
 use crate::anon_target_attr_resolve::AnonTargetAttrResolutionContext;
 
-#[derive(Eq, PartialEq, Clone, Debug, Allocative)]
+#[derive(Eq, PartialEq, Clone, Debug, Allocative, Pagable)]
 pub(crate) struct AnonTarget {
     /// Not necessarily a "real" target label that actually exists, but could be.
     name: TargetLabel,
@@ -81,7 +84,7 @@ pub(crate) struct AnonTarget {
     hash: u64,
 }
 
-#[derive(Hash, Eq, PartialEq, Clone, Debug, Allocative, StrongHash)]
+#[derive(Hash, Eq, PartialEq, Clone, Debug, Allocative, StrongHash, Pagable)]
 pub(crate) enum AnonTargetVariant {
     Bzl,
     Bxl(GlobalCfgOptions),
@@ -105,6 +108,14 @@ impl Hash for AnonTarget {
     }
 }
 
+impl StrongHash for AnonTarget {
+    fn strong_hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.strong_hash);
+    }
+}
+
+pagable::register_typetag!(AnonTarget as dyn DynEvalKindKey);
+
 impl AnonTarget {
     pub(crate) fn as_proto(&self) -> buck2_data::AnonTarget {
         buck2_data::AnonTarget {
@@ -121,7 +132,7 @@ impl AnonTarget {
         exec_cfg: ConfigurationNoExec,
         variant: AnonTargetVariant,
     ) -> Self {
-        let mut full_hash = FxHasher::default();
+        let mut full_hash = BuckHasher::default();
         rule_type.hash(&mut full_hash);
         name.hash(&mut full_hash);
         attrs.hash(&mut full_hash);
@@ -189,8 +200,8 @@ impl AnonTargetDyn for AnonTarget {
 
     fn resolve_attrs<'v>(
         &self,
-        env: &'v Module,
-        dependents_analyses: AnonTargetDependentAnalysisResults<'v>,
+        env: &Module<'v>,
+        dependents_analyses: AnonTargetDependentAnalysisResults<'_>,
         exec_resolution: ExecutionPlatformResolution,
     ) -> buck2_error::Result<ValueOfUncheckedGeneric<Value<'v>, StructRef<'static>>> {
         let dep_analysis_results =
@@ -198,9 +209,9 @@ impl AnonTargetDyn for AnonTarget {
 
         // No attributes are allowed to contain macros or other stuff, so an empty resolution context works
         let rule_analysis_attr_resolution_ctx = RuleAnalysisAttrResolutionContext {
-            module: &env,
+            module: env,
             dep_analysis_results,
-            query_results: HashMap::new(),
+            query_results: StdBuckHashMap::default(),
             execution_platform_resolution: exec_resolution,
         };
 
@@ -228,8 +239,8 @@ impl AnonTargetDyn for AnonTarget {
         promise_artifact_mappings: SmallMap<String, Value<'v>>,
         anon_target_result: Value<'v>,
         eval: &mut Evaluator<'v, '_, '_>,
-    ) -> buck2_error::Result<HashMap<PromiseArtifactId, Artifact>> {
-        let mut fulfilled_artifact_mappings = HashMap::new();
+    ) -> buck2_error::Result<StdBuckHashMap<PromiseArtifactId, Artifact>> {
+        let mut fulfilled_artifact_mappings = StdBuckHashMap::default();
 
         for (id, func) in promise_artifact_mappings.values().enumerate() {
             let artifact = eval.eval_function(*func, &[anon_target_result], &[])?;
@@ -257,6 +268,7 @@ impl AnonTargetDyn for AnonTarget {
     }
 }
 
+#[pagable_typetag]
 impl BaseDeferredKeyDyn for AnonTarget {
     fn eq_token(&self) -> PartialEqAny<'_> {
         PartialEqAny::new(self)
@@ -308,14 +320,12 @@ impl BaseDeferredKeyDyn for AnonTarget {
             },
             if path_resolution_method == BuckOutPathKind::Configuration {
                 self.path_hash()
+            } else if let Some(content_hash) = content_hash {
+                content_hash.as_str()
             } else {
-                if let Some(content_hash) = content_hash {
-                    content_hash.as_str()
-                } else {
-                    return Err(PathResolutionError::ContentBasedPathWithNoContentHash(
-                        path.to_buf(),
-                    ))?;
-                }
+                return Err(PathResolutionError::ContentBasedPathWithNoContentHash(
+                    path.to_buf(),
+                ))?;
             },
             "/__",
             self.name().name().as_str(),

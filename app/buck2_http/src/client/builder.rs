@@ -16,7 +16,7 @@ use buck2_certs::certs::find_internal_cert;
 use buck2_certs::certs::supports_vpnless;
 use buck2_certs::certs::tls_config_with_single_cert;
 use buck2_certs::certs::tls_config_with_system_roots;
-use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use hyper::Uri;
 use hyper_http_proxy::Proxy;
 use hyper_http_proxy::ProxyConnector;
@@ -84,7 +84,7 @@ impl HttpClientBuilder {
         let mut builder = Self::https_with_system_roots().await?;
         if supports_vpnless() {
             tracing::debug!("Using vpnless client");
-            let proxy = x2p::find_proxy()?.buck_error_context("Expected unix domain socket or http proxy port for x2p client but did not find either")?;
+            let proxy = x2p::find_proxy()?.ok_or_else(|| internal_error!("Expected unix domain socket or http proxy port for x2p client but did not find either"))?;
             builder.with_x2p_proxy(proxy);
         } else if let Some(cert_path) = find_internal_cert() {
             tracing::debug!("Using internal https client");
@@ -229,47 +229,27 @@ impl HttpClientBuilder {
         match (self.proxies.as_slice(), &self.timeout_config) {
             // Construct x2p unix socket client.
             // Note: This ignores (and does not require) the TLS config.
-            #[cfg(unix)]
-            (proxies @ [_, ..], Some(timeout_config))
-                if let Some(unix_socket) = find_unix_proxy(proxies) =>
-            {
-                let timeout_connector = timeout_config.to_connector(hyperlocal::UnixConnector);
-                let proxy_connector = build_proxy_connector(
-                    std::slice::from_ref(unix_socket),
-                    timeout_connector,
-                    None,
-                );
-                Arc::new(Client::builder(TokioExecutor::new()).build(proxy_connector))
-            }
-            #[cfg(unix)]
-            (proxies @ [_, ..], None) if let Some(unix_socket) = find_unix_proxy(proxies) => {
-                let proxy_connector = build_proxy_connector(
-                    std::slice::from_ref(unix_socket),
-                    hyperlocal::UnixConnector,
-                    None,
-                );
-                Arc::new(Client::builder(TokioExecutor::new()).build(proxy_connector))
-            }
-
-            // Construct x2p http proxy client.
-            (proxies @ [_, ..], Some(timeout_config)) if self.supports_vpnless => {
-                let mut http_connector = HttpConnector::new();
-                // When talking to local x2pagent proxy, only http is supported.
-                http_connector.enforce_http(true);
-                let timeout_connector = timeout_config.to_connector(http_connector);
-                let proxy_connector = build_proxy_connector(proxies, timeout_connector, None);
-                Arc::new(Client::builder(TokioExecutor::new()).build(proxy_connector))
-            }
-            (proxies @ [_, ..], None) if self.supports_vpnless => {
-                let mut http_connector = HttpConnector::new();
-                // When talking to local x2pagent proxy, only http is supported.
-                http_connector.enforce_http(true);
-                let proxy_connector = build_proxy_connector(proxies, http_connector, None);
-                Arc::new(Client::builder(TokioExecutor::new()).build(proxy_connector))
-            }
-
-            // Proxied http client with TLS.
             (proxies @ [_, ..], Some(timeout_config)) => {
+                #[cfg(unix)]
+                if let Some(unix_socket) = find_unix_proxy(proxies) {
+                    let timeout_connector = timeout_config.to_connector(hyperlocal::UnixConnector);
+                    let proxy_connector = build_proxy_connector(
+                        std::slice::from_ref(unix_socket),
+                        timeout_connector,
+                        None,
+                    );
+                    return Arc::new(Client::builder(TokioExecutor::new()).build(proxy_connector));
+                }
+                if self.supports_vpnless {
+                    let mut http_connector = HttpConnector::new();
+                    // When talking to local x2pagent proxy, only http is supported.
+                    http_connector.enforce_http(true);
+                    let timeout_connector = timeout_config.to_connector(http_connector);
+                    let proxy_connector = build_proxy_connector(proxies, timeout_connector, None);
+                    return Arc::new(Client::builder(TokioExecutor::new()).build(proxy_connector));
+                }
+
+                // Proxied http client with TLS.
                 let https_connector = build_https_connector(self.tls_config.clone(), self.http2);
                 let timeout_connector = timeout_config.to_connector(https_connector);
                 // Re-use TLS config from https connection for communication with proxies.
@@ -281,6 +261,23 @@ impl HttpClientBuilder {
                 Arc::new(Client::builder(TokioExecutor::new()).build(proxy_connector))
             }
             (proxies @ [_, ..], None) => {
+                #[cfg(unix)]
+                if let Some(unix_socket) = find_unix_proxy(proxies) {
+                    let proxy_connector = build_proxy_connector(
+                        std::slice::from_ref(unix_socket),
+                        hyperlocal::UnixConnector,
+                        None,
+                    );
+                    return Arc::new(Client::builder(TokioExecutor::new()).build(proxy_connector));
+                }
+                if self.supports_vpnless {
+                    let mut http_connector = HttpConnector::new();
+                    // When talking to local x2pagent proxy, only http is supported.
+                    http_connector.enforce_http(true);
+                    let proxy_connector = build_proxy_connector(proxies, http_connector, None);
+                    return Arc::new(Client::builder(TokioExecutor::new()).build(proxy_connector));
+                }
+
                 let https_connector = build_https_connector(self.tls_config.clone(), self.http2);
                 let proxy_connector =
                     build_proxy_connector(proxies, https_connector, Some(self.tls_config.clone()));

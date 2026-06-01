@@ -15,11 +15,14 @@ use std::sync::Arc;
 use allocative::Allocative;
 use buck2_error::BuckErrorContext;
 use buck2_error::conversion::from_any_with_tag;
+use buck2_error::internal_error;
 use buck2_interpreter::file_type::StarlarkFileType;
 use buck2_node::metadata::key::MetadataKey;
 use buck2_node::metadata::key::MetadataKeyRef;
 use buck2_node::metadata::super_package_values::SuperPackageValues;
 use dupe::Dupe;
+use pagable::Pagable;
+use pagable::pagable_typetag;
 use starlark::environment::GlobalsBuilder;
 use starlark::eval::Evaluator;
 use starlark::starlark_module;
@@ -31,6 +34,7 @@ use starlark::values::Freezer;
 use starlark::values::FrozenHeapRef;
 use starlark::values::FrozenValue;
 use starlark::values::OwnedFrozenValue;
+use starlark::values::StarlarkPagable;
 use starlark::values::Trace;
 use starlark::values::Value;
 use starlark::values::none::NoneType;
@@ -48,7 +52,7 @@ enum PackageValueError {
     KeySetInParentFile(MetadataKey),
 }
 
-#[derive(Debug, Default, Allocative)]
+#[derive(Debug, Default, Allocative, Pagable)]
 pub struct SuperPackageValuesImpl {
     values: SmallMap<MetadataKey, OwnedFrozenStarlarkPackageValue>,
 }
@@ -58,7 +62,7 @@ impl SuperPackageValuesImpl {
         values
             .as_any()
             .downcast_ref::<SuperPackageValuesImpl>()
-            .internal_error("Expecting SuperPackageValuesImpl")
+            .ok_or_else(|| internal_error!("Expecting SuperPackageValuesImpl"))
     }
 
     pub fn get_package_value(
@@ -85,6 +89,7 @@ impl SuperPackageValuesImpl {
     }
 }
 
+#[pagable_typetag]
 impl SuperPackageValues for SuperPackageValuesImpl {
     fn as_any(&self) -> &dyn Any {
         self
@@ -121,10 +126,10 @@ impl SuperPackageValues for SuperPackageValuesImpl {
 #[derive(Trace, Debug, Allocative, Clone, Dupe, Copy)]
 pub(crate) struct StarlarkPackageValue<'v>(Value<'v>);
 
-#[derive(Debug, Allocative, Clone, Dupe, Copy)]
+#[derive(Debug, Allocative, Clone, Dupe, Copy, StarlarkPagable)]
 pub(crate) struct FrozenStarlarkPackageValue(FrozenValue);
 
-#[derive(Debug, Allocative, Clone, Dupe)]
+#[derive(Debug, Allocative, Clone, Dupe, Pagable)]
 pub struct OwnedFrozenStarlarkPackageValue(OwnedFrozenValue);
 
 impl<'v> StarlarkPackageValue<'v> {
@@ -249,7 +254,9 @@ pub(crate) fn read_parent_package_value_impl<'v>(
         .values
         .get(key)
     {
-        Some(value) => Ok(value.owned_frozen_value().owned_value(eval.frozen_heap())),
+        Some(value) => Ok(eval
+            .heap()
+            .access_owned_frozen_value(value.owned_frozen_value())),
         None => Ok(Value::new_none()),
     }
 }
@@ -285,7 +292,9 @@ pub(crate) fn register_read_package_value(globals: &mut GlobalsBuilder) {
             .values
             .get(key)
         {
-            Some(value) => Ok(value.owned_frozen_value().owned_value(eval.frozen_heap())),
+            Some(value) => Ok(eval
+                .heap()
+                .access_owned_frozen_value(value.owned_frozen_value())),
             None => Ok(Value::new_none()),
         }
     }

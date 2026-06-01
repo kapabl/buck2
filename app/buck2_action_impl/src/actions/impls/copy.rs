@@ -22,17 +22,20 @@ use buck2_build_api::actions::execute::action_executor::ActionExecutionMetadata;
 use buck2_build_api::actions::execute::action_executor::ActionOutputs;
 use buck2_build_api::actions::execute::error::ExecuteError;
 use buck2_build_api::artifact_groups::ArtifactGroup;
+use buck2_build_signals::env::WaitingData;
 use buck2_core::category::CategoryRef;
 use buck2_core::content_hash::ContentBasedPathHash;
-use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_execute::artifact::artifact_dyn::ArtifactDyn;
 use buck2_execute::artifact_utils::ArtifactValueBuilder;
 use buck2_execute::execute::command_executor::ActionExecutionTimingData;
 use buck2_execute::materialize::materializer::CopiedArtifact;
+use buck2_hash::BuckIndexSet;
+use buck2_hash::buck_indexset;
 use dupe::Dupe;
 use gazebo::prelude::*;
-use indexmap::IndexSet;
-use indexmap::indexset;
+use pagable::Pagable;
+use pagable::pagable_typetag;
 use starlark::values::OwnedFrozenValue;
 
 #[derive(Debug, buck2_error::Error)]
@@ -44,7 +47,7 @@ enum CopyActionValidationError {
     UnsupportedInput(ArtifactGroup),
 }
 
-#[derive(Debug, Allocative)]
+#[derive(Debug, Allocative, Pagable)]
 pub(crate) enum CopyMode {
     Copy {
         // Override the destination executable bit to +x (true) or -x (false)
@@ -68,7 +71,7 @@ impl UnregisteredCopyAction {
 impl UnregisteredAction for UnregisteredCopyAction {
     fn register(
         self: Box<Self>,
-        outputs: IndexSet<BuildArtifact>,
+        outputs: BuckIndexSet<BuildArtifact>,
         _starlark_data: Option<OwnedFrozenValue>,
         _error_handler: Option<OwnedFrozenValue>,
     ) -> buck2_error::Result<Box<dyn Action>> {
@@ -76,7 +79,7 @@ impl UnregisteredAction for UnregisteredCopyAction {
     }
 }
 
-#[derive(Debug, Allocative)]
+#[derive(Debug, Allocative, Pagable)]
 struct CopyAction {
     copy: CopyMode,
     inputs: BoxSliceSet<ArtifactGroup>,
@@ -87,7 +90,7 @@ impl CopyAction {
     fn new(
         copy: CopyMode,
         src: ArtifactGroup,
-        outputs: IndexSet<BuildArtifact>,
+        outputs: BuckIndexSet<BuildArtifact>,
     ) -> buck2_error::Result<Self> {
         // TODO: Exclude other variants once they become available here. For now, this is a noop.
         match src {
@@ -102,7 +105,7 @@ impl CopyAction {
         } else {
             Ok(CopyAction {
                 copy,
-                inputs: BoxSliceSet::from(indexset![src]),
+                inputs: BoxSliceSet::from(buck_indexset![src]),
                 outputs: BoxSliceSet::from(outputs),
             })
         }
@@ -123,6 +126,7 @@ impl CopyAction {
     }
 }
 
+#[pagable_typetag]
 #[async_trait]
 impl Action for CopyAction {
     fn kind(&self) -> buck2_data::ActionKind {
@@ -152,17 +156,18 @@ impl Action for CopyAction {
     async fn execute(
         &self,
         ctx: &mut dyn ActionExecutionCtx,
+        waiting_data: WaitingData,
     ) -> Result<(ActionOutputs, ActionExecutionMetadata), ExecuteError> {
         let (input, src_value) = ctx
             .artifact_values(self.input())
             .iter()
             .into_singleton()
-            .buck_error_context("Input did not dereference to exactly one artifact")?;
+            .ok_or_else(|| internal_error!("Input did not dereference to exactly one artifact"))?;
 
         let artifact_fs = ctx.fs();
         let src = input.resolve_path(
             artifact_fs,
-            if input.has_content_based_path() {
+            if input.path_resolution_requires_artifact_value() {
                 Some(src_value.content_based_path_hash())
             } else {
                 None
@@ -205,6 +210,10 @@ impl Action for CopyAction {
             tmp_dest
         };
 
+        let configuration_path = ctx
+            .materializer()
+            .maybe_eager_configuration_path(ctx.fs(), self.output().get_path())?;
+
         ctx.materializer()
             .declare_copy(
                 dest.clone(),
@@ -223,6 +232,7 @@ impl Action for CopyAction {
                         CopyMode::Symlink => None,
                     },
                 )],
+                configuration_path,
             )
             .await?;
 
@@ -232,6 +242,7 @@ impl Action for CopyAction {
                 execution_kind: ActionExecutionKind::Simple,
                 timing: ActionExecutionTimingData::default(),
                 input_files_bytes: None,
+                waiting_data,
             },
         ))
     }

@@ -24,6 +24,7 @@ use buck2_core::execution_types::executor_config::HybridExecutionLevel;
 use buck2_core::execution_types::executor_config::LocalExecutorOptions;
 use buck2_core::execution_types::executor_config::MetaInternalExtraParams;
 use buck2_core::execution_types::executor_config::PathSeparatorKind;
+use buck2_core::execution_types::executor_config::ReGangWorker;
 use buck2_core::execution_types::executor_config::RePlatformFields;
 use buck2_core::execution_types::executor_config::RemoteEnabledExecutor;
 use buck2_core::execution_types::executor_config::RemoteEnabledExecutorOptions;
@@ -32,7 +33,6 @@ use buck2_core::execution_types::executor_config::RemoteExecutorOptions;
 use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::project::ProjectRoot;
-use buck2_error::BuckErrorContext;
 use buck2_events::daemon_id::DaemonId;
 use buck2_execute::execute::blocking::BlockingExecutor;
 use buck2_execute::execute::cache_uploader::NoOpCacheUploader;
@@ -163,6 +163,18 @@ impl CommandExecutorFactory {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
+#[derive(buck2_error::Error, Debug)]
+#[buck2(input)]
+enum ExecutorCompatibilityError {
+    #[error("The desired execution strategy (`{0:?}`) is incompatible with the local executor")]
+    LocalIncompatible(ExecutionStrategy),
+    #[error(
+        "The desired execution strategy (`{0:?}`) is incompatible with the executor config that was selected: {1:?}"
+    )]
+    SelectedConfig(ExecutionStrategy, CommandExecutorConfig),
+}
+
 impl HasCommandExecutor for CommandExecutorFactory {
     fn get_command_executor(
         &self,
@@ -200,11 +212,7 @@ impl HasCommandExecutor for CommandExecutorFactory {
             });
 
             if self.strategy.ban_local() {
-                return Err(buck2_error::buck2_error!(
-                    buck2_error::ErrorTag::Input,
-                    "The desired execution strategy (`{:?}`) is incompatible with the local executor",
-                    self.strategy,
-                ));
+                return Err(ExecutorCompatibilityError::LocalIncompatible(self.strategy).into());
             }
 
             return Ok(CommandExecutorResponse {
@@ -217,32 +225,35 @@ impl HasCommandExecutor for CommandExecutorFactory {
             });
         }
 
-        let remote_executor_new =
-            |options: &RemoteExecutorOptions,
-             re_use_case: &RemoteExecutorUseCase,
-             re_action_key: &Option<String>,
-             remote_cache_enabled: bool,
-             dependencies: &[RemoteExecutorDependency]| {
-                ReExecutor {
-                    artifact_fs: artifact_fs.clone(),
-                    project_fs: self.project_root.clone(),
-                    materializer: self.materializer.dupe(),
-                    incremental_db_state: self.incremental_db_state.dupe(),
-                    re_client: self.get_prepared_re_client(*re_use_case),
-                    re_action_key: re_action_key.clone(),
-                    re_max_queue_time: options.re_max_queue_time,
-                    re_resource_units: options.re_resource_units,
-                    knobs: self.executor_global_knobs.dupe(),
-                    skip_cache_read: self.skip_cache_read || !remote_cache_enabled,
-                    skip_cache_write: self.skip_cache_write || !remote_cache_enabled,
-                    paranoid: self.paranoid.dupe(),
-                    materialize_failed_inputs: self.materialize_failed_inputs,
-                    materialize_failed_outputs: self.materialize_failed_outputs,
-                    dependencies: dependencies.to_vec(),
-                    deduplicate_get_digests_ttl_calls: self.deduplicate_get_digests_ttl_calls,
-                    output_trees_download_config: self.output_trees_download_config.dupe(),
-                }
-            };
+        let remote_executor_new = |options: &RemoteExecutorOptions,
+                                   re_use_case: &RemoteExecutorUseCase,
+                                   re_action_key: &Option<String>,
+                                   remote_cache_enabled: bool,
+                                   dependencies: &[RemoteExecutorDependency],
+                                   gang_workers: &[ReGangWorker],
+                                   priority: Option<i32>| {
+            ReExecutor {
+                artifact_fs: artifact_fs.clone(),
+                project_fs: self.project_root.clone(),
+                materializer: self.materializer.dupe(),
+                incremental_db_state: self.incremental_db_state.dupe(),
+                re_client: self.get_prepared_re_client(*re_use_case),
+                re_action_key: re_action_key.clone(),
+                re_max_queue_time: options.re_max_queue_time,
+                re_resource_units: options.re_resource_units,
+                knobs: self.executor_global_knobs.dupe(),
+                skip_cache_read: self.skip_cache_read || !remote_cache_enabled,
+                skip_cache_write: self.skip_cache_write || !remote_cache_enabled,
+                paranoid: self.paranoid.dupe(),
+                materialize_failed_inputs: self.materialize_failed_inputs,
+                materialize_failed_outputs: self.materialize_failed_outputs,
+                dependencies: dependencies.to_vec(),
+                gang_workers: gang_workers.to_vec(),
+                deduplicate_get_digests_ttl_calls: self.deduplicate_get_digests_ttl_calls,
+                output_trees_download_config: self.output_trees_download_config.dupe(),
+                priority,
+            }
+        };
 
         let response = match &executor_config.executor {
             Executor::None => None,
@@ -339,6 +350,8 @@ impl HasCommandExecutor for CommandExecutorFactory {
                                 &remote_options.re_action_key,
                                 remote_options.remote_cache_enabled,
                                 &remote_options.dependencies,
+                                &remote_options.gang_workers,
+                                remote_options.priority,
                             )))
                         }
                         RemoteEnabledExecutor::Hybrid {
@@ -356,6 +369,8 @@ impl HasCommandExecutor for CommandExecutorFactory {
                                 &remote_options.re_action_key,
                                 remote_options.remote_cache_enabled,
                                 &remote_options.dependencies,
+                                &remote_options.gang_workers,
+                                remote_options.priority,
                             );
                             let executor_preference = self.strategy.hybrid_preference();
                             let low_pass_filter = self.low_pass_filter.dupe();
@@ -447,9 +462,9 @@ impl HasCommandExecutor for CommandExecutorFactory {
             }
         };
 
-        let response = response
-            .with_buck_error_context(|| format!("The desired execution strategy (`{:?}`) is incompatible with the executor config that was selected: {:?}", self.strategy, executor_config)).tag(buck2_error::ErrorTag::Input)?;
-
+        let response = response.ok_or_else(|| {
+            ExecutorCompatibilityError::SelectedConfig(self.strategy, executor_config.clone())
+        })?;
         Ok(response)
     }
 }
@@ -463,24 +478,15 @@ trait ExecutionStrategyExt {
 
 impl ExecutionStrategyExt for ExecutionStrategy {
     fn ban_local(&self) -> bool {
-        match self {
-            Self::RemoteOnly | Self::NoExecution => true,
-            _ => false,
-        }
+        matches!(self, Self::RemoteOnly | Self::NoExecution)
     }
 
     fn ban_remote(&self) -> bool {
-        match self {
-            Self::LocalOnly | Self::NoExecution => true,
-            _ => false,
-        }
+        matches!(self, Self::LocalOnly | Self::NoExecution)
     }
 
     fn ban_hybrid(&self) -> bool {
-        match self {
-            Self::NoExecution => true,
-            _ => false,
-        }
+        matches!(self, Self::NoExecution)
     }
 
     fn hybrid_preference(&self) -> ExecutorPreference {
@@ -512,8 +518,10 @@ pub fn get_default_executor_config(host_platform: HostPlatformOverride) -> Comma
             remote_cache_enabled: true,
             remote_dep_file_cache_enabled: false,
             dependencies: vec![],
+            gang_workers: vec![],
             custom_image: None,
-            meta_internal_extra_params: MetaInternalExtraParams::default(),
+            meta_internal_extra_params: MetaInternalExtraParams::default_arc(),
+            priority: None,
         })
     };
 
@@ -523,6 +531,7 @@ pub fn get_default_executor_config(host_platform: HostPlatformOverride) -> Comma
             path_separator: get_default_path_separator(host_platform),
             output_paths_behavior: Default::default(),
             use_bazel_protocol_remote_persistent_workers: false,
+            network_access: None,
         },
     }
 }

@@ -33,6 +33,7 @@ buck2_data = { workspace = true }
 buck2_error = { workspace = true }
 buck2_events = { workspace = true }
 buck2_fs = { workspace = true }
+buck2_hash = { workspace = true }
 buck2_util = { workspace = true }
 
 [dev-dependencies]
@@ -43,5 +44,5 @@ assert_matches = { workspace = true }
 buck2_util = { workspace = true }
 gazebo = { workspace = true }
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fbcode_build)"] }
+[lints]
+workspace = true

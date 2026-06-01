@@ -14,11 +14,12 @@ use std::hash::Hasher;
 
 use allocative::Allocative;
 use buck2_data::ToProtoMessage;
-use buck2_util::hash::BuckHasher;
+use buck2_hash::BuckHasher;
 use buck2_util::strong_hasher::Blake3StrongHasher;
 use dupe::Dupe;
 use equivalent::Equivalent;
 use once_cell::sync::Lazy;
+use pagable::Pagable;
 use serde::Serialize;
 use serde::Serializer;
 use static_interner::Intern;
@@ -108,7 +109,8 @@ fn emit_configuration_instant_event(cfg: &ConfigurationData) -> buck2_error::Res
     PartialOrd,
     Allocative,
     derive_more::Display,
-    StrongHash
+    StrongHash,
+    Pagable
 )]
 pub struct ConfigurationData(Intern<HashedConfigurationPlatform>);
 
@@ -125,10 +127,14 @@ interner!(INTERNER, BuckHasher, HashedConfigurationPlatform);
 
 impl ConfigurationData {
     /// Produces a "bound" configuration for a platform. The label should be a unique identifier for the data.
-    pub fn from_platform(label: String, data: ConfigurationDataData) -> buck2_error::Result<Self> {
+    pub fn from_platform(
+        label: String,
+        data: ConfigurationDataData,
+        is_marked_as_exec_platform: bool,
+    ) -> buck2_error::Result<Self> {
         let label = BoundConfigurationLabel::new(label)?;
         let (cfg, disposition) = Self::from_data(HashedConfigurationPlatform::new(
-            ConfigurationPlatform::Bound(label, data),
+            ConfigurationPlatform::Bound(label, data, is_marked_as_exec_platform),
         ));
         if let InternDisposition::Computed = disposition {
             emit_configuration_instant_event(&cfg)?;
@@ -198,6 +204,7 @@ impl ConfigurationData {
                 ConfigurationDataData {
                     constraints: BTreeMap::new(),
                 },
+                false,
             ),
         ))
         .0
@@ -248,7 +255,7 @@ impl ConfigurationData {
 
     pub fn label(&self) -> buck2_error::Result<&str> {
         match &self.0.configuration_platform {
-            ConfigurationPlatform::Bound(label, _) => Ok(label.as_str()),
+            ConfigurationPlatform::Bound(label, _, _) => Ok(label.as_str()),
             _ => Err(ConfigurationError::NotBound(self.to_string()).into()),
         }
     }
@@ -261,20 +268,20 @@ impl ConfigurationData {
             ConfigurationPlatform::Builtin(builtin) => {
                 Err(ConfigurationError::Builtin(*builtin).into())
             }
-            ConfigurationPlatform::Bound(_, data) => Ok(data),
+            ConfigurationPlatform::Bound(_, data, _) => Ok(data),
         }
     }
 
     pub fn is_unbound(&self) -> bool {
-        match &self.0.configuration_platform {
-            ConfigurationPlatform::Builtin(BuiltinPlatform::Unbound) => true,
-            _ => false,
-        }
+        matches!(
+            &self.0.configuration_platform,
+            ConfigurationPlatform::Builtin(BuiltinPlatform::Unbound)
+        )
     }
 
     pub fn bound(&self) -> Option<&BoundConfigurationLabel> {
         match &self.0.configuration_platform {
-            ConfigurationPlatform::Bound(label, _) => Some(label),
+            ConfigurationPlatform::Bound(label, _, _) => Some(label),
             _ => None,
         }
     }
@@ -287,10 +294,17 @@ impl ConfigurationData {
     }
 
     pub fn is_bound(&self) -> bool {
-        match &self.0.configuration_platform {
-            ConfigurationPlatform::Bound(..) => true,
-            _ => false,
-        }
+        matches!(
+            &self.0.configuration_platform,
+            ConfigurationPlatform::Bound(..)
+        )
+    }
+
+    pub fn is_marked_as_exec_platform(&self) -> bool {
+        matches!(
+            &self.0.configuration_platform,
+            ConfigurationPlatform::Bound(_, _, true)
+        )
     }
 
     pub fn output_hash(&self) -> &ConfigurationHash {
@@ -326,24 +340,27 @@ impl ToProtoMessage for ConfigurationData {
     }
 }
 
-#[derive(Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Allocative, StrongHash)]
+#[derive(
+    Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Allocative, StrongHash, Pagable
+)]
 enum ConfigurationPlatform {
     /// This represents the normal case where a platform has been defined by a `platform()` (or similar) target.
-    Bound(BoundConfigurationLabel, ConfigurationDataData),
+    /// The `bool` indicates whether the user provided a modifier constraint to mark this as an execution platform.
+    Bound(BoundConfigurationLabel, ConfigurationDataData, bool),
     Builtin(BuiltinPlatform),
 }
 
 impl ConfigurationPlatform {
     fn label(&self) -> &str {
         match self {
-            ConfigurationPlatform::Bound(label, _) => label.as_str(),
+            ConfigurationPlatform::Bound(label, _, _) => label.as_str(),
             ConfigurationPlatform::Builtin(builtin) => builtin.label(),
         }
     }
 }
 
 /// A set of values used in configuration-related contexts.
-#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Allocative, StrongHash)]
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Allocative, StrongHash, Pagable)]
 pub struct ConfigurationDataData {
     // contains the full specification of the platform configuration
     pub constraints: BTreeMap<ConstraintKey, ConstraintValue>,
@@ -395,7 +412,8 @@ impl ConfigurationDataData {
     Ord,
     PartialOrd,
     Allocative,
-    derive_more::Display
+    derive_more::Display,
+    Pagable
 )]
 #[display("{}", full_name)]
 pub(crate) struct HashedConfigurationPlatform {
@@ -424,13 +442,14 @@ impl StrongHash for HashedConfigurationPlatform {
 
 impl HashedConfigurationPlatform {
     fn new(configuration_platform: ConfigurationPlatform) -> Self {
-        let mut hasher = Blake3StrongHasher::new();
-        configuration_platform.strong_hash(&mut hasher);
-        let output_hash = hasher.finish();
-        let output_hash = ConfigurationHash::new(output_hash);
+        let output_hash = {
+            let mut hasher = Blake3StrongHasher::new();
+            configuration_platform.strong_hash(&mut hasher);
+            ConfigurationHash::new(hasher.finish())
+        };
 
         let full_name = match &configuration_platform {
-            ConfigurationPlatform::Bound(label, _cfg) => {
+            ConfigurationPlatform::Bound(label, _cfg, _) => {
                 format!("{label:#}#{output_hash}")
             }
             ConfigurationPlatform::Builtin(builtin) => builtin.label().to_owned(),
@@ -472,13 +491,14 @@ mod tests {
                     ),
                 ]),
             },
+            false,
         )
         .unwrap();
 
-        assert_eq!(configuration.output_hash().as_str(), "6770d7f2ebfc0845");
+        assert_eq!(configuration.output_hash().as_str(), "39f3b844d3613e4f");
         assert_eq!(
             configuration.to_string(),
-            "cfg_for//:testing_exec#6770d7f2ebfc0845"
+            "cfg_for//:testing_exec#39f3b844d3613e4f"
         );
 
         Ok(())
@@ -500,10 +520,11 @@ mod tests {
                     ),
                 ]),
             },
+            false,
         )
         .unwrap();
 
-        let expected_cfg_str = "cfg_for//:testing_exec#6770d7f2ebfc0845";
+        let expected_cfg_str = "cfg_for//:testing_exec#39f3b844d3613e4f";
         assert_eq!(expected_cfg_str, configuration.to_string());
 
         let looked_up =

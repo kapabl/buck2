@@ -38,7 +38,6 @@ use starlark::values::ValueOf;
 use starlark::values::ValueTypedComplex;
 use starlark::values::list_or_tuple::UnpackListOrTuple;
 use starlark::values::tuple::UnpackTuple;
-use tracing::error;
 
 use crate::attrs::coerce::attr_type::AttrTypeExt;
 use crate::attrs::coerce::ctx::BuildAttrCoercionContext;
@@ -95,7 +94,7 @@ impl AttributeExt for Attribute {
         };
         Ok(StarlarkAttribute::new(Attribute::new(
             default, doc, coercer,
-        )))
+        )?))
     }
 }
 
@@ -240,7 +239,7 @@ fn attr_module(registry: &mut GlobalsBuilder) {
             coerced_default.map(Arc::new),
             doc,
             coercer,
-        )))
+        )?))
     }
 
     fn configured_dep<'v>(
@@ -280,9 +279,16 @@ fn attr_module(registry: &mut GlobalsBuilder) {
             coerced_default.map(Arc::new),
             doc,
             coercer,
-        )))
+        )?))
     }
 
+    /// Takes a target label from the user and registers it as a plugin dependency.
+    ///
+    /// Plugin dependencies are propagated as unconfigured target labels up the build graph,
+    /// then configured as exec deps when used by a rule with `uses_plugins`. This is useful
+    /// for dependencies like Rust proc macros that need to be accessible to transitive dependents.
+    ///
+    /// See the [`plugins`](../plugins) namespace documentation for a full explanation and examples.
     fn plugin_dep<'v>(
         #[starlark(require = named)] kind: PluginKindArg,
         #[starlark(require = named)] default: Option<Value<'v>>,
@@ -303,6 +309,9 @@ fn attr_module(registry: &mut GlobalsBuilder) {
     ///
     /// If supplied the `providers` argument ensures that specific providers will be present
     /// on the dependency.
+    ///
+    /// The `pulls_plugins` and `pulls_and_pushes_plugins` parameters control plugin propagation.
+    /// See the [`plugins`](../plugins) namespace documentation for a full explanation.
     fn dep<'v>(
         #[starlark(require = named, default = UnpackListOrTuple::default())]
         providers: UnpackListOrTuple<Value<'v>>,
@@ -569,7 +578,7 @@ fn attr_module(registry: &mut GlobalsBuilder) {
             Some(Arc::new(AnyAttrType::empty_list())),
             doc,
             coercer,
-        )))
+        )?))
     }
 
     /// Takes a source file from the user, supplies an artifact to the rule.

@@ -8,8 +8,6 @@
  * above-listed licenses.
  */
 
-use std::collections::HashMap;
-use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -41,13 +39,16 @@ use buck2_execute::execute::clean_output_paths::cleanup_path;
 use buck2_execute::materialize::http::http_download;
 use buck2_execute::materialize::materializer::CasNotFoundError;
 use buck2_execute::materialize::materializer::WriteRequest;
+use buck2_execute::materialize::utils::dynamic_priority_handle::DynamicPriorityHandle;
 use buck2_execute::output_size::OutputSize;
 use buck2_execute::re::error::RemoteExecutionError;
 use buck2_execute::re::manager::ReConnectionManager;
+use buck2_fs::error::IoResultExt;
 use buck2_fs::fs_util;
-use buck2_fs::fs_util::IoError;
 use buck2_fs::fs_util::ReadDir;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
+use buck2_hash::StdBuckHashMap;
+use buck2_hash::StdBuckHashSet;
 use buck2_http::HttpClient;
 use chrono::Duration;
 use chrono::Utc;
@@ -131,6 +132,7 @@ pub trait IoHandler: Sized + Sync + Send + 'static {
         path: ProjectRelativePathBuf,
         method: Arc<ArtifactMaterializationMethod>,
         entry: ActionDirectoryEntry<ActionSharedDirectory>,
+        priority_control: DynamicPriorityHandle,
         event_dispatcher: EventDispatcher,
         cancellations: &CancellationContext,
     ) -> Result<(), MaterializeEntryError>;
@@ -141,7 +143,7 @@ pub trait IoHandler: Sized + Sync + Send + 'static {
         min_ttl: Duration,
     ) -> Option<BoxFuture<'static, buck2_error::Result<()>>>;
 
-    fn read_dir(&self, path: &AbsNormPathBuf) -> Result<ReadDir, IoError>;
+    fn read_dir(&self, path: &AbsNormPathBuf) -> buck2_error::Result<ReadDir>;
     fn buck_out_path(&self) -> &ProjectRelativePathBuf;
     fn re_client_manager(&self) -> &Arc<ReConnectionManager>;
     fn fs(&self) -> &ProjectRoot;
@@ -173,6 +175,7 @@ impl DefaultIoHandler {
         path: ProjectRelativePathBuf,
         method: Arc<ArtifactMaterializationMethod>,
         entry: ActionDirectoryEntry<ActionSharedDirectory>,
+        priority_control: DynamicPriorityHandle,
         stat: &mut MaterializationStat,
         cancellations: &CancellationContext,
     ) -> Result<(), MaterializeEntryError> {
@@ -228,11 +231,11 @@ impl DefaultIoHandler {
                 let connection = self.re_client_manager.get_re_connection();
                 let re_client = connection.get_client().with_use_case(info.re_use_case);
 
-                re_client.materialize_files(files).await.map_err(|e| {
-                    let e: buck2_error::Error = e.into();
-                    match e.find_typed_context::<RemoteExecutionError>() {
+                re_client
+                    .materialize_files(files, priority_control.dupe())
+                    .await
+                    .map_err(|e| match e.find_typed_context::<RemoteExecutionError>() {
                         Some(re_error) if re_error.code == TCode::NOT_FOUND => {
-                            let e: buck2_error::Error = e.into();
                             MaterializeEntryError::NotFound(CasNotFoundError {
                                 path: Arc::from(path),
                                 info: info.dupe(),
@@ -243,8 +246,7 @@ impl DefaultIoHandler {
                         _ => MaterializeEntryError::Error(e.context({
                             format!("Error materializing files declared by action: {info}")
                         })),
-                    }
-                })?;
+                    })?;
             }
             ArtifactMaterializationMethod::HttpDownload { info } => {
                 async {
@@ -288,7 +290,7 @@ impl DefaultIoHandler {
                 self.io_executor
                     .execute_io_inline(|| {
                         for a in copied_artifacts {
-                            let count_and_bytes = a.dest_entry.calc_output_count_and_bytes();
+                            let count_and_bytes = a.dest_entry.calc_output_count_and_bytes(false);
                             stat.file_count += count_and_bytes.count;
                             stat.total_bytes += count_and_bytes.bytes;
 
@@ -342,7 +344,7 @@ impl IoHandler for DefaultIoHandler {
                 }),
                 cancellations,
             )
-            .map_err(|e| SharedMaterializingError::Error(e.into()))
+            .map_err(SharedMaterializingError::Error)
             .boxed()
     }
 
@@ -375,7 +377,7 @@ impl IoHandler for DefaultIoHandler {
                 }),
                 cancellations,
             )
-            .map(|r| r.map_err(buck2_error::Error::from))
+            .map(|r| r)
             .boxed()
     }
 
@@ -397,6 +399,7 @@ impl IoHandler for DefaultIoHandler {
         path: ProjectRelativePathBuf,
         method: Arc<ArtifactMaterializationMethod>,
         entry: ActionDirectoryEntry<ActionSharedDirectory>,
+        priority_control: DynamicPriorityHandle,
         event_dispatcher: EventDispatcher,
         cancellations: &CancellationContext,
     ) -> Result<(), MaterializeEntryError> {
@@ -417,7 +420,14 @@ impl IoHandler for DefaultIoHandler {
                     total_bytes: 0,
                 };
                 let res = self
-                    .materialize_entry_span(path, method.dupe(), entry, &mut stat, cancellations)
+                    .materialize_entry_span(
+                        path,
+                        method.dupe(),
+                        entry,
+                        priority_control,
+                        &mut stat,
+                        cancellations,
+                    )
                     .await;
                 let error = res.as_ref().err().map(|e| format!("{e:#}"));
 
@@ -447,8 +457,8 @@ impl IoHandler for DefaultIoHandler {
             .map(|f| f.boxed())
     }
 
-    fn read_dir(&self, path: &AbsNormPathBuf) -> Result<ReadDir, IoError> {
-        fs_util::read_dir(path)
+    fn read_dir(&self, path: &AbsNormPathBuf) -> buck2_error::Result<ReadDir> {
+        fs_util::read_dir(path).categorize_internal()
     }
 
     fn buck_out_path(&self) -> &ProjectRelativePathBuf {
@@ -474,7 +484,7 @@ fn maybe_tombstone_digest(digest: &FileDigest) -> buck2_error::Result<&FileDiges
     // instead of a not-found error.
     static TOMBSTONE_DIGEST: Lazy<FileDigest> = Lazy::new(|| FileDigest::new_sha1([0; 20], 1));
 
-    fn convert_digests(val: &str) -> buck2_error::Result<HashSet<FileDigest>> {
+    fn convert_digests(val: &str) -> buck2_error::Result<StdBuckHashSet<FileDigest>> {
         val.split(' ')
             .map(|digest| {
                 let digest = TDigest::from_str(digest)
@@ -490,7 +500,7 @@ fn maybe_tombstone_digest(digest: &FileDigest) -> buck2_error::Result<&FileDiges
 
     let tombstoned_digests = buck2_env!(
         "BUCK2_TEST_TOMBSTONED_DIGESTS",
-        type=HashSet<FileDigest>,
+        type=StdBuckHashSet<FileDigest>,
         converter=convert_digests,
         applicability=testing,
     )?;
@@ -510,36 +520,27 @@ pub(super) fn create_ttl_refresh(
     min_ttl: Duration,
     digest_config: DigestConfig,
 ) -> Option<impl Future<Output = buck2_error::Result<()>> + use<>> {
-    let mut digests_to_refresh = HashMap::<_, HashSet<_>>::new();
+    let mut digests_to_refresh = StdBuckHashMap::<_, StdBuckHashSet<_>>::new();
 
     let ttl_deadline = Utc::now() + min_ttl;
 
     for data in tree.iter_without_paths() {
-        match &data.stage {
-            ArtifactMaterializationStage::Declared {
-                entry,
-                method,
-                persist_full_directory_structure: _,
-            } => match method.as_ref() {
-                ArtifactMaterializationMethod::CasDownload { info } => {
-                    let mut walk = unordered_entry_walk(entry.as_ref().map_dir(Directory::as_ref));
-                    while let Some((_entry_path, entry)) = walk.next() {
-                        if let DirectoryEntry::Leaf(ActionDirectoryMember::File(file)) = entry {
-                            let needs_refresh =
-                                file.digest.expires().unwrap_or_default() < ttl_deadline;
-                            tracing::trace!("{} needs_refresh: {}", file, needs_refresh);
-                            if needs_refresh {
-                                digests_to_refresh
-                                    .entry(info.re_use_case)
-                                    .or_default()
-                                    .insert(file.digest.dupe());
-                            }
-                        }
+        if let ArtifactMaterializationStage::Declared { entry, method } = &data.stage
+            && let ArtifactMaterializationMethod::CasDownload { info } = method.as_ref()
+        {
+            let mut walk = unordered_entry_walk(entry.as_ref().map_dir(Directory::as_ref));
+            while let Some((_entry_path, entry)) = walk.next() {
+                if let DirectoryEntry::Leaf(ActionDirectoryMember::File(file)) = entry {
+                    let needs_refresh = file.digest.expires().unwrap_or_default() < ttl_deadline;
+                    tracing::trace!("{} needs_refresh: {}", file, needs_refresh);
+                    if needs_refresh {
+                        digests_to_refresh
+                            .entry(info.re_use_case)
+                            .or_default()
+                            .insert(file.digest.dupe());
                     }
                 }
-                _ => {}
-            },
-            _ => {}
+            }
         }
     }
 
@@ -632,9 +633,7 @@ impl IoRequest for WriteIoRequest {
     fn execute(self: Box<Self>, project_fs: &ProjectRoot) -> buck2_error::Result<()> {
         // NOTE: No spans here! We should perhaps add one, but this needs to be considered
         // carefully as it's a lot of spans, and we haven't historically emitted those for writes.
-        let res = self
-            .execute_inner(project_fs)
-            .map_err(buck2_error::Error::from);
+        let res = self.execute_inner(project_fs);
 
         // If the materializer has shut down, we ignore this.
         let _ignored = self.command_sender.send_low_priority(
@@ -660,7 +659,7 @@ impl IoRequest for CleanIoRequest {
     fn execute(self: Box<Self>, project_fs: &ProjectRoot) -> buck2_error::Result<()> {
         // NOTE: No spans here! We should perhaps add one, but this needs to be considered
         // carefully as it's a lot of spans, and we haven't historically emitted those for writes.
-        let res = cleanup_path(project_fs, &self.path).map_err(buck2_error::Error::from);
+        let res = cleanup_path(project_fs, &self.path);
 
         // If the materializer has shut down, we ignore this.
         let _ignored = self.command_sender.send_low_priority(

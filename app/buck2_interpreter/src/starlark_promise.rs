@@ -21,7 +21,6 @@ use starlark::any::ProvidesStaticType;
 use starlark::environment::GlobalsBuilder;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
-use starlark::environment::MethodsStatic;
 use starlark::eval::Evaluator;
 use starlark::starlark_module;
 use starlark::typing::Ty;
@@ -37,7 +36,6 @@ use starlark::values::ValueTyped;
 use starlark::values::list::AllocList;
 use starlark::values::list_or_tuple::UnpackListOrTuple;
 use starlark::values::starlark_value;
-use starlark::values::starlark_value_as_type::StarlarkValueAsType;
 use starlark::values::type_repr::StarlarkTypeRepr;
 use starlark::values::typing::StarlarkCallable;
 
@@ -193,7 +191,7 @@ impl<'v> StarlarkPromise<'v> {
 
     pub fn join(
         args: Vec<ValueTyped<'v, StarlarkPromise<'v>>>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> ValueTyped<'v, StarlarkPromise<'v>> {
         let join = PromiseJoin::new(args);
         match join.get() {
@@ -281,7 +279,7 @@ impl<'v> StarlarkPromise<'v> {
 // We can't use starlark_complex_value! because there is no frozen form of a promise
 
 impl<'v> AllocValue<'v> for StarlarkPromise<'v> {
-    fn alloc_value(self, heap: &'v Heap) -> Value<'v> {
+    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
         // FIXME: need to be able to freeze things that are resolved
         heap.alloc_complex_no_freeze(self)
     }
@@ -303,11 +301,12 @@ impl<'v> UnpackValue<'v> for &'v StarlarkPromise<'v> {
     }
 }
 
+starlark::methods_static!(PROMISE_METHODS = promise_methods);
+
 #[starlark_value(type = "Promise")]
 impl<'v> StarlarkValue<'v> for StarlarkPromise<'v> {
     fn get_methods() -> Option<&'static Methods> {
-        static RES: MethodsStatic = MethodsStatic::new();
-        RES.methods(promise_methods)
+        Some(PROMISE_METHODS.methods())
     }
 }
 
@@ -330,7 +329,7 @@ fn promise_methods(builder: &mut MethodsBuilder) {
     fn join<'v>(
         this: ValueTyped<'v, StarlarkPromise<'v>>,
         #[starlark(args)] mut args: UnpackListOrTuple<ValueTyped<'v, StarlarkPromise<'v>>>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> starlark::Result<ValueTyped<'v, StarlarkPromise<'v>>> {
         args.items.insert(0, this);
         Ok(StarlarkPromise::join(args.items, heap))
@@ -338,9 +337,8 @@ fn promise_methods(builder: &mut MethodsBuilder) {
 }
 
 #[starlark_module]
-pub fn register_promise(globals: &mut GlobalsBuilder) {
-    const Promise: StarlarkValueAsType<StarlarkPromise> = StarlarkValueAsType::new();
-}
+#[starlark_types(StarlarkPromise<'_> as Promise)]
+pub fn register_promise(globals: &mut GlobalsBuilder) {}
 
 #[cfg(test)]
 mod tests {
@@ -403,18 +401,18 @@ mod tests {
         }
     }
 
-    fn alloc_promises<'v>(modu: &'v Module) {
+    fn alloc_promises(modu: &Module) {
         modu.set(
             "__promises__",
             modu.heap().alloc_complex_no_freeze(Promises::default()),
         )
     }
 
-    fn get_promises<'v>(modu: &'v Module) -> &'v Promises<'v> {
+    fn get_promises<'v>(modu: &Module<'v>) -> &'v Promises<'v> {
         modu.get("__promises__").unwrap().downcast_ref().unwrap()
     }
 
-    fn assert_promise<'v>(modu: &'v Module, content: &str) -> buck2_error::Result<Value<'v>> {
+    fn assert_promise<'v>(modu: &Module<'v>, content: &str) -> buck2_error::Result<Value<'v>> {
         alloc_promises(modu);
         let globals = GlobalsBuilder::standard().with(helpers).build();
         let ast = AstModule::parse(
@@ -431,7 +429,8 @@ mod tests {
         Ok(res)
     }
 
-    fn assert_promise_err<'v>(modu: &'v Module, content: &str, err: &str) -> buck2_error::Error {
+    #[allow(clippy::needless_lifetimes)]
+    fn assert_promise_err<'v>(modu: &Module<'v>, content: &str, err: &str) -> buck2_error::Error {
         match assert_promise(modu, content) {
             Ok(_) => panic!("Expected an error, got a result"),
             Err(e) => {
@@ -446,10 +445,11 @@ mod tests {
 
     #[test]
     fn test_promise() {
-        let modu = Module::new();
-        let res = assert_promise(
-            &modu,
-            r#"
+        // patternlint-disable-next-line buck2-no-starlark-module: Test
+        Module::with_temp_heap(|modu| {
+            let res = assert_promise(
+                &modu,
+                r#"
 a = promise_unresolved("test")
 b = a.map(lambda x: x.upper())
 c = b.map(lambda x: x + "!")
@@ -458,86 +458,97 @@ e = promise_resolved("more")
 f = e.map(lambda x: x.upper())
 (a,b,c,d,e,f)
 "#,
-        )
+            )
+            .unwrap();
+            let wants = &["test", "TEST", "TEST!", "Test", "more", "MORE"];
+            for (want, got) in wants
+                .iter()
+                .zip(TupleRef::from_value(res).unwrap().content())
+            {
+                assert_eq!(
+                    StarlarkPromise::from_value(*got)
+                        .unwrap()
+                        .get()
+                        .unwrap()
+                        .unpack_str()
+                        .unwrap(),
+                    *want
+                );
+            }
+            starlark::Result::Ok(())
+        })
         .unwrap();
-        let wants = &["test", "TEST", "TEST!", "Test", "more", "MORE"];
-        for (want, got) in wants
-            .iter()
-            .zip(TupleRef::from_value(res).unwrap().content())
-        {
-            assert_eq!(
-                StarlarkPromise::from_value(*got)
-                    .unwrap()
-                    .get()
-                    .unwrap()
-                    .unpack_str()
-                    .unwrap(),
-                *want
-            );
-        }
     }
 
     #[test]
     fn test_promise_validate() {
-        let modu = Module::new();
-        assert_promise(
-            &modu,
-            r#"
+        // patternlint-disable-next-line buck2-no-starlark-module: Test
+        Module::with_temp_heap(|modu| {
+            assert_promise(
+                &modu,
+                r#"
 p = promise_unresolved("ok")
 promise_validate(p)
 p
 "#,
-        )
-        .unwrap();
-        assert_promise_err(
-            &modu,
-            r#"
+            )
+            .unwrap();
+            assert_promise_err(
+                &modu,
+                r#"
 p = promise_unresolved("test")
 promise_validate(p)
 p
 "#,
-            "VALIDATE_FAILED",
-        );
+                "VALIDATE_FAILED",
+            );
+            starlark::Result::Ok(())
+        })
+        .unwrap();
     }
 
     #[test]
     fn test_promise_join() {
-        let modu = Module::new();
-        let res = assert_promise(
-            &modu,
-            r#"
+        // patternlint-disable-next-line buck2-no-starlark-module: Test
+        Module::with_temp_heap(|modu| {
+            let res = assert_promise(
+                &modu,
+                r#"
 p1 = promise_resolved("a")
 p2 = promise_resolved("b")
 p3 = promise_resolved("c")
 p1.join(p2, p3)
 "#,
-        )
-        .unwrap();
-        assert_eq!(
-            StarlarkPromise::from_value(res)
-                .unwrap()
-                .get()
-                .unwrap()
-                .to_string(),
-            "[\"a\", \"b\", \"c\"]"
-        );
-        let res = assert_promise(
-            &modu,
-            r#"
+            )
+            .unwrap();
+            assert_eq!(
+                StarlarkPromise::from_value(res)
+                    .unwrap()
+                    .get()
+                    .unwrap()
+                    .to_string(),
+                "[\"a\", \"b\", \"c\"]"
+            );
+            let res = assert_promise(
+                &modu,
+                r#"
 p1 = promise_resolved("a")
 p2 = promise_unresolved("B")
 p3 = promise_unresolved("C")
 p1.join(p2, p3)
 "#,
-        )
+            )
+            .unwrap();
+            assert_eq!(
+                StarlarkPromise::from_value(res)
+                    .unwrap()
+                    .get()
+                    .unwrap()
+                    .to_string(),
+                "[\"a\", \"B\", \"C\"]"
+            );
+            starlark::Result::Ok(())
+        })
         .unwrap();
-        assert_eq!(
-            StarlarkPromise::from_value(res)
-                .unwrap()
-                .get()
-                .unwrap()
-                .to_string(),
-            "[\"a\", \"B\", \"C\"]"
-        );
     }
 }

@@ -41,6 +41,7 @@ pub fn get_re_group_tag(group: &TCodeReasonGroup) -> Option<ErrorTag> {
     match *group {
         TCodeReasonGroup::RE_CONNECTION => Some(ErrorTag::ReConnection),
         TCodeReasonGroup::USER_QUOTA => Some(ErrorTag::ReUserQuota),
+        TCodeReasonGroup::USER_BAD_CERTS => Some(ErrorTag::ReUserBadCerts),
         _ => None,
     }
 }
@@ -66,8 +67,8 @@ impl TypedContext for RemoteExecutionError {
         }
     }
 
-    fn should_display(&self) -> bool {
-        false
+    fn display(&self) -> Option<String> {
+        None
     }
 }
 
@@ -103,10 +104,17 @@ pub(crate) async fn with_error_handler<T>(
         Err(e) => {
             let (code, group) = e
                 .downcast_ref::<REClientError>()
-                .map(|e| (e.code, e.group))
-                .unwrap_or((TCode::UNKNOWN, TCodeReasonGroup::UNKNOWN));
+                .map_or((TCode::UNKNOWN, TCodeReasonGroup::UNKNOWN), |e| {
+                    (e.code, e.group)
+                });
 
-            Err(re_error(re_action, re_session_id, format!("{e:#}"), code, group).into())
+            Err(re_error(
+                re_action,
+                re_session_id,
+                format!("{e:#}"),
+                code,
+                group,
+            ))
         }
     }
 }

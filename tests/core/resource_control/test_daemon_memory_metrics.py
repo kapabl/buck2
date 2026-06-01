@@ -13,9 +13,10 @@ import typing
 
 from buck2.tests.e2e_util.api.buck import Buck
 from buck2.tests.e2e_util.buck_workspace import buck_test
+from buck2.tests.e2e_util.helper.utils import filter_events
 
 
-@buck_test(skip_for_os=["darwin", "windows"])
+@buck_test(skip_for_os=["darwin", "windows"], disable_daemon_cgroup=False)
 async def test_metrics_cgroup_no_resource_control(buck: Buck) -> None:
     write_config(buck, resource_control=False)
     snapshot = await start_daemon_and_get_snapshot(buck)
@@ -23,7 +24,7 @@ async def test_metrics_cgroup_no_resource_control(buck: Buck) -> None:
     assert snapshot["forkserver_actions_cgroup"] is None
 
 
-@buck_test(skip_for_os=["darwin", "windows"])
+@buck_test(skip_for_os=["darwin", "windows"], disable_daemon_cgroup=False)
 async def test_metrics_cgroup_resource_control(buck: Buck) -> None:
     write_config(buck, resource_control=True)
     snapshot = await start_daemon_and_get_snapshot(buck)
@@ -41,6 +42,18 @@ async def test_metrics_cgroup_resource_control(buck: Buck) -> None:
     )
 
 
+@buck_test(
+    skip_for_os=["darwin", "windows"],
+)
+async def test_cgroup_path_tag(buck: Buck) -> None:
+    await buck.targets(":")
+    events = await filter_events(buck, "Event", "data", "Instant", "data", "SystemInfo")
+    assert len(events) >= 1
+    path = events[0]["daemon_cgroup_slice_path"]
+    assert path is not None
+    assert path.startswith("/sys/fs/cgroup/")
+
+
 # Placeholder for tests to be listed successfully on non-Linux platforms.
 async def test_noop() -> None:
     pass
@@ -49,7 +62,7 @@ async def test_noop() -> None:
 def write_config(buck: Buck, *, resource_control: bool) -> None:
     with open(buck.cwd / ".buckconfig", "a") as buckconfig:
         buckconfig.write("[buck2_resource_control]\n")
-        buckconfig.write(f"status = {"required" if resource_control else "off"}\n")
+        buckconfig.write(f"status = {'required' if resource_control else 'off'}\n")
 
 
 async def start_daemon_and_get_snapshot(buck: Buck) -> dict[str, typing.Any]:

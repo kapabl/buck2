@@ -60,7 +60,8 @@ use crate::bxl::value_as_starlark_target_label::ValueAsStarlarkTargetLabel;
     Display,
     ProvidesStaticType,
     NoSerialize,
-    Allocative
+    Allocative,
+    starlark::StarlarkPagable
 )]
 #[repr(C)]
 pub(crate) struct StarlarkProvidersArtifactIterableGen<V: ValueLifetimeless>(pub(crate) V);
@@ -81,7 +82,7 @@ where
             .1
             .outputs
             .iter()
-            .filter_map(|built| built.as_ref().ok())
+            .filter_map(|built| built.inner.as_ref().ok())
             .flat_map(|built| built.values.iter().map(|(artifact, _)| artifact))
     }
 }
@@ -91,14 +92,14 @@ impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for StarlarkProvidersArtifactIterab
 where
     Self: ProvidesStaticType<'v>,
 {
-    fn iterate_collect(&self, heap: &'v Heap) -> starlark::Result<Vec<Value<'v>>> {
+    fn iterate_collect(&self, heap: Heap<'v>) -> starlark::Result<Vec<Value<'v>>> {
         Ok(self
             .iter()
             .map(|artifact| heap.alloc(StarlarkArtifact::new(artifact.dupe())))
             .collect())
     }
 
-    fn at(&self, index: Value<'v>, heap: &'v Heap) -> starlark::Result<Value<'v>> {
+    fn at(&self, index: Value<'v>, heap: Heap<'v>) -> starlark::Result<Value<'v>> {
         let i = i32::unpack_value_err(index)?;
         if let Ok(i) = usize::try_from(i) {
             if let Some(artifact) = self.iter().nth(i) {
@@ -122,7 +123,8 @@ where
     Display,
     ProvidesStaticType,
     NoSerialize,
-    Allocative
+    Allocative,
+    starlark::StarlarkPagablePanic // okay("bxl")
 )]
 #[repr(C)]
 pub(crate) struct StarlarkFailedArtifactIterableGen<V: ValueLifetimeless>(pub(crate) V);
@@ -143,7 +145,7 @@ where
             .1
             .outputs
             .iter()
-            .filter_map(|built| built.as_ref().err())
+            .filter_map(|built| built.inner.as_ref().err())
     }
 }
 
@@ -152,11 +154,11 @@ impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for StarlarkFailedArtifactIterableG
 where
     Self: ProvidesStaticType<'v>,
 {
-    fn iterate_collect(&self, heap: &'v Heap) -> starlark::Result<Vec<Value<'v>>> {
+    fn iterate_collect(&self, heap: Heap<'v>) -> starlark::Result<Vec<Value<'v>>> {
         Ok(self.iter().map(|e| heap.alloc(format!("{e}"))).collect())
     }
 
-    fn at(&self, index: Value<'v>, heap: &'v Heap) -> starlark::Result<Value<'v>> {
+    fn at(&self, index: Value<'v>, heap: Heap<'v>) -> starlark::Result<Value<'v>> {
         let i = i32::unpack_value_err(index)?;
         if let Ok(i) = usize::try_from(i) {
             if let Some(e) = self.iter().nth(i) {
@@ -184,7 +186,7 @@ pub(crate) fn build<'v>(
         ValueTyped<'v, StarlarkBxlBuildResult>,
     >,
 > {
-    let global_cfg_options = ctx.resolve_global_cfg_options(target_platform, vec![].into())?;
+    let global_cfg_options = ctx.resolve_global_cfg_options(target_platform, vec![])?;
 
     let build_result = ctx.via_dice(eval, |dice| {
         dice.via(|dice| {
@@ -192,12 +194,13 @@ pub(crate) fn build<'v>(
                 let build_spec = ProvidersExpr::<ConfiguredProvidersLabel>::unpack(
                     spec,
                     &global_cfg_options,
-                    &ctx,
+                    ctx,
                     dice,
                 )
                 .await?;
 
-                let (result_builder, consumer) = AsyncBuildTargetResultBuilder::new(None);
+                let (result_builder, consumer) =
+                    AsyncBuildTargetResultBuilder::new(None, std::time::Instant::now());
                 result_builder
                     .wait_for(
                         // TODO (torozco): support --fail-fast in BXL.
@@ -211,7 +214,7 @@ pub(crate) fn build<'v>(
                                     build_configured_label(
                                         &consumer,
                                         &ctx,
-                                        &(materializations, uploads).into(),
+                                        (materializations, uploads).into(),
                                         target,
                                         &ProvidersToBuild {
                                             default: true,
@@ -243,11 +246,11 @@ pub(crate) fn build<'v>(
         .configured
         .values()
         .flatten()
-        .flat_map(|r| &r.errors)
+        .flat_map(|r| r.errors.iter().map(|t| &t.inner))
         .chain(build_result.other_errors.values().flatten())
         .next()
     {
-        return Err(err.dupe().into());
+        return Err(err.dupe());
     }
 
     Ok(build_result

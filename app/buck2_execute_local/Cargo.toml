@@ -30,7 +30,7 @@ nix = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 buck2_wrapper_common = { workspace = true }
 dupe = { workspace = true }
-winapi = { workspace = true }
+windows-sys = { workspace = true }
 
 [dev-dependencies]
 assert_matches = { workspace = true }
@@ -41,5 +41,5 @@ tokio-stream = { workspace = true }
 
 buck2_util = { workspace = true }
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fbcode_build)"] }
+[lints]
+workspace = true

@@ -16,9 +16,12 @@ use buck2_artifact::artifact::artifact_type::Artifact;
 use buck2_artifact::artifact::source_artifact::SourceArtifact;
 use buck2_core::package::PackageLabel;
 use buck2_core::package::source_path::SourcePath;
+use buck2_error::internal_error;
 use buck2_error::starlark_error::from_starlark_with_options;
 use buck2_interpreter::types::configured_providers_label::StarlarkConfiguredProvidersLabel;
 use buck2_interpreter::types::configured_providers_label::StarlarkProvidersLabel;
+use buck2_interpreter::types::select_fail::StarlarkSelectFail;
+use buck2_interpreter::types::select_incompatible::StarlarkSelectIncompatible;
 use buck2_interpreter::types::target_label::StarlarkTargetLabel;
 use buck2_node::attrs::coerced_attr::CoercedAttr;
 use buck2_node::attrs::display::AttrDisplayWithContext;
@@ -30,15 +33,16 @@ use buck2_node::visibility::WithinViewSpecification;
 use derive_more::From;
 use dupe::Dupe;
 use gazebo::prelude::SliceExt;
+use pagable::Pagable;
 use serde::Serialize;
 use starlark::__derive_refs::serde::Serializer;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
-use starlark::environment::MethodsStatic;
 use starlark::starlark_module;
 use starlark::starlark_simple_value;
 use starlark::values::Heap;
+use starlark::values::StarlarkPagable;
 use starlark::values::StarlarkValue;
 use starlark::values::Value;
 use starlark::values::dict::Dict;
@@ -51,8 +55,11 @@ use crate::bxl::select::StarlarkSelectConcat;
 use crate::bxl::select::StarlarkSelectDict;
 use crate::interpreter::rule_defs::artifact::starlark_artifact::StarlarkArtifact;
 
-#[derive(Debug, ProvidesStaticType, From, Allocative)]
-pub struct StarlarkCoercedAttr(pub CoercedAttr, pub PackageLabel);
+#[derive(Debug, ProvidesStaticType, From, Allocative, Pagable, StarlarkPagable)]
+pub struct StarlarkCoercedAttr(
+    #[starlark_pagable(pagable)] pub CoercedAttr,
+    #[starlark_pagable(pagable)] pub PackageLabel,
+);
 
 starlark_simple_value!(StarlarkCoercedAttr);
 
@@ -83,12 +90,13 @@ impl Serialize for StarlarkCoercedAttr {
     }
 }
 
+starlark::methods_static!(COERCED_ATTR_METHODS = coerced_attr_methods);
+
 /// Coerced attr from an unconfigured target node.
 #[starlark_value(type = "CoercedAttr")]
 impl<'v> StarlarkValue<'v> for StarlarkCoercedAttr {
     fn get_methods() -> Option<&'static Methods> {
-        static RES: MethodsStatic = MethodsStatic::new();
-        RES.methods(coerced_attr_methods)
+        Some(COERCED_ATTR_METHODS.methods())
     }
 }
 
@@ -106,7 +114,7 @@ fn coerced_attr_methods(builder: &mut MethodsBuilder) {
     // FIXME(JakobDegen): Strings as types are mostly dead, users should be getting the value and
     // using `isinstance` instead. Remove this.
     #[starlark(attribute)]
-    fn r#type<'v>(this: &StarlarkCoercedAttr, heap: &'v Heap) -> starlark::Result<&'v str> {
+    fn r#type<'v>(this: &StarlarkCoercedAttr, heap: Heap<'v>) -> starlark::Result<&'v str> {
         Ok(this.0.to_value(this.1.dupe(), heap)?.get_type())
     }
 
@@ -119,18 +127,18 @@ fn coerced_attr_methods(builder: &mut MethodsBuilder) {
     ///     node = ctx.uquery().owner("bin/TARGETS")[0]
     ///     ctx.output.print(node.attrs.name.value())
     /// ```
-    fn value<'v>(this: &StarlarkCoercedAttr, heap: &'v Heap) -> starlark::Result<Value<'v>> {
+    fn value<'v>(this: &StarlarkCoercedAttr, heap: Heap<'v>) -> starlark::Result<Value<'v>> {
         Ok(this.0.to_value(this.1.dupe(), heap)?)
     }
 }
 
 pub trait CoercedAttrExt {
-    fn to_value<'v>(&self, pkg: PackageLabel, heap: &'v Heap) -> buck2_error::Result<Value<'v>>;
+    fn to_value<'v>(&self, pkg: PackageLabel, heap: Heap<'v>) -> buck2_error::Result<Value<'v>>;
 }
 
 impl CoercedAttrExt for CoercedAttr {
     /// Converts the coerced attr to a starlark value
-    fn to_value<'v>(&self, pkg: PackageLabel, heap: &'v Heap) -> buck2_error::Result<Value<'v>> {
+    fn to_value<'v>(&self, pkg: PackageLabel, heap: Heap<'v>) -> buck2_error::Result<Value<'v>> {
         Ok(match &self {
             CoercedAttr::Bool(v) => heap.alloc(v.0),
             CoercedAttr::Int(v) => heap.alloc(*v),
@@ -164,6 +172,11 @@ impl CoercedAttrExt for CoercedAttr {
                 VisibilityPatternList::Public => heap.alloc(AllocList(["PUBLIC"])),
                 VisibilityPatternList::List(specs) => {
                     heap.alloc(AllocList(specs.iter().map(|s| s.to_string())))
+                }
+                VisibilityPatternList::Intersection(_) => {
+                    return Err(internal_error!(
+                        "Intersection visibility cannot be serialized as attribute"
+                    ));
                 }
             },
             CoercedAttr::ExplicitConfiguredDep(d) => heap.alloc(
@@ -199,6 +212,14 @@ impl CoercedAttrExt for CoercedAttr {
             CoercedAttr::Selector(selector) => {
                 let select_dict = StarlarkSelectDict::new(*selector.clone(), pkg.dupe());
                 heap.alloc(select_dict)
+            }
+            CoercedAttr::SelectFail(message) => {
+                let select_fail = StarlarkSelectFail::new(heap.alloc_str(message));
+                heap.alloc(select_fail)
+            }
+            CoercedAttr::SelectIncompatible(message) => {
+                let select_incompatible = StarlarkSelectIncompatible::new(heap.alloc_str(message));
+                heap.alloc(select_incompatible)
             }
             CoercedAttr::Concat(c) => heap.alloc(StarlarkSelectConcat::new(c.clone(), pkg.dupe())),
         })

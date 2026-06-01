@@ -36,6 +36,10 @@ use allocative::Allocative;
 use allocative::Visitor;
 use bumpalo::Bump;
 use dupe::Dupe;
+use pagable::PagableDeserialize;
+use pagable::PagableDeserializer;
+use pagable::PagableSerialize;
+use pagable::PagableSerializer;
 use starlark_map::small_map::SmallMap;
 
 use crate::collections::StarlarkHashValue;
@@ -46,7 +50,7 @@ use crate::values::layout::aligned_size::AlignedSize;
 use crate::values::layout::avalue::AValue;
 use crate::values::layout::avalue::AValueImpl;
 use crate::values::layout::avalue::BlackHole;
-use crate::values::layout::avalue::starlark_str;
+use crate::values::layout::avalues::str_::starlark_str;
 use crate::values::layout::heap::allocator::api::ArenaAllocator;
 use crate::values::layout::heap::allocator::api::ChunkAllocationDirection;
 use crate::values::layout::heap::call_enter_exit::CallEnter;
@@ -61,6 +65,7 @@ use crate::values::layout::heap::repr::AValueHeader;
 use crate::values::layout::heap::repr::AValueOrForward;
 use crate::values::layout::heap::repr::AValueOrForwardUnpack;
 use crate::values::layout::heap::repr::AValueRepr;
+use crate::values::layout::value_alloc_size::ValueAllocSize;
 use crate::values::layout::vtable::AValueVTable;
 use crate::values::string::str_type::StarlarkStr;
 
@@ -76,6 +81,72 @@ pub(crate) const MIN_ALLOC: AlignedSize = {
         AlignedSize::of::<AValueRepr<BlackHole>>(),
     )
 };
+
+/// Which bump region a value is allocated in.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub(crate) enum BumpKind {
+    Drop = 0,
+    NonDrop = 1,
+}
+
+impl PagableSerialize for BumpKind {
+    fn pagable_serialize(&self, serializer: &mut dyn PagableSerializer) -> pagable::Result<()> {
+        (*self as u8).pagable_serialize(serializer)
+    }
+}
+
+impl<'de> PagableDeserialize<'de> for BumpKind {
+    fn pagable_deserialize<D: PagableDeserializer<'de> + ?Sized>(
+        deserializer: &mut D,
+    ) -> pagable::Result<Self> {
+        match u8::pagable_deserialize(deserializer)? {
+            0 => Ok(BumpKind::Drop),
+            1 => Ok(BumpKind::NonDrop),
+            tag => Err(anyhow::anyhow!("Invalid BumpKind tag: {}", tag)),
+        }
+    }
+}
+
+/// Location of a value within a heap's arena.
+#[derive(Copy, Clone, Debug, PagableSerialize, PagableDeserialize)]
+pub(crate) struct ArenaOffset {
+    pub(crate) bump: BumpKind,
+    pub(crate) offset: u32,
+}
+
+/// Cursor for writing values into a pre-allocated raw block in the arena.
+/// Handles allocation direction internally so callers don't need to care.
+pub(crate) struct ArenaRawCursor {
+    cursor: *mut u8,
+    direction: ChunkAllocationDirection,
+    /// Base address of the allocated block (lowest address).
+    base: usize,
+}
+
+impl ArenaRawCursor {
+    /// Get the base address (lowest address) of the allocated block.
+    pub(crate) fn base(&self) -> usize {
+        self.base
+    }
+
+    /// Get pointer to the next value slot and advance cursor by `alloc_size`.
+    /// Returns a pointer to the `AValueHeader` position for this value.
+    pub(crate) unsafe fn next(&mut self, alloc_size: u32) -> *mut AValueHeader {
+        unsafe {
+            match self.direction {
+                ChunkAllocationDirection::Up => {
+                    let ptr = self.cursor;
+                    self.cursor = self.cursor.add(alloc_size as usize);
+                    ptr as *mut AValueHeader
+                }
+                ChunkAllocationDirection::Down => {
+                    self.cursor = self.cursor.sub(alloc_size as usize);
+                    self.cursor as *mut AValueHeader
+                }
+            }
+        }
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct Arena<A: ArenaAllocator> {
@@ -287,8 +358,6 @@ impl<A: ArenaAllocator> Arena<A> {
     }
 
     /// Allocate a type `T` plus `extra` bytes.
-    ///
-    /// The type `T` will never be dropped, so had better not do any memory allocation.
     pub(crate) fn alloc_extra<'v, T: AValue<'v>>(
         &self,
         x: AValueImpl<'v, T>,
@@ -332,38 +401,127 @@ impl<A: ArenaAllocator> Arena<A> {
         ChunkIter { chunk }
     }
 
-    // Iterate over the values in the heap in the order they
-    // were added.
-    fn for_each_ordered<'a>(&'a mut self, mut f: impl FnMut(ArenaVisitEvent<'a>)) {
-        // We get the chunks from most newest to oldest as per the bumpalo spec.
+    /// Iterate over values in a single bump allocator in allocation order.
+    fn for_each_bump_ordered<'a>(bump: &'a A, mut f: impl FnMut(&'a AValueOrForward)) {
+        // We get the chunks from newest to oldest as per the bumpalo spec.
         // And within each chunk, the values are filled newest to oldest.
         // So need to do two sets of reversing.
-        for bump in [&mut self.drop, &mut self.non_drop] {
-            f(ArenaVisitEvent::EnterBump);
-            let chunks = unsafe { bump.iter_allocated_chunks_rev().collect::<Vec<_>>() };
-            // Use a single buffer to reduce allocations, but clear it after use
-            let mut buffer = Vec::new();
-            for chunk in chunks.iter().rev() {
-                match A::CHUNK_ALLOCATION_DIRECTION {
-                    ChunkAllocationDirection::Down => {
-                        buffer.extend(Arena::<A>::iter_chunk(chunk));
-                        for x in buffer.iter().rev() {
-                            f(ArenaVisitEvent::Value(x));
-                        }
-                        buffer.clear();
+        let chunks = unsafe { bump.iter_allocated_chunks_rev().collect::<Vec<_>>() };
+        let mut buffer = Vec::new();
+        for chunk in chunks.iter().rev() {
+            match A::CHUNK_ALLOCATION_DIRECTION {
+                ChunkAllocationDirection::Down => {
+                    buffer.extend(Arena::<A>::iter_chunk(chunk));
+                    for x in buffer.iter().rev() {
+                        f(x);
                     }
-                    ChunkAllocationDirection::Up => {
-                        for x in Arena::<A>::iter_chunk(chunk) {
-                            f(ArenaVisitEvent::Value(x));
-                        }
+                    buffer.clear();
+                }
+                ChunkAllocationDirection::Up => {
+                    for x in Arena::<A>::iter_chunk(chunk) {
+                        f(x);
                     }
                 }
             }
         }
     }
 
+    // Iterate over the values in the heap in the order they
+    // were added.
+    fn for_each_ordered<'a>(&'a self, mut f: impl FnMut(ArenaVisitEvent<'a>)) {
+        for bump in [&self.drop, &self.non_drop] {
+            f(ArenaVisitEvent::EnterBump);
+            Self::for_each_bump_ordered(bump, |x| f(ArenaVisitEvent::Value(x)));
+        }
+    }
+
+    /// Collect live value headers from the `drop` bump in allocation order.
+    /// Forward pointers (from GC) are skipped.
+    pub(crate) fn collect_drop_headers_ordered(&self) -> Vec<&AValueHeader> {
+        Self::collect_bump_headers_ordered(&self.drop)
+    }
+
+    /// Collect live value headers from the `non_drop` bump in allocation order.
+    /// Forward pointers (from GC) are skipped.
+    pub(crate) fn collect_undrop_headers_ordered(&self) -> Vec<&AValueHeader> {
+        Self::collect_bump_headers_ordered(&self.non_drop)
+    }
+
+    /// Allocate a raw block in the `drop` bump and return a cursor for filling values.
+    /// Returns `None` if `total_bytes` is 0.
+    pub(crate) fn alloc_raw_drop_cursor(&self, total_bytes: u32) -> Option<ArenaRawCursor> {
+        Self::alloc_raw_cursor(&self.drop, total_bytes)
+    }
+
+    /// Allocate a raw block in the `non_drop` bump and return a cursor for filling values.
+    /// Returns `None` if `total_bytes` is 0.
+    pub(crate) fn alloc_raw_non_drop_cursor(&self, total_bytes: u32) -> Option<ArenaRawCursor> {
+        Self::alloc_raw_cursor(&self.non_drop, total_bytes)
+    }
+
+    fn alloc_raw_cursor(bump: &A, total_bytes: u32) -> Option<ArenaRawCursor> {
+        if total_bytes == 0 {
+            return None;
+        }
+        let size = ValueAllocSize::new(AlignedSize::new_bytes(total_bytes as usize));
+        let block = bump.alloc(size);
+        let base = block.as_ptr() as usize;
+        let cursor = match A::CHUNK_ALLOCATION_DIRECTION {
+            ChunkAllocationDirection::Up => block.as_ptr(),
+            ChunkAllocationDirection::Down => unsafe { block.as_ptr().add(total_bytes as usize) },
+        };
+        Some(ArenaRawCursor {
+            cursor,
+            direction: A::CHUNK_ALLOCATION_DIRECTION,
+            base,
+        })
+    }
+
+    fn collect_bump_headers_ordered(bump: &A) -> Vec<&AValueHeader> {
+        let mut headers = Vec::new();
+        Self::for_each_bump_ordered(bump, |value| {
+            if let Some(header) = value.unpack_header() {
+                headers.push(header);
+            }
+        });
+        headers
+    }
+
+    /// Build a map from raw header pointer address to `ArenaOffset`
+    /// for all values in both bump regions.
+    pub(crate) fn build_ptr_to_offset_map(&self) -> HashMap<usize, ArenaOffset> {
+        let mut map = HashMap::new();
+
+        fn build_for_bump<A: ArenaAllocator>(
+            bump: &A,
+            bump_kind: BumpKind,
+            map: &mut HashMap<usize, ArenaOffset>,
+        ) {
+            let mut cumulative_offset: u32 = 0;
+            Arena::<A>::for_each_bump_ordered(bump, |value| {
+                if let Some(header) = value.unpack_header() {
+                    let ptr_addr = header.payload_ptr().ptr as usize;
+                    map.insert(
+                        ptr_addr,
+                        ArenaOffset {
+                            bump: bump_kind,
+                            offset: cumulative_offset,
+                        },
+                    );
+                }
+                let size = value.alloc_size();
+                cumulative_offset += size.bytes();
+            });
+        }
+
+        build_for_bump(&self.drop, BumpKind::Drop, &mut map);
+        build_for_bump(&self.non_drop, BumpKind::NonDrop, &mut map);
+
+        map
+    }
+
     pub(crate) unsafe fn visit_arena<'v>(
-        &'v mut self,
+        &'v self,
         heap_kind: HeapKind,
         forward_heap_kind: HeapKind,
         visitor: &mut impl ArenaVisitor<'v>,
@@ -461,7 +619,7 @@ impl<A: ArenaAllocator> Arena<A> {
                 .entry(x.dupe())
                 .or_insert_with(|| (v.vtable().type_name, AllocCounts::default()));
             e.1.count += 1;
-            e.1.bytes += v.total_memory()
+            e.1.bytes += v.total_memory_for_profile()
         };
         self.for_each_unordered(f);
 
@@ -502,7 +660,9 @@ impl<A: ArenaAllocator> Allocative for Arena<A> {
                 // We visit both drop and non-drop bumps, because although
                 // non-drop `Bump` cannot contain malloc pointers, it can still provide
                 // useful information about headers/payload/padding.
-                x.unpack().as_allocative().visit(&mut object_visitor);
+                let value = x.unpack();
+                value.as_allocative().visit(&mut object_visitor);
+                value.visit_extra_allocative(&mut object_visitor);
                 object_visitor.exit();
             });
             allocated_visitor.exit();
@@ -533,7 +693,7 @@ impl<A: ArenaAllocator> Allocative for Arena<A> {
 mod tests {
     use super::*;
     use crate::values::any::StarlarkAny;
-    use crate::values::layout::avalue::simple;
+    use crate::values::layout::avalues::simple::simple;
 
     fn to_repr(x: &AValueHeader) -> String {
         let mut s = String::new();
@@ -597,7 +757,7 @@ mod tests {
     #[test]
     // Make sure that even if there are some blackholes when we drop, we can still walk to heap
     fn drop_with_blackhole() {
-        let mut arena = Arena::default();
+        let arena = Arena::default();
         arena.alloc(mk_str("test"));
         // reserve but do not fill!
         reserve_str(&arena, &mk_str(""));

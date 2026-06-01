@@ -34,7 +34,6 @@ use futures::FutureExt;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
-use starlark::environment::MethodsStatic;
 use starlark::eval::Evaluator;
 use starlark::starlark_module;
 use starlark::values::AllocValue;
@@ -89,16 +88,17 @@ impl<'v> BxlFilesystem<'v> {
     }
 }
 
+starlark::methods_static!(BXL_FILESYSTEM_METHODS = fs_operations);
+
 #[starlark_value(type = "bxl.Filesystem", StarlarkTypeRepr, UnpackValue)]
 impl<'v> StarlarkValue<'v> for BxlFilesystem<'v> {
     fn get_methods() -> Option<&'static Methods> {
-        static RES: MethodsStatic = MethodsStatic::new();
-        RES.methods(fs_operations)
+        Some(BXL_FILESYSTEM_METHODS.methods())
     }
 }
 
 impl<'v> AllocValue<'v> for BxlFilesystem<'v> {
-    fn alloc_value(self, heap: &'v Heap) -> Value<'v> {
+    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
         heap.alloc_complex_no_freeze(self)
     }
 }

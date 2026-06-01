@@ -22,12 +22,17 @@ use std::sync::Arc;
 
 use allocative::Allocative;
 use dupe::Dupe;
+use pagable::Pagable;
+use pagable::pagable_typetag;
+use starlark_derive::type_matcher;
 use starlark_map::sorted_map::SortedMap;
 
+use crate as starlark;
 use crate::typing::Ty;
 use crate::typing::TyBasic;
 use crate::typing::TypingBinOp;
 use crate::typing::TypingOracleCtx;
+use crate::typing::custom::TyCustomDyn;
 use crate::typing::custom::TyCustomImpl;
 use crate::typing::error::TypingNoContextError;
 use crate::typing::error::TypingNoContextOrInternalError;
@@ -36,9 +41,24 @@ use crate::values::Value;
 use crate::values::structs::StructRef;
 use crate::values::typing::type_compiled::alloc::TypeMatcherAlloc;
 use crate::values::typing::type_compiled::matcher::TypeMatcher;
+use crate::values::typing::type_compiled::matcher::TypeMatcherDyn;
+
+#[derive(Allocative, Eq, PartialEq, Hash, Debug, Clone, Copy, Dupe, Pagable)]
+#[pagable_typetag(TypeMatcherDyn)]
+struct StructMatcher;
+
+#[type_matcher]
+impl TypeMatcher for StructMatcher {
+    fn matches(&self, value: Value) -> bool {
+        StructRef::is_instance(value)
+    }
+}
 
 /// Struct type.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Allocative)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Allocative, Pagable
+)]
+#[pagable_typetag(TyCustomDyn)]
 pub struct TyStruct {
     /// The fields that are definitely present in the struct, with their types.
     pub(crate) fields: SortedMap<ArcStr, Ty>,
@@ -109,15 +129,6 @@ impl TyCustomImpl for TyStruct {
     }
 
     fn matcher<T: TypeMatcherAlloc>(&self, factory: T) -> T::Result {
-        #[derive(Allocative, Eq, PartialEq, Hash, Debug, Clone, Copy, Dupe)]
-        struct StructMatcher;
-
-        impl TypeMatcher for StructMatcher {
-            fn matches(&self, value: Value) -> bool {
-                StructRef::is_instance(value)
-            }
-        }
-
         factory.alloc(StructMatcher)
     }
 }

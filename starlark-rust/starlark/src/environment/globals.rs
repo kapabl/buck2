@@ -16,13 +16,18 @@
  */
 
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use allocative::Allocative;
 use dupe::Dupe;
 use itertools::Itertools;
-use once_cell::sync::Lazy;
 use once_cell::sync::OnceCell;
+use pagable::PagableDeserialize;
+use pagable::PagableDeserializer;
+use pagable::PagableSerialize;
+use pagable::PagableSerializer;
 
+use crate as starlark;
 use crate::__derive_refs::components::NativeCallableComponents;
 use crate::collections::SmallMap;
 use crate::collections::symbol::map::SymbolMap;
@@ -32,6 +37,12 @@ use crate::docs::DocString;
 use crate::docs::DocStringKind;
 use crate::docs::DocType;
 use crate::eval::ParametersSpec;
+use crate::pagable::StarlarkDeserialize;
+use crate::pagable::StarlarkDeserializerImpl;
+use crate::pagable::StarlarkSerialize;
+use crate::pagable::StarlarkSerializerImpl;
+use crate::pagable::starlark_deserialize_context::HeapDeserializationState;
+use crate::register_starlark_any;
 use crate::stdlib;
 pub use crate::stdlib::LibraryExtension;
 use crate::typing::Ty;
@@ -40,16 +51,18 @@ use crate::values::FrozenHeap;
 use crate::values::FrozenHeapRef;
 use crate::values::FrozenStringValue;
 use crate::values::FrozenValue;
-use crate::values::Value;
+use crate::values::OwnedFrozenValue;
 use crate::values::function::NativeFunc;
 use crate::values::function::NativeFuncFn;
 use crate::values::function::SpecialBuiltinFunction;
+use crate::values::layout::heap::heap_type::FrozenHeapName;
 use crate::values::namespace::FrozenNamespace;
 use crate::values::namespace::value::MaybeDocHiddenValue;
 use crate::values::types::function::NativeFunction;
 
 /// The global values available during execution.
 #[derive(Clone, Dupe, Debug, Allocative)]
+#[derive(pagable::Pagable, starlark_derive::StarlarkPagableViaPagable)]
 pub struct Globals(Arc<GlobalsData>);
 
 type GlobalValue = MaybeDocHiddenValue<'static, FrozenValue>;
@@ -60,6 +73,80 @@ struct GlobalsData {
     variables: SymbolMap<GlobalValue>,
     variable_names: Vec<FrozenStringValue>,
     docstring: Option<String>,
+}
+
+impl PagableSerialize for GlobalsData {
+    fn pagable_serialize(&self, serializer: &mut dyn PagableSerializer) -> pagable::Result<()> {
+        // Serialize the heap (via pagable arc — actual heap data may be deferred).
+        self.heap.pagable_serialize(serializer)?;
+
+        // Force-register offset maps for the heap and its transitive deps. The
+        // pagable arc may not run heap serialization yet, but we need the
+        // offset maps now so the upcoming starlark serializer can resolve
+        // FrozenValue pointers. Same trick as `OwnedFrozenValue` and
+        // `FrozenModule`.
+        let state = StarlarkSerializerImpl::get_or_create_state(serializer);
+        state.ensure_offset_maps_registered(&self.heap);
+        let mut ctx = StarlarkSerializerImpl::new(serializer, state);
+
+        self.variables
+            .starlark_serialize(&mut ctx)
+            .map_err(|e: crate::Error| e.into_anyhow())?;
+        self.variable_names
+            .starlark_serialize(&mut ctx)
+            .map_err(|e: crate::Error| e.into_anyhow())?;
+        drop(ctx);
+
+        self.docstring.pagable_serialize(serializer)?;
+
+        Ok(())
+    }
+}
+
+impl<'de> PagableDeserialize<'de> for GlobalsData {
+    fn pagable_deserialize<D: PagableDeserializer<'de> + ?Sized>(
+        deserializer: &mut D,
+    ) -> pagable::Result<Self> {
+        let heap = FrozenHeapRef::pagable_deserialize(deserializer)?;
+
+        // Empty `HeapDeserializationState` — the owner heap is fully
+        // deserialized at this point, so `ensure_initialized` is a no-op for
+        // any pointer we resolve into it.
+        let state = StarlarkDeserializerImpl::get_or_create_state(deserializer.as_dyn());
+        let mut ctx = StarlarkDeserializerImpl::new(
+            deserializer.as_dyn(),
+            state,
+            Arc::new(Mutex::new(HeapDeserializationState::empty())),
+        );
+
+        let variables = <SymbolMap<GlobalValue>>::starlark_deserialize(&mut ctx)
+            .map_err(|e: crate::Error| e.into_anyhow())?;
+        let variable_names = <Vec<FrozenStringValue>>::starlark_deserialize(&mut ctx)
+            .map_err(|e: crate::Error| e.into_anyhow())?;
+        drop(ctx);
+
+        let docstring = <Option<String>>::pagable_deserialize(deserializer)?;
+
+        Ok(Self {
+            heap,
+            variables,
+            variable_names,
+            docstring,
+        })
+    }
+}
+
+/// Heap name for a [`Globals`] object, used for heap graph tracking.
+#[derive(Debug, Clone, Copy, Hash)]
+pub struct GlobalFrozenHeapName {
+    /// A name identifying this globals heap.
+    pub name: &'static str,
+}
+
+impl std::fmt::Display for GlobalFrozenHeapName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "globals({})", self.name)
+    }
 }
 
 /// Used to build a [`Globals`] value.
@@ -100,12 +187,6 @@ impl Globals {
         GlobalsBuilder::extended().build()
     }
 
-    /// Empty globals.
-    pub(crate) fn empty() -> &'static Globals {
-        static EMPTY: Lazy<Globals> = Lazy::new(|| GlobalsBuilder::new().build());
-        &EMPTY
-    }
-
     /// Create a [`Globals`] combining those functions in the Starlark standard plus
     /// all those given in the [`LibraryExtension`] arguments.
     pub fn extended_by(extensions: &[LibraryExtension]) -> Self {
@@ -114,7 +195,8 @@ impl Globals {
 
     /// This function is only safe if you first call `heap` and keep a reference to it.
     /// Therefore, don't expose it on the public API.
-    pub(crate) fn get<'v>(&'v self, name: &str) -> Option<Value<'v>> {
+    #[cfg(test)]
+    pub(crate) fn get<'v>(&'v self, name: &str) -> Option<crate::values::Value<'v>> {
         self.get_frozen(name).map(FrozenValue::to_value)
     }
 
@@ -122,6 +204,12 @@ impl Globals {
     /// Therefore, don't expose it on the public API.
     pub(crate) fn get_frozen(&self, name: &str) -> Option<FrozenValue> {
         self.0.variables.get_str(name).map(|x| x.value)
+    }
+
+    pub(crate) fn get_owned(&self, name: &str) -> Option<OwnedFrozenValue> {
+        let v = self.get_frozen(name)?;
+        // SAFETY: We know the heap this is allocated in
+        unsafe { Some(OwnedFrozenValue::new(self.heap().dupe(), v)) }
     }
 
     /// Get all the names defined in this environment.
@@ -135,7 +223,8 @@ impl Globals {
         self.0.variables.iter().map(|(n, v)| (n.as_str(), v.value))
     }
 
-    pub(crate) fn heap(&self) -> &FrozenHeapRef {
+    /// The heap that owns the values in this globals.
+    pub fn heap(&self) -> &FrozenHeapRef {
         &self.0.heap
     }
 
@@ -244,14 +333,26 @@ impl GlobalsBuilder {
 
     /// Called at the end to build a [`Globals`].
     pub fn build(self) -> Globals {
+        self.build_impl(None)
+    }
+
+    /// Called at the end to build a [`Globals`] with a named heap.
+    pub fn build_named(self, name: GlobalFrozenHeapName) -> Globals {
+        self.build_impl(Some(name))
+    }
+
+    fn build_impl(self, name: Option<GlobalFrozenHeapName>) -> Globals {
         let mut variable_names: Vec<_> = self
             .variables
             .keys()
             .map(|x| self.heap.alloc_str_intern(x.as_str()))
             .collect();
         variable_names.sort();
+        let heap = self
+            .heap
+            .into_ref_impl(name.map(FrozenHeapName::Global), None);
         Globals(Arc::new(GlobalsData {
-            heap: self.heap.into_ref(),
+            heap,
             variables: self.variables,
             variable_names,
             docstring: self.docstring,
@@ -301,13 +402,8 @@ impl GlobalsBuilder {
                 name: name.to_owned(),
                 speculative_exec_safe: components.speculative_exec_safe,
                 as_type: as_type.as_ref().map(|x| x.0.dupe()),
-                ty: ty.unwrap_or_else(|| {
-                    Ty::from_native_callable_components(
-                        &components,
-                        as_type.as_ref().map(|x| x.0.dupe()),
-                    )
-                    .unwrap() // TODO(nga): do not unwrap.
-                }),
+                ty: ty
+                    .unwrap_or_else(|| components.make_type(as_type.as_ref().map(|x| x.0.dupe()))),
                 docs: components.into_docs(as_type),
                 special_builtin_function,
             },
@@ -335,23 +431,41 @@ impl GlobalsBuilder {
     }
 }
 
-/// Used to create globals.
-pub struct GlobalsStatic(OnceCell<Globals>);
+/// Lazy, named cache for a [`Globals`] value. Created via the
+/// [`globals_static!`](crate::globals_static) macro; the globals are built on
+/// first access via the supplied initializer.
+pub struct GlobalsStatic {
+    cell: OnceCell<Globals>,
+    name: &'static str,
+    init: fn(&mut GlobalsBuilder),
+}
 
 impl GlobalsStatic {
-    /// Create a new [`GlobalsStatic`].
-    pub const fn new() -> Self {
-        Self(OnceCell::new())
+    /// Create a new [`GlobalsStatic`]. Prefer the
+    /// [`globals_static!`](crate::globals_static) macro, which fills in `name`
+    /// from the call site.
+    pub const fn new(name: &'static str, init: fn(&mut GlobalsBuilder)) -> GlobalsStatic {
+        GlobalsStatic {
+            cell: OnceCell::new(),
+            name,
+            init,
+        }
     }
 
-    fn globals(&'static self, x: impl FnOnce(&mut GlobalsBuilder)) -> &'static Globals {
-        self.0.get_or_init(|| GlobalsBuilder::new().with(x).build())
+    /// Get (or build, on first call) the [`Globals`] value.
+    pub fn globals(&'static self) -> &'static Globals {
+        self.cell.get_or_init(|| {
+            GlobalsBuilder::new()
+                .with(self.init)
+                .build_named(GlobalFrozenHeapName { name: self.name })
+        })
     }
 
-    /// Get a function out of the object. Requires that the function passed only set a single
-    /// value. If populated via a `#[starlark_module]`, that means a single function in it.
-    pub fn function(&'static self, x: impl FnOnce(&mut GlobalsBuilder)) -> FrozenValue {
-        let globals = self.globals(x);
+    /// Get a function out of the object. Requires that the initializer set
+    /// exactly one value. If populated via a `#[starlark_module]`, that means
+    /// a single function in it.
+    pub fn function(&'static self) -> FrozenValue {
+        let globals = self.globals();
         assert!(
             globals.0.variables.len() == 1,
             "GlobalsBuilder.function must have exactly 1 member, you had {}",
@@ -364,15 +478,45 @@ impl GlobalsStatic {
         globals.0.variables.values().next().unwrap().value
     }
 
-    /// Move all the globals in this [`GlobalsBuilder`] into a new one. All variables will
-    /// only be allocated once (ensuring things like function comparison works properly).
-    pub fn populate(&'static self, x: impl FnOnce(&mut GlobalsBuilder), out: &mut GlobalsBuilder) {
-        let globals = self.globals(x);
+    /// Copy all the globals into another builder. The values stay owned by
+    /// the static's heap; `out`'s heap takes a reference so the dependency is
+    /// recorded for downstream consumers (e.g. pagable serialization).
+    pub fn populate(&'static self, out: &mut GlobalsBuilder) {
+        let globals = self.globals();
+        out.heap.add_reference(globals.heap());
         for (name, value) in globals.0.variables.iter() {
             out.set_inner(name.as_str(), value.value, value.doc_hidden)
         }
         out.docstring = globals.0.docstring.clone();
     }
+}
+
+/// Define a `static` of type [`GlobalsStatic`] backed by an init function.
+/// The heap is named `<module_path>::<NAME>`.
+///
+/// ```ignore
+/// fn build(b: &mut GlobalsBuilder) { ... }
+///
+/// starlark::globals_static!(MY_GLOBALS = build);
+/// ```
+#[macro_export]
+macro_rules! globals_static {
+    ($vis:vis $name:ident = $init:expr) => {
+        #[allow(dead_code)]
+        $vis static $name: $crate::__derive_refs::GlobalsStatic =
+            $crate::__derive_refs::GlobalsStatic::new(
+                concat!(module_path!(), "::", stringify!($name)),
+                $init,
+            );
+
+        $crate::__derive_refs::inventory::submit! {
+            $crate::__derive_refs::StaticHeapEntry {
+                file: file!(),
+                line: line!(),
+                get_heap: || $name.globals().heap(),
+            }
+        }
+    };
 }
 
 pub(crate) fn common_documentation<'a, T: IntoIterator<Item = (&'a str, FrozenValue)>>(
@@ -393,25 +537,17 @@ pub(crate) fn common_documentation<'a, T: IntoIterator<Item = (&'a str, FrozenVa
     (main_docs, member_docs)
 }
 
+register_starlark_any!(Globals);
+
 #[cfg(test)]
 mod tests {
-    use starlark_derive::starlark_module;
-
     use super::*;
-    use crate as starlark;
 
     #[test]
     fn test_send_sync()
     where
         Globals: Send + Sync,
     {
-    }
-
-    #[starlark_module]
-    fn register_foo(builder: &mut GlobalsBuilder) {
-        fn foo() -> anyhow::Result<i32> {
-            Ok(1)
-        }
     }
 
     #[test]

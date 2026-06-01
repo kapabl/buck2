@@ -8,12 +8,12 @@
  * above-listed licenses.
  */
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use buck2_events::BuckEvent;
 use buck2_events::span::SpanId;
+use buck2_hash::StdBuckHashMap;
 use derivative::Derivative;
 use derive_more::From;
 use dupe::Dupe;
@@ -115,10 +115,11 @@ impl<'a, T: SpanTrackable> SpanHandle<'a, T> {
                 .tracker
                 .all
                 .get(c.0)
-                .with_buck_error_context(|| {
-                    format!(
+                .ok_or_else(|| {
+                    internal_error!(
                         "Invariant violation: span `{:?}` references non-existent child `{}`",
-                        self.span.info.event, c.0
+                        self.span.info.event,
+                        c.0
                     )
                 })
                 .unwrap();
@@ -141,7 +142,7 @@ impl<'a, T: SpanTrackable> SpanHandle<'a, T> {
 pub struct Roots<T: SpanTrackable> {
     roots: LinkedHashMap<<T as SpanTrackable>::Id, RootData>,
     boring_roots: LinkedHashMap<<T as SpanTrackable>::Id, RootData>,
-    dice_counts: HashMap<&'static str, u64>,
+    dice_counts: StdBuckHashMap<&'static str, u64>,
 }
 
 #[derive(Clone)]
@@ -241,7 +242,7 @@ impl<T: SpanTrackable> Roots<T> {
         }
     }
 
-    pub fn dice_counts(&self) -> &HashMap<&'static str, u64> {
+    pub fn dice_counts(&self) -> &StdBuckHashMap<&'static str, u64> {
         &self.dice_counts
     }
 }
@@ -287,7 +288,7 @@ impl<T> ExactSizeIterator for ExactSizeIteratorWrapper<T> where T: Iterator {}
 #[derive(Clone)]
 pub struct SpanTracker<T: SpanTrackable> {
     roots: Roots<T>,
-    all: HashMap<<T as SpanTrackable>::Id, Span<T>>,
+    all: StdBuckHashMap<<T as SpanTrackable>::Id, Span<T>>,
     roots_completed: usize,
 }
 
@@ -452,23 +453,19 @@ impl SpanTrackable for BuckEvent {
                     Some(Stage::Local(stage)) => {
                         use buck2_data::local_stage::Stage;
 
-                        match stage.stage.as_ref() {
-                            Some(Stage::Queued(..) | Stage::AcquireLocalResource(..)) => true,
-                            _ => false,
-                        }
+                        matches!(
+                            stage.stage.as_ref(),
+                            Some(Stage::Queued(..) | Stage::AcquireLocalResource(..))
+                        )
                     }
                     Some(Stage::Re(stage)) => {
                         use buck2_data::re_stage::Stage;
 
-                        match stage.stage.as_ref() {
-                            Some(Stage::Queue(..)) => true,
-                            _ => false,
-                        }
+                        matches!(stage.stage.as_ref(), Some(Stage::Queue(..)))
                     }
                     _ => false,
                 }
             }
-            Some(Data::BxlDiceInvocation(..)) => true,
             _ => false,
         }
     }
@@ -535,7 +532,7 @@ pub fn is_span_shown(event: &BuckEvent) -> bool {
             | Data::Load(..)
             | Data::LoadPackage(..)
             | Data::TestDiscovery(..)
-            | Data::TestStart(..)
+            | Data::TestRun(..)
             | Data::FileWatcher(..)
             | Data::SharedTask(..)
             | Data::CreateOutputSymlinks(..)

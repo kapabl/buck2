@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
 from buck2.tests.e2e_util.api.buck import Buck
 from buck2.tests.e2e_util.api.buck_result import BuckException
 from buck2.tests.e2e_util.asserts import expect_failure
@@ -24,7 +23,6 @@ from buck2.tests.e2e_util.helper.utils import (
     expect_exec_count,
     filter_events,
     random_string,
-    read_invocation_record,
     read_what_ran,
 )
 
@@ -412,13 +410,54 @@ async def test_dep_file_hit_identical_action(buck: Buck) -> None:
     )
 
 
+# Reproduces T237527198: changing ActionKey (by registering additional actions
+# before the dep-file action during analysis) should not cause a dep-file cache
+# miss when the dep-file action itself is identical.
+@buck_test(
+    setup_eden=False,
+    data_dir="dep_files",
+    skip_for_os=["windows"],
+)
+async def test_dep_file_hit_with_action_key_change(buck: Buck) -> None:
+    await buck.build(
+        "app:dep_file_with_preceding_actions",
+        "--local-only",
+        "--no-remote-cache",
+        "-c",
+        "test.num_preceding_actions=0",
+    )
+    await check_execution_kind(
+        buck,
+        [ACTION_EXECUTION_KIND_LOCAL],
+        ignored=[ACTION_EXECUTION_KIND_SIMPLE],
+    )
+
+    # Add a preceding action, shifting the dep-file action's ActionKey index.
+    # The dep-file action itself (command, inputs, outputs) is identical.
+    await buck.build(
+        "app:dep_file_with_preceding_actions",
+        "--local-only",
+        "--no-remote-cache",
+        "-c",
+        "test.num_preceding_actions=1",
+    )
+    # TODO(T237527198): The dep-file action should get a LOCAL_ACTION_CACHE hit
+    # here since it is identical, but the ActionKey index shift causes the dep
+    # file cache to report "Dep files declaration has changed".
+    await check_execution_kind(
+        buck,
+        [ACTION_EXECUTION_KIND_LOCAL],
+        ignored=[ACTION_EXECUTION_KIND_SIMPLE],
+    )
+
+
 # Flaky because of watchman on mac (and maybe windows)
 # Skipping on windows due to gcc dependency
 # This test tombstones the hash of the dep file produced by this action.
 @buck_test(data_dir="dep_files", skip_for_os=["darwin", "windows"])
 @env(
     "BUCK2_TEST_TOMBSTONED_DIGESTS",
-    "151ed6387904e98814958f9489711af7883db5ed:78",
+    "e537c6611d7e2ba1c9b71248f7a0ca506e5a0f9a:78",
 )
 async def test_dep_files_ignore_missing_digests(buck: Buck, tmp_path: Path) -> None:
     await buck.build("app:app")
@@ -689,10 +728,10 @@ async def test_re_dep_file_remote_upload(buck: Buck) -> None:
     await _check_uploaded_dep_file_key(buck, key)
 
 
-@buck_test(data_dir="upload_dep_files")
+@buck_test(data_dir="upload_dep_files", write_invocation_record=True)
 @env("BUCK_LOG", "buck2_action_impl=debug,buck2_execute_impl::executors::caching=debug")
 @env("BUCK2_TEST_SKIP_ACTION_CACHE_WRITE", "true")
-async def test_re_dep_file_cache_hit_upload(buck: Buck, tmpdir: Path) -> None:
+async def test_re_dep_file_cache_hit_upload(buck: Buck) -> None:
     target = [
         "root//:dep_files",
         "--remote-only",
@@ -705,14 +744,11 @@ async def test_re_dep_file_cache_hit_upload(buck: Buck, tmpdir: Path) -> None:
     await buck.build(*target)
     await buck.kill()
 
-    record = tmpdir / "record.json"
     # Check for action cache hit and dep file cache upload
-    await buck.build(
+    res = await buck.build(
         *target,
         "-c",
         "test.allow_dep_file_cache_upload=true",
-        "--unstable-write-invocation-record",
-        str(record),
     )
     what_ran = await read_what_ran(buck)
     assert what_ran[0]["reproducer"]["executor"] == "Cache"
@@ -720,7 +756,7 @@ async def test_re_dep_file_cache_hit_upload(buck: Buck, tmpdir: Path) -> None:
     key = await _dep_file_key_from_executions(buck)
     await _check_uploaded_dep_file_key(buck, key)
 
-    invocation_record = read_invocation_record(record)
+    invocation_record = res.invocation_record()
 
     assert invocation_record["dep_file_upload_count"] == 1
     assert (

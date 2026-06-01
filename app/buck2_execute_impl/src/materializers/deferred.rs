@@ -10,6 +10,7 @@
 
 pub mod clean_stale;
 mod data_tree;
+mod eager_materialization;
 mod extension;
 mod io_handler;
 mod materialize_stack;
@@ -17,12 +18,10 @@ mod subscriptions;
 
 pub(crate) mod artifact_tree;
 mod command_processor;
-pub mod directory_metadata;
 pub(crate) mod file_tree;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
@@ -37,7 +36,6 @@ use async_trait::async_trait;
 use buck2_common::file_ops::metadata::FileMetadata;
 use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_common::liveliness_observer::LivelinessGuard;
-use buck2_core::buck2_env;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_directory::directory::directory::Directory;
@@ -63,11 +61,13 @@ use buck2_execute::materialize::materializer::CopiedArtifact;
 use buck2_execute::materialize::materializer::DeclareArtifactPayload;
 use buck2_execute::materialize::materializer::DeclareMatchOutcome;
 use buck2_execute::materialize::materializer::DeferredMaterializerExtensions;
+use buck2_execute::materialize::materializer::EagerMaterializationGuard;
 use buck2_execute::materialize::materializer::HttpDownloadInfo;
 use buck2_execute::materialize::materializer::MaterializationError;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::materialize::materializer::WriteRequest;
 use buck2_execute::re::manager::ReConnectionManager;
+use buck2_hash::StdBuckHashSet;
 use buck2_http::HttpClient;
 use buck2_util::threads::thread_spawn;
 use chrono::DateTime;
@@ -77,7 +77,7 @@ use derivative::Derivative;
 use dice_futures::cancellation::CancellationContext;
 use dupe::Dupe;
 use futures::stream::BoxStream;
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -88,6 +88,7 @@ use crate::materializers::deferred::clean_stale::CleanStaleConfig;
 use crate::materializers::deferred::command_processor::DeferredMaterializerCommandProcessor;
 use crate::materializers::deferred::command_processor::LowPriorityMaterializerCommand;
 use crate::materializers::deferred::command_processor::MaterializerCommand;
+use crate::materializers::deferred::eager_materialization::EagerPathLeases;
 use crate::materializers::deferred::file_tree::FileTree;
 use crate::materializers::deferred::io_handler::DefaultIoHandler;
 use crate::materializers::deferred::io_handler::IoHandler;
@@ -130,6 +131,7 @@ pub struct DeferredMaterializerAccessor<T: IoHandler + 'static> {
     /// materializes them, otherwise skips them.
     materialize_final_artifacts: bool,
     defer_write_actions: bool,
+    eager_materialization_enabled: bool,
 
     io: Arc<T>,
 
@@ -155,10 +157,6 @@ pub struct DeferredMaterializerStats {
     declares_reused: AtomicU64,
 }
 
-fn access_time_update_max_buffer_size() -> buck2_error::Result<usize> {
-    buck2_env!("BUCK_ACCESS_TIME_UPDATE_MAX_BUFFER_SIZE", type=usize, default=5000)
-}
-
 pub struct DeferredMaterializerConfigs {
     pub materialize_final_artifacts: bool,
     pub defer_write_actions: bool,
@@ -167,6 +165,7 @@ pub struct DeferredMaterializerConfigs {
     pub verbose_materializer_log: bool,
     pub clean_stale_config: Option<CleanStaleConfig>,
     pub disable_eager_write_dispatch: bool,
+    pub eager_materialization_enabled: bool,
 }
 
 pub struct TtlRefreshConfiguration {
@@ -239,15 +238,22 @@ pub struct MaterializerSender<T: 'static> {
     low_priority: mpsc::UnboundedSender<LowPriorityMaterializerCommand>,
     counters: MaterializerCounters,
     /// Liveliness guard held while clean stale executes, dropped to interrupt clean.
-    clean_guard: Mutex<Option<LivelinessGuard>>,
+    clean_guard: RwLock<Option<LivelinessGuard>>,
 }
 
 impl<T> MaterializerSender<T> {
+    #[allow(clippy::result_large_err)]
     fn send(
         &self,
         command: MaterializerCommand<T>,
     ) -> Result<(), mpsc::error::SendError<MaterializerCommand<T>>> {
-        *self.clean_guard.lock() = None;
+        {
+            let read = self.clean_guard.read();
+            if read.is_some() {
+                drop(read);
+                *self.clean_guard.write() = None;
+            }
+        }
         let res = self.high_priority.send(command);
         self.counters.sent.fetch_add(1, Ordering::Relaxed);
         res
@@ -302,7 +308,7 @@ impl From<buck2_error::Error> for MaterializeEntryError {
 impl From<MaterializeEntryError> for SharedMaterializingError {
     fn from(e: MaterializeEntryError) -> SharedMaterializingError {
         match e {
-            MaterializeEntryError::Error(e) => Self::Error(e.into()),
+            MaterializeEntryError::Error(e) => Self::Error(e),
             MaterializeEntryError::NotFound(e) => Self::NotFound(e),
         }
     }
@@ -332,6 +338,7 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
         path: ProjectRelativePathBuf,
         value: ArtifactValue,
         srcs: Vec<CopiedArtifact>,
+        configuration_path: Option<ProjectRelativePathBuf>,
     ) -> buck2_error::Result<()> {
         // TODO(rafaelc): get rid of this tree; it'd save a lot of memory.
         let mut srcs_tree = FileTree::new();
@@ -359,10 +366,11 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
             DeclareArtifactPayload {
                 path,
                 artifact: value,
-                persist_full_directory_structure: false,
+                configuration_path,
             },
             Box::new(ArtifactMaterializationMethod::LocalCopy(srcs_tree, srcs)),
             get_dispatcher(),
+            current_span(),
         );
         self.command_sender.send(cmd)?;
         Ok(())
@@ -378,6 +386,7 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
                 a,
                 Box::new(ArtifactMaterializationMethod::CasDownload { info: info.dupe() }),
                 get_dispatcher(),
+                current_span(),
             );
             self.command_sender.send(cmd)?;
         }
@@ -388,15 +397,17 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
         &self,
         path: ProjectRelativePathBuf,
         info: HttpDownloadInfo,
+        configuration_path: Option<ProjectRelativePathBuf>,
     ) -> buck2_error::Result<()> {
         let cmd = MaterializerCommand::Declare(
             DeclareArtifactPayload {
                 path,
                 artifact: ArtifactValue::file(info.metadata.dupe()),
-                persist_full_directory_structure: false,
+                configuration_path,
             },
             Box::new(ArtifactMaterializationMethod::HttpDownload { info }),
             get_dispatcher(),
+            current_span(),
         );
         self.command_sender.send(cmd)?;
 
@@ -414,6 +425,7 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
         let contents = generate()?;
 
         let mut paths = Vec::with_capacity(contents.len());
+        let mut configuration_paths = Vec::with_capacity(contents.len());
         let mut values = Vec::with_capacity(contents.len());
         let mut methods = Vec::with_capacity(contents.len());
 
@@ -421,6 +433,7 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
             path,
             content,
             is_executable,
+            configuration_path,
         } in contents
         {
             let digest = TrackedFileDigest::from_content(
@@ -440,6 +453,7 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
                 .into_boxed_slice();
 
             paths.push(path);
+            configuration_paths.push(configuration_path);
             values.push(ArtifactValue::file(meta));
             methods.push(ArtifactMaterializationMethod::Write(Arc::new(WriteFile {
                 compressed_data,
@@ -448,16 +462,19 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
             })));
         }
 
-        for (path, (value, method)) in std::iter::zip(paths, std::iter::zip(values.iter(), methods))
-        {
+        for ((path, cfg_path), (value, method)) in std::iter::zip(
+            std::iter::zip(paths, configuration_paths),
+            std::iter::zip(values.iter(), methods),
+        ) {
             self.command_sender.send(MaterializerCommand::Declare(
                 DeclareArtifactPayload {
                     path,
                     artifact: value.dupe(),
-                    persist_full_directory_structure: false,
+                    configuration_path: cfg_path,
                 },
                 Box::new(method),
                 get_dispatcher(),
+                current_span(),
             ))?;
         }
 
@@ -501,25 +518,25 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
                 paths,
                 sender,
                 get_dispatcher(),
+                current_span(),
             ))?;
 
         // Wait on future to finish before invalidation can continue.
         let invalidate_fut = recv.await?;
-        invalidate_fut.await.map_err(buck2_error::Error::from)
+        invalidate_fut.await
     }
 
     async fn materialize_many(
         &self,
         artifact_paths: Vec<ProjectRelativePathBuf>,
     ) -> buck2_error::Result<BoxStream<'static, Result<(), MaterializationError>>> {
-        let event_dispatcher = get_dispatcher();
-
         // TODO: display [materializing] in superconsole
         let (sender, recv) = oneshot::channel();
         self.command_sender
             .send(MaterializerCommand::Ensure(
                 artifact_paths,
-                event_dispatcher,
+                get_dispatcher(),
+                current_span(),
                 sender,
             ))
             .buck_error_context("Sending Ensure() command.")?;
@@ -573,6 +590,7 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
     async fn get_artifact_entries_for_materialized_paths(
         &self,
         paths: Vec<ProjectRelativePathBuf>,
+        fetch_root_artifact_entries_for_subpaths: bool,
     ) -> buck2_error::Result<
         Vec<
             Option<(
@@ -583,16 +601,41 @@ impl<T: IoHandler + Allocative> Materializer for DeferredMaterializerAccessor<T>
     > {
         let (sender, recv) = oneshot::channel();
 
-        self.command_sender
-            .send(MaterializerCommand::GetArtifactEntriesForMaterializedPaths(
-                paths, sender,
-            ))?;
+        self.command_sender.send(
+            MaterializerCommand::GetArtifactEntriesForMaterializedPaths {
+                paths,
+                fetch_root_artifact_entries_for_subpaths,
+                sender,
+            },
+        )?;
 
         let result = recv.await.buck_error_context(
             "Receiving \"artifact entries for materialized paths\" future from command thread.",
         )?;
 
         Ok(result)
+    }
+
+    fn is_eager_materialization_enabled(&self) -> bool {
+        self.eager_materialization_enabled
+    }
+
+    async fn register_eager_paths(
+        &self,
+        paths: Vec<ProjectRelativePathBuf>,
+        event_dispatcher: EventDispatcher,
+    ) -> buck2_error::Result<Box<dyn EagerMaterializationGuard>> {
+        let (sender, receiver) = oneshot::channel();
+        self.command_sender
+            .send(MaterializerCommand::RegisterEagerPaths(
+                paths,
+                event_dispatcher,
+                sender,
+            ))?;
+        let leases = receiver
+            .await
+            .buck_error_context("No response from materializer")?;
+        Ok(Box::new(EagerPathLeases(leases)))
     }
 }
 
@@ -621,7 +664,7 @@ impl DeferredMaterializerAccessor<DefaultIoHandler> {
             high_priority: high_priority_sender,
             low_priority: low_priority_sender,
             counters,
-            clean_guard: Mutex::new(None),
+            clean_guard: RwLock::new(None),
         });
 
         let command_receiver = MaterializerReceiver {
@@ -638,7 +681,7 @@ impl DeferredMaterializerAccessor<DefaultIoHandler> {
         };
         let access_times_buffer =
             (!matches!(configs.update_access_times, AccessTimesUpdates::Disabled))
-                .then(HashSet::new);
+                .then(StdBuckHashSet::new);
 
         let tree = ArtifactTree::initialize(sqlite_state);
 
@@ -674,8 +717,6 @@ impl DeferredMaterializerAccessor<DefaultIoHandler> {
             }
         };
 
-        let access_time_update_max_buffer_size = access_time_update_max_buffer_size()?;
-
         let command_thread = thread_spawn("buck2-dm", {
             move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -688,7 +729,6 @@ impl DeferredMaterializerAccessor<DefaultIoHandler> {
                 rt.block_on(command_processor(cancellations).run(
                     command_receiver,
                     configs.ttl_refresh,
-                    access_time_update_max_buffer_size,
                     configs.update_access_times,
                     configs.clean_stale_config,
                 ));
@@ -701,6 +741,7 @@ impl DeferredMaterializerAccessor<DefaultIoHandler> {
             command_sender,
             materialize_final_artifacts: configs.materialize_final_artifacts,
             defer_write_actions: configs.defer_write_actions,
+            eager_materialization_enabled: configs.eager_materialization_enabled,
             io,
             materializer_state_info,
             stats,

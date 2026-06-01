@@ -25,6 +25,7 @@ use buck2_core::build_file_path::BuildFilePath;
 use buck2_core::cells::build_file_cell::BuildFileCell;
 use buck2_core::cells::cell_path::CellPath;
 use buck2_core::package::PackageLabel;
+use buck2_core::package::package_relative_path::PackageRelativePath;
 use buck2_error::BuckErrorContext;
 use buck2_error::internal_error;
 use buck2_events::dispatch::span;
@@ -48,11 +49,17 @@ use buck2_util::time_span::TimeSpan;
 use derive_more::Display;
 use dice::DiceComputations;
 use dice::Key;
+use dice::OkPagableValueSerialize;
+use dice::ValueSerialize;
 use dice_futures::cancellation::CancellationContext;
 use dupe::Dupe;
 use futures::FutureExt;
+use pagable::Pagable;
+use pagable::pagable_typetag;
 use starlark::codemap::FileSpan;
+use starlark::environment::Module;
 use starlark::syntax::AstModule;
+use starlark::values::FrozenHeapName;
 
 use crate::interpreter::buckconfig::ConfigsOnDiceViewForStarlark;
 use crate::interpreter::cell_info::InterpreterCellInfo;
@@ -86,15 +93,6 @@ fn toml_value_to_json(value: toml::Value) -> serde_json::Value {
     }
 }
 
-#[derive(Debug, buck2_error::Error)]
-#[buck2(tag = Input)]
-enum DiceCalculationDelegateError {
-    #[error("Error evaluating build file: `{0}`")]
-    EvalBuildFileError(BuildFilePath),
-    #[error("Error evaluating module: `{0}`")]
-    EvalModuleError(String),
-}
-
 #[async_trait]
 pub trait HasCalculationDelegate<'c, 'd> {
     /// Get calculator for a file evaluation.
@@ -113,8 +111,9 @@ impl<'c, 'd> HasCalculationDelegate<'c, 'd> for DiceComputations<'d> {
         &'c mut self,
         path: OwnedStarlarkPath,
     ) -> buck2_error::Result<DiceCalculationDelegate<'c, 'd>> {
-        #[derive(Clone, Display, Debug, Eq, Hash, PartialEq, Allocative)]
+        #[derive(Clone, Display, Debug, Eq, Hash, PartialEq, Allocative, Pagable)]
         #[display("{}@{}", _0, _1)]
+        #[pagable_typetag(dice::DiceKeyDyn)]
         struct InterpreterConfigForDirKey(CellPath, BuildFileCell);
 
         #[async_trait]
@@ -150,6 +149,10 @@ impl<'c, 'd> HasCalculationDelegate<'c, 'd> for DiceComputations<'d> {
 
             fn equality(_: &Self::Value, _: &Self::Value) -> bool {
                 false
+            }
+
+            fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+                OkPagableValueSerialize::<Self::Value>::new()
             }
         }
 
@@ -231,8 +234,8 @@ impl<'c, 'd: 'c> DiceCalculationDelegate<'c, 'd> {
         ))
     }
 
-    pub async fn prepare_eval<'a>(
-        &'a mut self,
+    pub async fn prepare_eval(
+        &mut self,
         starlark_file: StarlarkPath<'_>,
     ) -> buck2_error::Result<(AstModule, ModuleDeps)> {
         let ParseData(ast, imports) = self.parse_file(starlark_file).await??;
@@ -244,8 +247,8 @@ impl<'c, 'd: 'c> DiceCalculationDelegate<'c, 'd> {
         Ok((ast, deps))
     }
 
-    pub fn prepare_eval_with_content<'a>(
-        &'a self,
+    pub fn prepare_eval_with_content(
+        &self,
         starlark_file: StarlarkPath<'_>,
         content: String,
     ) -> buck2_error::Result<ParseResult> {
@@ -287,9 +290,15 @@ impl<'c, 'd: 'c> DiceCalculationDelegate<'c, 'd> {
         let value: serde_json::Value = serde_json::from_str(&contents)
             .with_buck_error_context(|| format!("Parsing {path}"))?;
 
-        let module = starlark::environment::Module::new();
-        module.set("value", module.heap().alloc(value));
-        let frozen = module.freeze().map_err(from_freeze_error)?;
+        // patternlint-disable-next-line buck2-no-starlark-module: We expect these to be small + simple
+        let frozen = Module::with_temp_heap(|module| {
+            module.set("value", module.heap().alloc(value));
+            module
+                .freeze_named(FrozenHeapName::User(Box::new(StarlarkEvalKind::Load(
+                    Arc::new(OwnedStarlarkModulePath::new(starlark_file)),
+                ))))
+                .map_err(from_freeze_error)
+        })?;
         Ok(LoadedModule::new(
             OwnedStarlarkModulePath::new(starlark_file),
             Default::default(),
@@ -310,9 +319,15 @@ impl<'c, 'd: 'c> DiceCalculationDelegate<'c, 'd> {
             toml::from_str(&contents).with_buck_error_context(|| format!("Parsing {path}"))?;
         let json_value = toml_value_to_json(value);
 
-        let module = starlark::environment::Module::new();
-        module.set("value", module.heap().alloc(json_value));
-        let frozen = module.freeze().map_err(from_freeze_error)?;
+        // patternlint-disable-next-line buck2-no-starlark-module: We expect these to be small + simple
+        let frozen = Module::with_temp_heap(|module| {
+            module.set("value", module.heap().alloc(json_value));
+            module
+                .freeze_named(FrozenHeapName::User(Box::new(StarlarkEvalKind::Load(
+                    Arc::new(OwnedStarlarkModulePath::new(starlark_file)),
+                ))))
+                .map_err(from_freeze_error)
+        })?;
         Ok(LoadedModule::new(
             OwnedStarlarkModulePath::new(starlark_file),
             Default::default(),
@@ -346,9 +361,7 @@ impl<'c, 'd: 'c> DiceCalculationDelegate<'c, 'd> {
                 provider,
                 cancellation,
             )
-            .with_buck_error_context(|| {
-                DiceCalculationDelegateError::EvalModuleError(starlark_file.to_string())
-            })?;
+            .with_buck_error_context(|| format!("Error evaluating module: `{}`", starlark_file))?;
 
         Ok(LoadedModule::new(
             OwnedStarlarkModulePath::new(starlark_file),
@@ -397,7 +410,8 @@ impl<'c, 'd: 'c> DiceCalculationDelegate<'c, 'd> {
         //
         // Here we put the package file check behind an additional dice key so that we don't recompute on irrelevant
         // changes to the directory contents.
-        #[derive(Debug, Display, Clone, Allocative, Eq, PartialEq, Hash)]
+        #[derive(Debug, Display, Clone, Allocative, Eq, PartialEq, Hash, Pagable)]
+        #[pagable_typetag(dice::DiceKeyDyn)]
         struct PackageFileLookupKey(PackageLabel);
 
         #[async_trait]
@@ -431,6 +445,10 @@ impl<'c, 'd: 'c> DiceCalculationDelegate<'c, 'd> {
 
             fn validity(x: &Self::Value) -> bool {
                 x.is_ok()
+            }
+
+            fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+                OkPagableValueSerialize::<Self::Value>::new()
             }
         }
 
@@ -493,7 +511,8 @@ impl<'c, 'd: 'c> DiceCalculationDelegate<'c, 'd> {
         &mut self,
         path: PackageLabel,
     ) -> buck2_error::Result<SuperPackage> {
-        #[derive(Debug, Display, Clone, Allocative, Eq, PartialEq, Hash)]
+        #[derive(Debug, Display, Clone, Allocative, Eq, PartialEq, Hash, Pagable)]
+        #[pagable_typetag(dice::DiceKeyDyn)]
         struct PackageFileKey(PackageLabel);
 
         #[async_trait]
@@ -513,7 +532,6 @@ impl<'c, 'd: 'c> DiceCalculationDelegate<'c, 'd> {
                 interpreter
                     .eval_package_file_uncached(self.0.dupe(), cancellation)
                     .await
-                    .map_err(buck2_error::Error::from)
             }
 
             fn equality(x: &Self::Value, y: &Self::Value) -> bool {
@@ -526,12 +544,13 @@ impl<'c, 'd: 'c> DiceCalculationDelegate<'c, 'd> {
             fn validity(x: &Self::Value) -> bool {
                 x.is_ok()
             }
+
+            fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+                OkPagableValueSerialize::<Self::Value>::new()
+            }
         }
 
-        self.ctx
-            .compute(&PackageFileKey(path))
-            .await?
-            .map_err(buck2_error::Error::from)
+        self.ctx.compute(&PackageFileKey(path)).await?
     }
 
     /// Most directories do not contain a `PACKAGE` file, this function
@@ -543,7 +562,7 @@ impl<'c, 'd: 'c> DiceCalculationDelegate<'c, 'd> {
     ) -> buck2_error::Result<SuperPackage> {
         for package_file_name in PackageFilePath::package_file_names() {
             if package_listing
-                .get_file(package_file_name.as_ref())
+                .get_file(PackageRelativePath::new(package_file_name)?)
                 .is_some()
             {
                 return self.eval_package_file(package).await;
@@ -633,18 +652,23 @@ impl<'c, 'd: 'c> DiceCalculationDelegate<'c, 'd> {
                         cancellation,
                     )
                     .with_buck_error_context(|| {
-                        DiceCalculationDelegateError::EvalBuildFileError(build_file_path)
+                        format!("Error evaluating build file: `{}`", build_file_path)
                     });
                 let error = result_with_stats.as_ref().err().map(|e| format!("{e:#}"));
-                let (starlark_peak_allocated_bytes, cpu_instruction_count, target_count) =
-                    match &result_with_stats {
-                        Ok((_, rs)) => (
-                            Some(rs.starlark_peak_allocated_bytes),
-                            rs.cpu_instruction_count,
-                            Some(rs.result.targets().len() as u64),
-                        ),
-                        Err(_) => (None, None, None),
-                    };
+                let (
+                    starlark_peak_allocated_bytes,
+                    cpu_instruction_count,
+                    starlark_tick_count,
+                    target_count,
+                ) = match &result_with_stats {
+                    Ok((_, rs)) => (
+                        Some(rs.starlark_peak_allocated_bytes),
+                        rs.cpu_instruction_count,
+                        Some(rs.starlark_tick_count),
+                        Some(rs.result.targets().len() as u64),
+                    ),
+                    Err(_) => (None, None, None, None),
+                };
 
                 (
                     result_with_stats,
@@ -655,6 +679,7 @@ impl<'c, 'd: 'c> DiceCalculationDelegate<'c, 'd> {
                         starlark_peak_allocated_bytes,
                         cpu_instruction_count,
                         error,
+                        starlark_tick_count,
                     },
                 )
             })?;
@@ -664,7 +689,9 @@ impl<'c, 'd: 'c> DiceCalculationDelegate<'c, 'd> {
             if eval_result.starlark_profile.is_some() {
                 return (
                     now.unwrap().end_now(),
-                    Err(internal_error!("starlark_profile field must not be set yet").into()),
+                    Err(internal_error!(
+                        "starlark_profile field must not be set yet"
+                    )),
                 );
             }
             eval_result.starlark_profile = profile_data.map(|d| d as _);
@@ -682,8 +709,11 @@ mod keys {
     use allocative::Allocative;
     use buck2_interpreter::paths::module::OwnedStarlarkModulePath;
     use derive_more::Display;
+    use pagable::Pagable;
+    use pagable::pagable_typetag;
 
-    #[derive(Clone, Display, Debug, Eq, Hash, PartialEq, Allocative)]
+    #[derive(Clone, Display, Debug, Eq, Hash, PartialEq, Allocative, Pagable)]
+    #[pagable_typetag(dice::DiceKeyDyn)]
     pub struct EvalImportKey(pub OwnedStarlarkModulePath);
 }
 

@@ -8,9 +8,12 @@
  * above-listed licenses.
  */
 
-use buck2_build_api::actions::calculation::ActionWithExtraData;
+use std::collections::HashMap;
+
 use buck2_build_signals::env::CriticalPathBackendName;
 use buck2_build_signals::env::NodeDuration;
+use buck2_build_signals::env::WaitingData;
+use buck2_build_signals::error::CriticalPathError;
 use buck2_core::target::configured_target_label::ConfiguredTargetLabel;
 use buck2_data::QuickUnstableE2eData;
 use buck2_events::dispatch::EventDispatcher;
@@ -21,39 +24,60 @@ use smallvec::SmallVec;
 
 use crate::BuildInfo;
 use crate::DetailedCriticalPath;
+use crate::NodeExtraData;
 use crate::NodeKey;
 use crate::backend::backend::BuildListenerBackend;
 
 pub(crate) struct LoggingBackend {
     events: EventDispatcher,
+    start_time: std::time::Instant,
 }
 
 impl LoggingBackend {
     pub(crate) fn new(events: EventDispatcher) -> Self {
-        Self { events }
+        Self {
+            events,
+            start_time: std::time::Instant::now(),
+        }
     }
 }
 
+/// Node data logged for debugging/testing the critical path.
 #[derive(Serialize, Deserialize)]
 struct Node {
     key: String,
     deps: Vec<String>,
+    /// Time span as (start, end) in microseconds since the backend was created.
+    time_span: (u64, u64),
 }
 
 impl BuildListenerBackend for LoggingBackend {
     fn process_node(
         &mut self,
         key: NodeKey,
-        _value: Option<ActionWithExtraData>,
-        _duration: NodeDuration,
+        _extra_data: NodeExtraData,
+        duration: NodeDuration,
         dep_keys: impl IntoIterator<Item = NodeKey>,
         _span_ids: SmallVec<[SpanId; 1]>,
+        _waiting_data: WaitingData,
     ) {
         self.events.instant_event(QuickUnstableE2eData {
             key: "critical_path_logging_node".to_owned(),
             data: serde_json::to_string(&Node {
                 key: key.to_string(),
                 deps: dep_keys.into_iter().map(|v| v.to_string()).collect(),
+                time_span: (
+                    duration
+                        .total
+                        .start()
+                        .duration_since(self.start_time)
+                        .as_micros() as u64,
+                    duration
+                        .total
+                        .end()
+                        .duration_since(self.start_time)
+                        .as_micros() as u64,
+                ),
             })
             .unwrap(),
         });
@@ -66,9 +90,13 @@ impl BuildListenerBackend for LoggingBackend {
     ) {
     }
 
-    fn finish(self) -> buck2_error::Result<BuildInfo> {
+    fn finish(
+        self,
+        _anon_target_discovery_edges: HashMap<NodeKey, NodeKey>,
+    ) -> Result<BuildInfo, CriticalPathError> {
         Ok(BuildInfo {
             critical_path: DetailedCriticalPath::empty(),
+            slowest_path: DetailedCriticalPath::empty(),
             num_nodes: 0,
             num_edges: 0,
             top_level_targets: Default::default(),

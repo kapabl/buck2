@@ -13,11 +13,14 @@ use buck2_interpreter::extra::InterpreterHostArchitecture;
 use buck2_interpreter::extra::InterpreterHostPlatform;
 use buck2_interpreter::extra::xcode::XcodeVersionInfo;
 use derivative::Derivative;
+use pagable::Pagable;
 use starlark::environment::GlobalsBuilder;
 use starlark::eval::Evaluator;
+use starlark::singleton_heap_name;
 use starlark::starlark_module;
 use starlark::values::AllocFrozenValue;
 use starlark::values::FrozenHeap;
+use starlark::values::FrozenHeapName;
 use starlark::values::FrozenValue;
 use starlark::values::OwnedFrozenValue;
 use starlark::values::ValueOfUnchecked;
@@ -104,7 +107,12 @@ fn new_host_info(
     );
 
     // Safe because the value info was allocated into the heap
-    unsafe { OwnedFrozenValue::new(heap.into_ref(), info) }
+    unsafe {
+        OwnedFrozenValue::new(
+            heap.into_ref_named(FrozenHeapName::Singleton(singleton_heap_name!())),
+            info,
+        )
+    }
 }
 
 #[starlark_module]
@@ -145,12 +153,12 @@ pub(crate) fn register_host_info(builder: &mut GlobalsBuilder) {
         // that might reuse each other's output.
         let host_info = &BuildContext::from_context(eval)?.host_info;
         Ok(ValueOfUnchecked::new(
-            host_info.value.owned_value(eval.frozen_heap()),
+            eval.heap().access_owned_frozen_value(&host_info.value),
         ))
     }
 }
 
-#[derive(Derivative, Clone, Debug, Allocative)]
+#[derive(Derivative, Clone, Debug, Allocative, Pagable)]
 #[derivative(PartialEq)]
 pub struct HostInfo {
     // These first three fields are for equality only, otherwise not used

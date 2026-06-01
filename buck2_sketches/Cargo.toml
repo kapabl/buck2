@@ -1,0 +1,11 @@
+[package]
+description = "Typed sketch wrappers for buck2"
+edition = "2024"
+license = { workspace = true }
+name = "buck2_sketches"
+repository = { workspace = true }
+version = "0.1.0"
+
+[dependencies]
+base64 = { workspace = true }
+setsketch = { workspace = true }

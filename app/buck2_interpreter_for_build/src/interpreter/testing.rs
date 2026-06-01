@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use allocative::Allocative;
 use buck2_common::legacy_configs::configs::LegacyBuckConfig;
 use buck2_common::legacy_configs::configs::testing::parse_with_config_args;
 use buck2_common::package_listing::listing::PackageListing;
@@ -42,12 +43,25 @@ use buck2_node::super_package::SuperPackage;
 use dice::CancellationContext;
 use dupe::Dupe;
 use indoc::indoc;
+use pagable::PagablePanic;
+use pagable::pagable_typetag;
 use starlark::environment::GlobalsBuilder;
 
 use crate::interpreter::buckconfig::LegacyConfigsViewForStarlark;
 use crate::interpreter::cell_info::InterpreterCellInfo;
 use crate::interpreter::configuror::AdditionalGlobalsFn;
+use crate::interpreter::configuror::AdditionalGlobalsFnDyn;
 use crate::interpreter::configuror::BuildInterpreterConfiguror;
+
+#[derive(Allocative, PagablePanic)] // test only
+struct FnWrapper(#[allocative(skip)] Box<dyn Fn(&mut GlobalsBuilder) + Sync + Send + 'static>);
+
+#[pagable_typetag]
+impl AdditionalGlobalsFnDyn for FnWrapper {
+    fn apply(&self, globals: &mut GlobalsBuilder) {
+        (self.0)(globals);
+    }
+}
 use crate::interpreter::global_interpreter_state::GlobalInterpreterState;
 use crate::interpreter::interpreter_for_dir::InterpreterForDir;
 use crate::interpreter::interpreter_for_dir::ParseData;
@@ -79,7 +93,7 @@ pub fn run_simple_starlark_test(content: &str) -> buck2_error::Result<()> {
     let mut tester = Tester::new()?;
     match tester.run_starlark_test(content) {
         Ok(_) => Ok(()),
-        Err(e) => Err(buck2_error::Error::from(e)),
+        Err(e) => Err(e),
     }
 }
 
@@ -167,7 +181,9 @@ impl Tester {
         additional_globals: impl Fn(&mut GlobalsBuilder) + Sync + Send + 'static,
     ) {
         self.additional_globals
-            .push(AdditionalGlobalsFn(Arc::new(additional_globals)));
+            .push(AdditionalGlobalsFn(Arc::new(FnWrapper(Box::new(
+                additional_globals,
+            )))));
     }
 
     pub fn set_prelude(&mut self, prelude_import: ImportPath) {
@@ -198,15 +214,18 @@ impl Tester {
                     None,
                     false,
                     false,
-                    Some(AdditionalGlobalsFn(Arc::new(move |globals_builder| {
-                        for additional_globals in &additional_globals {
-                            (additional_globals.0)(globals_builder)
-                        }
-                    }))),
+                    Some(AdditionalGlobalsFn(Arc::new(FnWrapper(Box::new(
+                        move |globals_builder| {
+                            for additional_globals in &additional_globals {
+                                additional_globals.0.apply(globals_builder)
+                            }
+                        },
+                    ))))),
                     Arc::new(ConcurrentTargetLabelInterner::default()),
                 )?,
                 false,
                 true,
+                starlark::syntax::ParserKind::Lalrpop,
             )?),
             Arc::new(import_paths),
             self.current_dir_with_allowed_relative_dirs.dupe(),
@@ -258,7 +277,7 @@ impl Tester {
             ast,
             loaded_modules.clone(),
             provider,
-            &CancellationContext::testing(),
+            CancellationContext::testing(),
         )?;
         Ok(LoadedModule::new(
             OwnedStarlarkModulePath::LoadFile(path.clone()),
@@ -309,7 +328,7 @@ impl Tester {
             loaded_modules,
             provider,
             true,
-            &CancellationContext::testing(),
+            CancellationContext::testing(),
         )?;
         Ok(eval_result_with_stats.result)
     }
@@ -412,9 +431,7 @@ impl Tester {
             test()
             "#
         );
-        self.add_import(&test_path, test_content)
-            .map(|_| ())
-            .map_err(|e| e.into())
+        self.add_import(&test_path, test_content).map(|_| ())
     }
 
     pub fn run_starlark_bzl_test_expecting_error(&mut self, content: &str, expected: &str) {

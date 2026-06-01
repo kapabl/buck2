@@ -18,37 +18,35 @@
 use allocative::Allocative;
 use starlark_derive::NoSerialize;
 use starlark_derive::ProvidesStaticType;
+use starlark_derive::StarlarkPagable;
 use starlark_derive::starlark_value;
 
 use crate as starlark;
+use crate::static_starlark_value;
 use crate::values::AllocFrozenValue;
 use crate::values::FrozenHeap;
 use crate::values::FrozenValue;
 use crate::values::StarlarkValue;
-use crate::values::layout::avalue::AValueBasic;
-use crate::values::layout::avalue::AValueImpl;
-use crate::values::layout::avalue::alloc_static;
-use crate::values::layout::heap::repr::AValueRepr;
 
 #[derive(
     Allocative,
     NoSerialize,
     Debug,
     derive_more::Display,
-    ProvidesStaticType
+    ProvidesStaticType,
+    StarlarkPagable
 )]
 #[display("Ellipsis")]
 pub(crate) struct Ellipsis;
 
-pub(crate) static VALUE_ELLIPSIS: AValueRepr<AValueImpl<'static, AValueBasic<Ellipsis>>> =
-    alloc_static(Ellipsis);
+static_starlark_value!(pub(crate) VALUE_ELLIPSIS: Ellipsis = Ellipsis);
 
 #[starlark_value(type = "ellipsis")]
 impl<'v> StarlarkValue<'v> for Ellipsis {}
 
 impl Ellipsis {
     pub(crate) fn new_value() -> FrozenValue {
-        FrozenValue::new_repr(&VALUE_ELLIPSIS)
+        VALUE_ELLIPSIS.to_frozen_value()
     }
 }
 

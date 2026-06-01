@@ -31,7 +31,6 @@ NativeLinkStrategy = enum(
 PackageStyle = enum(
     "inplace",
     "standalone",
-    "inplace_lite",
     # Similar to inplace, but generate copies instead of symlinks
     "outplace",
 )
@@ -61,7 +60,7 @@ PythonToolchainInfo = provider(
         "extension_linker_flags": provider_field(ArgLike, default = []),
         "wheel_extension_linker_flags": provider_field(ArgLike, default = []),
         "wheel_linker_flags": provider_field(ArgLike, default = []),
-        # site-packages-relative rpaths to emebed into libs/bins in the wheel
+        # site-packages-relative rpaths to embed into libs/bins in the wheel
         "wheel_rpaths": provider_field(ArgLike, default = []),
         "gen_lpar_bootstrap": provider_field(Dependency | None, default = None),
         "package_style": provider_field(str | None, default = None),  # Should be `PackageStyle`.
@@ -80,14 +79,18 @@ PythonToolchainInfo = provider(
         # Prefix to use when running a Python test/executable.
         "run_prefix": provider_field(ArgLike, default = []),
         "python_error_handler": provider_field(typing.Callable | None, default = None),
+        "lazy_imports_analyzer": provider_field(RunInfo | None, default = None),
         "manifest_module_entries": provider_field(dict[str, list[str] | dict[str, typing.Any]] | None, default = None),
+        "preload_deps": provider_field(list[Dependency], default = []),
     },
 )
 
 # Stores "platform"/flavor name used to resolve *platform_* arguments
-PythonPlatformInfo = provider(fields = {
-    "name": provider_field(typing.Any, default = None),
-})
+PythonPlatformInfo = provider(
+    fields = {
+        "name": provider_field(typing.Any, default = None),
+    }
+)
 
 def get_package_style(ctx: AnalysisContext) -> PackageStyle:
     if ctx.attrs.package_style != None:

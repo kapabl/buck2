@@ -20,7 +20,6 @@ use futures::FutureExt;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::Methods;
 use starlark::environment::MethodsBuilder;
-use starlark::environment::MethodsStatic;
 use starlark::eval::Evaluator;
 use starlark::starlark_module;
 use starlark::values::AllocValue;
@@ -59,16 +58,17 @@ pub(crate) struct StarlarkTargetUniverse<'v> {
     ctx: ValueTyped<'v, BxlContext<'v>>,
 }
 
+starlark::methods_static!(TARGET_UNIVERSE_METHODS = target_universe_methods);
+
 #[starlark_value(type = "bxl.TargetUniverse", StarlarkTypeRepr, UnpackValue)]
 impl<'v> StarlarkValue<'v> for StarlarkTargetUniverse<'v> {
     fn get_methods() -> Option<&'static Methods> {
-        static RES: MethodsStatic = MethodsStatic::new();
-        RES.methods(target_universe_methods)
+        Some(TARGET_UNIVERSE_METHODS.methods())
     }
 }
 
 impl<'v> AllocValue<'v> for StarlarkTargetUniverse<'v> {
-    fn alloc_value(self, heap: &'v Heap) -> Value<'v> {
+    fn alloc_value(self, heap: Heap<'v>) -> Value<'v> {
         heap.alloc_complex_no_freeze(self)
     }
 }
@@ -82,9 +82,9 @@ impl<'v> StarlarkTargetUniverse<'v> {
         let target_set = target_universe
             .get_from_targets(target_set.iter().map(|i| i.label().unconfigured().dupe()));
         Ok(StarlarkTargetUniverse {
-            ctx,
             target_universe,
             target_set,
+            ctx,
         })
     }
 }
@@ -95,7 +95,7 @@ fn target_universe_methods(builder: &mut MethodsBuilder) {
     /// The target set of the nodes used to construct the target universe.
     fn target_set<'v>(
         this: &'v StarlarkTargetUniverse<'v>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> starlark::Result<ValueTyped<'v, StarlarkTargetSet<ConfiguredTargetNode>>> {
         Ok(heap.alloc_typed(StarlarkTargetSet::from(this.target_set.clone())))
     }

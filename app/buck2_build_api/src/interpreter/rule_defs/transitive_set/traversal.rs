@@ -9,7 +9,7 @@
  */
 
 use allocative::Allocative;
-use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
 use derive_more::Display;
 use dupe::Dupe;
 use starlark::any::ProvidesStaticType;
@@ -17,6 +17,7 @@ use starlark::coerce::Coerce;
 use starlark::values::Freeze;
 use starlark::values::Heap;
 use starlark::values::NoSerialize;
+use starlark::values::StarlarkPagable;
 use starlark::values::StarlarkValue;
 use starlark::values::Trace;
 use starlark::values::Value;
@@ -29,7 +30,17 @@ use crate::interpreter::rule_defs::transitive_set::FrozenTransitiveSet;
 use crate::interpreter::rule_defs::transitive_set::TransitiveSet;
 use crate::interpreter::rule_defs::transitive_set::TransitiveSetError;
 
-#[derive(Debug, Clone, Dupe, Copy, Trace, Freeze, PartialEq, Allocative)]
+#[derive(
+    Debug,
+    Clone,
+    Dupe,
+    Copy,
+    Trace,
+    Freeze,
+    PartialEq,
+    Allocative,
+    StarlarkPagable
+)]
 pub enum TransitiveSetOrdering {
     /// Preorder depth-first traversal, visiting parent node first, then children in an unspecified
     /// order that minimizes memory usage during traversal.
@@ -75,7 +86,8 @@ impl TransitiveSetOrdering {
     Display,
     ProvidesStaticType,
     NoSerialize,
-    Allocative
+    Allocative,
+    StarlarkPagable
 )]
 #[display("Traversal({})", inner)]
 #[repr(C)]
@@ -91,9 +103,9 @@ impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for TransitiveSetTraversalGen<V>
 where
     Self: ProvidesStaticType<'v>,
 {
-    fn iterate_collect(&self, _heap: &'v Heap) -> starlark::Result<Vec<Value<'v>>> {
-        let tset =
-            TransitiveSet::from_value(self.inner.to_value()).buck_error_context("Invalid inner")?;
+    fn iterate_collect(&self, _heap: Heap<'v>) -> starlark::Result<Vec<Value<'v>>> {
+        let tset = TransitiveSet::from_value(self.inner.to_value())
+            .ok_or_else(|| internal_error!("Invalid inner"))?;
         Ok(tset.iter_values(self.ordering)?.collect())
     }
 }
@@ -109,7 +121,8 @@ where
     Display,
     ProvidesStaticType,
     NoSerialize,
-    Allocative
+    Allocative,
+    StarlarkPagable
 )]
 #[display("Traversal({}[\"{}\"])", transitive_set, projection)]
 #[repr(C)]
@@ -126,9 +139,9 @@ impl<'v, V: ValueLike<'v>> StarlarkValue<'v> for TransitiveSetProjectionTraversa
 where
     Self: ProvidesStaticType<'v>,
 {
-    fn iterate_collect(&self, _heap: &'v Heap) -> starlark::Result<Vec<Value<'v>>> {
+    fn iterate_collect(&self, _heap: Heap<'v>) -> starlark::Result<Vec<Value<'v>>> {
         let set = TransitiveSet::from_value(self.transitive_set.get().to_value())
-            .buck_error_context("Invalid inner")?;
+            .ok_or_else(|| internal_error!("Invalid inner"))?;
         Ok(set
             .iter_projection_values(self.ordering, self.projection)?
             .collect())

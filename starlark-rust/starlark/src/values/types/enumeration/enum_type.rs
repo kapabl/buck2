@@ -38,9 +38,13 @@ use crate as starlark;
 use crate::any::ProvidesStaticType;
 use crate::environment::Methods;
 use crate::environment::MethodsBuilder;
-use crate::environment::MethodsStatic;
 use crate::eval::Arguments;
 use crate::eval::Evaluator;
+use crate::pagable::starlark_deserialize::StarlarkDeserialize;
+use crate::pagable::starlark_deserialize::StarlarkDeserializeContext;
+use crate::pagable::starlark_serialize::StarlarkSerialize;
+use crate::pagable::starlark_serialize::StarlarkSerializeContext;
+use crate::register_avalue_simple_frozen;
 use crate::typing::ParamSpec;
 use crate::typing::Ty;
 use crate::typing::callable::TyCallable;
@@ -170,10 +174,37 @@ pub type EnumType<'v> = EnumTypeGen<Value<'v>>;
 /// Frozen enum type.
 pub type FrozenEnumType = EnumTypeGen<FrozenValue>;
 
+impl StarlarkSerialize for EnumTypeGen<FrozenValue> {
+    fn starlark_serialize(&self, ctx: &mut dyn StarlarkSerializeContext) -> crate::Result<()> {
+        use pagable::PagableSerialize;
+        self.id.starlark_serialize(ctx)?;
+        self.ty_enum_data.pagable_serialize(ctx.pagable())?;
+        self.elements().starlark_serialize(ctx)?;
+        Ok(())
+    }
+}
+
+impl StarlarkDeserialize for EnumTypeGen<FrozenValue> {
+    fn starlark_deserialize(ctx: &mut dyn StarlarkDeserializeContext<'_>) -> crate::Result<Self> {
+        use pagable::PagableDeserialize;
+        let id = TypeInstanceId::starlark_deserialize(ctx)?;
+        let ty_enum_data =
+            <FrozenValue as EnumCell>::TyEnumDataOpt::pagable_deserialize(ctx.pagable())?;
+        let elements = SmallMap::starlark_deserialize(ctx)?;
+        Ok(EnumTypeGen {
+            id,
+            ty_enum_data,
+            elements: UnsafeCell::new(elements),
+        })
+    }
+}
+
+register_avalue_simple_frozen!(FrozenEnumType);
+
 impl<'v> EnumType<'v> {
     pub(crate) fn new(
         elements: Vec<StringValue<'v>>,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> crate::Result<ValueTyped<'v, EnumType<'v>>> {
         // We are constructing the enum and all elements in one go.
         // They both point at each other, which adds to the complexity.
@@ -235,6 +266,8 @@ where
     }
 }
 
+starlark::methods_static!(ENUM_TYPE_METHODS = enum_type_methods);
+
 #[starlark_value(type = FUNCTION_TYPE)]
 impl<'v, V> StarlarkValue<'v> for EnumTypeGen<V>
 where
@@ -258,7 +291,7 @@ where
         Ok(self.construct(val)?.to_value())
     }
 
-    fn get_attr(&self, attribute: &str, _heap: &'v Heap) -> Option<Value<'v>> {
+    fn get_attr(&self, attribute: &str, _heap: Heap<'v>) -> Option<Value<'v>> {
         self.elements()
             .get(&ValueStr(attribute))
             .map(|v| v.to_value())
@@ -277,7 +310,7 @@ where
         Ok(self.elements().len() as i32)
     }
 
-    fn at(&self, index: Value, _heap: &'v Heap) -> crate::Result<Value<'v>> {
+    fn at(&self, index: Value, _heap: Heap<'v>) -> crate::Result<Value<'v>> {
         let i = convert_index(index, self.elements().len() as i32)? as usize;
         // Must be in the valid range since convert_index checks that, so just unwrap
         Ok(self
@@ -288,7 +321,7 @@ where
             .to_value())
     }
 
-    unsafe fn iterate(&self, me: Value<'v>, _heap: &'v Heap) -> crate::Result<Value<'v>> {
+    unsafe fn iterate(&self, me: Value<'v>, _heap: Heap<'v>) -> crate::Result<Value<'v>> {
         Ok(me)
     }
 
@@ -298,15 +331,14 @@ where
         (rem, Some(rem))
     }
 
-    unsafe fn iter_next(&self, index: usize, _heap: &'v Heap) -> Option<Value<'v>> {
+    unsafe fn iter_next(&self, index: usize, _heap: Heap<'v>) -> Option<Value<'v>> {
         self.elements().values().nth(index).map(|v| v.to_value())
     }
 
     unsafe fn iter_stop(&self) {}
 
     fn get_methods() -> Option<&'static Methods> {
-        static RES: MethodsStatic = MethodsStatic::new();
-        RES.methods(enum_type_methods)
+        Some(ENUM_TYPE_METHODS.methods())
     }
 
     fn eval_type(&self) -> Option<Ty> {
@@ -386,7 +418,7 @@ where
 #[starlark_module]
 fn enum_type_methods(builder: &mut MethodsBuilder) {
     #[starlark(attribute)]
-    fn r#type<'v>(this: Value, heap: &Heap) -> starlark::Result<Value<'v>> {
+    fn r#type<'v>(this: Value, heap: Heap<'_>) -> starlark::Result<Value<'v>> {
         let this = EnumType::from_value(this).unwrap();
         let ty_enum_type = match this {
             Either::Left(x) => x.ty_enum_data(),

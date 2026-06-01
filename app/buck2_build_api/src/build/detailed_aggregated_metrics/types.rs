@@ -17,10 +17,13 @@ use buck2_core::provider::label::ProvidersName;
 use buck2_data::ActionExecutionKind;
 use buck2_data::ToProtoMessage;
 use buck2_node::nodes::configured::ConfiguredTargetNode;
+use buck2_sketches::ActionGraphSketch;
 use dupe::Dupe;
 
 use crate::artifact_groups::ArtifactGroup;
 use crate::build::BuildProviderType;
+use crate::build::detailed_aggregated_metrics::buck2_sketches::ArtifactPathSketches;
+use crate::build::sketch_impl::MergeableGraphSketch;
 
 #[derive(Clone)]
 pub struct ActionExecutionMetrics {
@@ -29,6 +32,8 @@ pub struct ActionExecutionMetrics {
     pub execution_kind: buck2_data::ActionExecutionKind,
     pub output_size_bytes: u64,
     pub memory_peak: Option<u64>,
+    /// RE platform name if this action ran remotely (e.g. "linux-remote-execution").
+    pub re_platform_name: Option<String>,
 }
 
 pub struct AnalysisMetrics {
@@ -36,6 +41,7 @@ pub struct AnalysisMetrics {
     pub retained_memory: usize,
 }
 
+#[derive(Clone)]
 pub struct TopLevelTargetSpec {
     pub label: ConfiguredProvidersLabel,
     pub target: ConfiguredTargetNode,
@@ -44,8 +50,19 @@ pub struct TopLevelTargetSpec {
 
 #[derive(Default)]
 pub struct PerBuildEvents {
-    pub executed_actions: fxhash::FxHashSet<ActionKey>,
+    pub executed_actions: buck2_hash::BuckHashSet<ActionKey>,
     pub top_level_targets: Vec<TopLevelTargetSpec>,
+}
+
+pub struct ActionGraphSketchResult {
+    pub per_target_sketches: Vec<(
+        ConfiguredProvidersLabel,
+        Option<MergeableGraphSketch<ActionKey, ActionGraphSketch>>,
+    )>,
+}
+
+pub struct ArtifactPathSketchResult {
+    pub(crate) per_target_sketches: Vec<(ConfiguredProvidersLabel, ArtifactPathSketches)>,
 }
 
 pub struct DetailedAggregatedMetrics {
@@ -104,11 +121,20 @@ impl ToProtoMessage for AggregatedBuildMetrics {
 
 pub struct TopLevelTargetAggregatedData {
     pub target: ConfiguredProvidersLabel,
+    pub target_rule_type_name: String,
     pub action_graph_size: Option<u64>,
     pub metrics: AggregatedBuildMetrics,
     pub amortized_metrics: AggregatedBuildMetrics,
     pub remote_max_memory_peak_bytes: u64,
     pub local_max_memory_peak_bytes: u64,
+    /// Distinct RE platform names used by actions for this target.
+    pub re_platform_names: Vec<String>,
+    /// Wall-clock time in milliseconds from the start of the build at which
+    /// this top-level target succeeded, failed, or timed out.
+    /// The exact point at which the build is deemed to have start is set in the
+    /// Buck2 daemon, so use this to compare durations but don't add it to a
+    /// start timestamp to produce an end timestamp.
+    pub wall_clock_completion_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Dupe)]
@@ -118,14 +144,21 @@ pub enum BuiltWhen {
 }
 
 impl TopLevelTargetAggregatedData {
-    pub fn new(target: ConfiguredProvidersLabel, action_graph_size: Option<usize>) -> Self {
+    pub fn new(
+        target: ConfiguredProvidersLabel,
+        target_rule_type_name: String,
+        action_graph_size: Option<usize>,
+    ) -> Self {
         Self {
             target,
+            target_rule_type_name,
             action_graph_size: action_graph_size.map(|v| v as u64),
             metrics: AggregatedBuildMetrics::default(),
             amortized_metrics: AggregatedBuildMetrics::default(),
             remote_max_memory_peak_bytes: 0,
             local_max_memory_peak_bytes: 0,
+            re_platform_names: Vec::new(),
+            wall_clock_completion_ms: None,
         }
     }
 
@@ -138,6 +171,12 @@ impl TopLevelTargetAggregatedData {
         let factor = 1.0 / (factor as f64);
         self.metrics.aggregate_execution(1.0, ev, when);
         self.amortized_metrics.aggregate_execution(factor, ev, when);
+
+        if let Some(ref platform_name) = ev.re_platform_name {
+            if !self.re_platform_names.contains(platform_name) {
+                self.re_platform_names.push(platform_name.clone());
+            }
+        }
     }
 
     pub fn aggregate_analysis_event(&mut self, factor: usize, ev: &AnalysisMetrics) {
@@ -182,11 +221,14 @@ impl ToProtoMessage for TopLevelTargetAggregatedData {
                 ProvidersName::Default => None,
                 v => Some(v.to_string()),
             },
+            target_rule_type_name: self.target_rule_type_name.clone(),
             action_graph_size: self.action_graph_size,
             metrics: Some(self.metrics.as_proto()),
             amortized_metrics: Some(self.amortized_metrics.as_proto()),
             remote_max_memory_peak_bytes: Some(self.remote_max_memory_peak_bytes),
             local_max_memory_peak_bytes: Some(self.local_max_memory_peak_bytes),
+            re_platform_names: self.re_platform_names.to_vec(),
+            wall_clock_completion_ms: self.wall_clock_completion_ms,
         }
     }
 }
@@ -231,6 +273,7 @@ impl AggregatedBuildMetrics {
     }
 }
 
+#[derive(Default)]
 pub struct AllTargetsAggregatedData {
     pub metrics: AggregatedBuildMetrics,
     pub action_graph_size: Option<u64>,

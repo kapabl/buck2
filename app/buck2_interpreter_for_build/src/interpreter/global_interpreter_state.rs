@@ -17,9 +17,15 @@ use buck2_core::cells::CellResolver;
 use buck2_interpreter::dice::starlark_types::GetStarlarkTypes;
 use dice::DiceComputations;
 use dice::Key;
+use dice::OkPagableValueSerialize;
+use dice::ValueSerialize;
 use dice_futures::cancellation::CancellationContext;
 use dupe::Dupe;
+use pagable::Pagable;
+use pagable::pagable_typetag;
+use starlark::environment::GlobalFrozenHeapName;
 use starlark::environment::Globals;
+use starlark::syntax::ParserKind;
 
 use crate::interpreter::configuror::BuildInterpreterConfiguror;
 use crate::interpreter::context::HasInterpreterContext;
@@ -27,7 +33,7 @@ use crate::interpreter::globals::base_globals;
 
 /// Information shared across interpreters. Contains no cell-specific
 /// information.
-#[derive(Allocative)]
+#[derive(Allocative, pagable::Pagable)]
 pub struct GlobalInterpreterState {
     pub cell_resolver: CellResolver,
 
@@ -43,6 +49,12 @@ pub struct GlobalInterpreterState {
 
     /// Static typechecking for bzl and bxl files.
     pub unstable_typecheck: bool,
+
+    /// Which Starlark parser to use when parsing build/extension files.
+    /// Driven by the `buck2.starlark_parser` buckconfig; defaults to
+    /// [`ParserKind::Lalrpop`].
+    #[allocative(skip)]
+    pub parser_kind: ParserKind,
 }
 
 impl GlobalInterpreterState {
@@ -51,14 +63,17 @@ impl GlobalInterpreterState {
         interpreter_configuror: Arc<BuildInterpreterConfiguror>,
         disable_starlark_types: bool,
         unstable_typecheck: bool,
+        parser_kind: ParserKind,
     ) -> buck2_error::Result<Self> {
         let global_env = base_globals()
             .with(|g| {
                 if let Some(additional_globals) = interpreter_configuror.additional_globals() {
-                    (additional_globals.0)(g);
+                    additional_globals.0.apply(g);
                 }
             })
-            .build();
+            .build_named(GlobalFrozenHeapName {
+                name: concat!(module_path!(), "::global_env"),
+            });
 
         Ok(Self {
             cell_resolver,
@@ -66,6 +81,7 @@ impl GlobalInterpreterState {
             configuror: interpreter_configuror,
             disable_starlark_types,
             unstable_typecheck,
+            parser_kind,
         })
     }
 
@@ -90,7 +106,7 @@ impl HasGlobalInterpreterState for DiceComputations<'_> {
     async fn get_global_interpreter_state(
         &mut self,
     ) -> buck2_error::Result<Arc<GlobalInterpreterState>> {
-        #[derive(Clone, Dupe, Allocative)]
+        #[derive(Clone, Dupe, Allocative, Pagable)]
         struct GisValue(Arc<GlobalInterpreterState>);
 
         #[derive(
@@ -101,9 +117,11 @@ impl HasGlobalInterpreterState for DiceComputations<'_> {
             Eq,
             Hash,
             PartialEq,
-            Allocative
+            Allocative,
+            Pagable
         )]
         #[display("{:?}", self)]
+        #[pagable_typetag(dice::DiceKeyDyn)]
         struct GisKey();
 
         #[async_trait]
@@ -118,17 +136,27 @@ impl HasGlobalInterpreterState for DiceComputations<'_> {
                 let cell_resolver = ctx.get_cell_resolver().await?;
                 let disable_starlark_types = ctx.get_disable_starlark_types().await?;
                 let unstable_typecheck = ctx.get_unstable_typecheck().await?;
+                let parser_kind = if ctx.get_use_rd_parser().await? {
+                    ParserKind::Rd
+                } else {
+                    ParserKind::Lalrpop
+                };
 
                 Ok(GisValue(Arc::new(GlobalInterpreterState::new(
                     cell_resolver,
                     interpreter_configuror,
                     disable_starlark_types,
                     unstable_typecheck,
+                    parser_kind,
                 )?)))
             }
 
             fn equality(_: &Self::Value, _: &Self::Value) -> bool {
                 false
+            }
+
+            fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+                OkPagableValueSerialize::<Self::Value>::new()
             }
         }
 

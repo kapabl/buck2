@@ -15,6 +15,8 @@ use buck2_core::cells::CellResolver;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_error::BuckErrorContext;
+use buck2_error::internal_error;
+use buck2_fs::IoResultExt;
 use buck2_fs::fs_util;
 use buck2_fs::fs_util::IoError;
 use buck2_fs::paths::RelativePath;
@@ -25,12 +27,22 @@ use dice::DiceComputations;
 use dupe::Dupe;
 use futures::FutureExt;
 use futures::future::BoxFuture;
+use pagable::Pagable;
 
 use crate::file_ops::dice::DiceFileComputations;
 use crate::file_ops::metadata::FileType;
 use crate::file_ops::metadata::RawPathMetadata;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Allocative, derive_more::Display)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Allocative,
+    derive_more::Display,
+    Pagable
+)]
 pub enum ConfigPath {
     #[display("{}", _0)]
     Project(ProjectRelativePathBuf),
@@ -53,12 +65,12 @@ impl ConfigPath {
         match self {
             ConfigPath::Project(path) => Ok(path
                 .parent()
-                .buck_error_context("file has no parent")?
+                .ok_or_else(|| internal_error!("file has no parent"))?
                 .join_normalized(rel)
                 .map(ConfigPath::Project)?),
             ConfigPath::Global(path) => Ok(ConfigPath::Global(
                 path.parent()
-                    .buck_error_context("file has no parent")?
+                    .ok_or_else(|| internal_error!("file has no parent"))?
                     .join(rel.as_str()),
             )),
         }
@@ -115,9 +127,9 @@ impl ConfigParserFileOps for DefaultConfigParserFileOps {
 
         let lines = file
             .lines()
-            .into_iter()
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| IoError::new_with_path("read_line", path, e))?;
+            .map_err(|e| IoError::new_with_path("read_line", path, e))
+            .categorize_internal()?;
 
         Ok(Some(lines))
     }
@@ -159,6 +171,7 @@ impl ConfigParserFileOps for DefaultConfigParserFileOps {
                 );
             }
         }
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(entries)
     }
 }
@@ -259,7 +272,7 @@ pub(crate) fn push_all_files_from_a_directory<'a>(
 
 #[cfg(test)]
 mod tests {
-    use buck2_fs::fs_util;
+    use buck2_fs::fs_util::uncategorized as fs_util;
     use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
     use buck2_fs::paths::abs_path::AbsPath;
 

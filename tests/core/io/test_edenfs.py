@@ -22,7 +22,6 @@ from buck2.tests.core.common.io.file_watcher import (
     FileWatcherProvider,
     get_file_watcher_events,
 )
-
 from buck2.tests.core.common.io.file_watcher_dir_tests import (
     run_create_directory_test,
     run_remove_directory_test,
@@ -52,9 +51,7 @@ from buck2.tests.core.common.io.file_watcher_tests import (
     setup_file_watcher_test,
     verify_results,
 )
-
 from buck2.tests.e2e_util.api.buck import Buck
-from buck2.tests.e2e_util.asserts import expect_failure
 from buck2.tests.e2e_util.buck_workspace import buck_test
 from buck2.tests.e2e_util.helper.utils import filter_events
 

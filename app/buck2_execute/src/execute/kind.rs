@@ -91,6 +91,22 @@ impl CommandExecutionKind {
         }
     }
 
+    /// Returns the RE platform name (the "platform" property) if executed remotely.
+    pub fn re_platform_name(&self) -> Option<&str> {
+        let details = match self {
+            Self::Remote { details, .. }
+            | Self::ActionCache { details }
+            | Self::RemoteDepFileCache { details } => details,
+            _ => return None,
+        };
+        details
+            .platform
+            .properties
+            .iter()
+            .find(|p| p.name == "platform")
+            .map(|p| p.value.as_str())
+    }
+
     pub fn to_proto(&self, omit_details: bool) -> buck2_data::CommandExecutionKind {
         use buck2_data::command_execution_kind::Command;
 
@@ -233,12 +249,12 @@ impl RemoteCommandExecutionDetails {
     }
 
     fn to_proto(&self, omit_details: bool) -> Option<buck2_data::RemoteCommandDetails> {
-        if omit_details {
-            return None;
-        }
-
         Some(buck2_data::RemoteCommandDetails {
-            session_id: self.session_id.clone(),
+            session_id: if omit_details {
+                None
+            } else {
+                self.session_id.clone()
+            },
             use_case: self.use_case.to_string(),
             platform: Some(self.platform.clone()),
             persistent_worker: self.persistent_worker,

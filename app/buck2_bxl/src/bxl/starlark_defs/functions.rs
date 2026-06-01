@@ -63,7 +63,7 @@ pub(crate) fn register_target_function(builder: &mut GlobalsBuilder) {
     ) -> starlark::Result<StarlarkTargetSet<ConfiguredTargetNode>> {
         Ok(StarlarkTargetSet::from_iter(
             nodes
-                .unwrap_or(UnpackList::default())
+                .unwrap_or_default()
                 .items
                 .into_iter()
                 .map(|node| node.0),
@@ -86,7 +86,7 @@ pub(crate) fn register_target_function(builder: &mut GlobalsBuilder) {
     ) -> starlark::Result<StarlarkTargetSet<TargetNode>> {
         Ok(StarlarkTargetSet::from_iter(
             nodes
-                .unwrap_or(UnpackList::default())
+                .unwrap_or_default()
                 .items
                 .into_iter()
                 .map(|node| node.0),
@@ -125,7 +125,7 @@ pub(crate) fn register_artifact_function(builder: &mut GlobalsBuilder) {
         #[starlark(require=pos)] this: ValueAsInputArtifactLikeUnpack<'v>,
         #[starlark(require=pos)] ctx: &'v BxlContext<'v>,
         #[starlark(require = named, default = false)] abs: bool,
-        heap: &'v Heap,
+        heap: Heap<'v>,
     ) -> starlark::Result<StringValue<'v>> {
         let path = match this {
             ValueAsInputArtifactLikeUnpack::Artifact(a) => {
@@ -328,7 +328,9 @@ pub(crate) fn register_read_package_value_function(builder: &mut GlobalsBuilder)
         match SuperPackageValuesImpl::get(&**super_package.package_values())?
             .get_package_value(metadata_key)
         {
-            Some(value) => Ok(value.owned_frozen_value().owned_value(eval.frozen_heap())),
+            Some(value) => Ok(eval
+                .heap()
+                .access_owned_frozen_value(value.owned_frozen_value())),
             None => Ok(Value::new_none()),
         }
     }

@@ -13,6 +13,9 @@ use std::sync::OnceLock;
 use allocative::Allocative;
 use buck2_interpreter::late_binding_ty::ProviderReprLate;
 use dupe::Dupe;
+use pagable::Pagable;
+use pagable::pagable_typetag;
+use starlark::type_matcher;
 use starlark::typing::Ty;
 use starlark::typing::TyStarlarkValue;
 use starlark::typing::TyUser;
@@ -23,14 +26,17 @@ use starlark::values::Value;
 use starlark::values::type_repr::StarlarkTypeRepr;
 use starlark::values::typing::TypeInstanceId;
 use starlark::values::typing::TypeMatcher;
+use starlark::values::typing::TypeMatcherDyn;
 use starlark::values::typing::TypeMatcherFactory;
 
 use crate::interpreter::rule_defs::provider::ValueAsProviderLike;
 use crate::interpreter::rule_defs::provider::user::UserProvider;
 
-#[derive(Allocative, Clone, Debug)]
+#[derive(Allocative, Clone, Debug, Pagable)]
+#[pagable_typetag(TypeMatcherDyn)]
 struct ProviderMatcher;
 
+#[type_matcher]
 impl TypeMatcher for ProviderMatcher {
     fn matches(&self, value: Value) -> bool {
         ValueAsProviderLike::unpack(value).is_some()

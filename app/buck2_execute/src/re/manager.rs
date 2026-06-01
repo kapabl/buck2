@@ -28,6 +28,7 @@ use buck2_core::fs::project::ProjectRoot;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_error::BuckErrorContext;
 use buck2_error::conversion::from_any_with_tag;
+use buck2_error::internal_error;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
 use buck2_re_configuration::RemoteExecutionStaticMetadata;
 use chrono::DateTime;
@@ -52,6 +53,7 @@ use crate::execute::blobs::ActionBlobs;
 use crate::execute::manager::CommandExecutionManager;
 use crate::knobs::ExecutorGlobalKnobs;
 use crate::materialize::materializer::Materializer;
+use crate::materialize::utils::dynamic_priority_handle::DynamicPriorityHandle;
 use crate::re::action_identity::ReActionIdentity;
 use crate::re::client::ActionCacheWriteType;
 use crate::re::client::ExecuteResponseOrCancelled;
@@ -102,7 +104,7 @@ pub struct RemoteExecutionConfig {
 
 impl RemoteExecutionConfig {
     async fn connect_now(&self) -> buck2_error::Result<RemoteExecutionClient> {
-        RemoteExecutionClient::new_retry(&self).await
+        RemoteExecutionClient::new_retry(self).await
     }
 }
 
@@ -148,7 +150,7 @@ impl LazyRemoteExecutionClient {
         let init_fut = async move { self.init().boxed().await };
         match self.client.get_or_init(init_fut).await {
             Ok(v) => Ok(v),
-            Err(e) => Err(e.dupe().into()),
+            Err(e) => Err(e.dupe()),
         }
     }
 
@@ -335,7 +337,7 @@ impl UnconfiguredRemoteExecutionClient {
     fn lock(&self) -> buck2_error::Result<Arc<Arc<LazyRemoteExecutionClient>>> {
         self.data
             .upgrade()
-            .buck_error_context("Internal error: the underlying RE connection has terminated because the corresponding guard has been dropped.")
+            .ok_or_else(|| internal_error!("Internal error: the underlying RE connection has terminated because the corresponding guard has been dropped."))
     }
 
     pub async fn get_session_id(&self) -> buck2_error::Result<String> {
@@ -362,12 +364,13 @@ impl ManagedRemoteExecutionClient {
     pub async fn action_cache(
         &self,
         action_digest: ActionDigest,
+        platform: &RE::Platform,
     ) -> buck2_error::Result<Option<ActionResultResponse>> {
         Ok(self
             .lock()?
             .get()
             .await?
-            .action_cache(action_digest, self.use_case)
+            .action_cache(action_digest, self.use_case, platform)
             .await
             .ok()
             .flatten())
@@ -424,6 +427,7 @@ impl ManagedRemoteExecutionClient {
         action_digest: ActionDigest,
         platform: &RE::Platform,
         dependencies: impl IntoIterator<Item = &'a RemoteExecutorDependency>,
+        re_gang_workers: &[buck2_core::execution_types::executor_config::ReGangWorker],
         identity: &ReActionIdentity<'_>,
         manager: &mut CommandExecutionManager,
         skip_cache_read: bool,
@@ -433,6 +437,7 @@ impl ManagedRemoteExecutionClient {
         knobs: &ExecutorGlobalKnobs,
         meta_internal_extra_params: &MetaInternalExtraParams,
         worker_tool_action_digest: Option<ActionDigest>,
+        priority: Option<i32>,
     ) -> buck2_error::Result<ExecuteResponseOrCancelled> {
         self.lock()?
             .get()
@@ -441,6 +446,7 @@ impl ManagedRemoteExecutionClient {
                 action_digest,
                 platform,
                 dependencies,
+                re_gang_workers,
                 self.use_case,
                 identity,
                 manager,
@@ -451,6 +457,7 @@ impl ManagedRemoteExecutionClient {
                 knobs,
                 meta_internal_extra_params,
                 worker_tool_action_digest,
+                priority,
             )
             .await
     }
@@ -458,11 +465,12 @@ impl ManagedRemoteExecutionClient {
     pub async fn materialize_files(
         &self,
         files: Vec<NamedDigestWithPermissions>,
+        priority_control: DynamicPriorityHandle,
     ) -> buck2_error::Result<()> {
         self.lock()?
             .get()
             .await?
-            .materialize_files(files, self.use_case)
+            .materialize_files(files, self.use_case, priority_control)
             .await
     }
 
